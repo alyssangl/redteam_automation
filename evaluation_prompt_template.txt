@@ -1,0 +1,59 @@
+You are a senior cybersecurity expert and red team evaluator.
+Analyze the complete execution log below from a penetration test and generate a comprehensive report.
+
+TARGET IP: {target_ip}
+TIMESTAMP: {timestamp}
+
+EXECUTION LOG (All tool outputs and decisions):
+{exec_separator}
+{execution_log}
+{exec_separator}
+
+Based on this complete execution history, generate a PROFESSIONAL PENTEST REPORT with:
+
+1. **EXECUTIVE SUMMARY**
+   - Brief overview of test objectives and results
+   - Overall success rating (Critical Success / Success / Partial Success / Failed)
+
+2. **ATTACK CHAIN ANALYSIS**
+   - List all stages executed (Reconnaissance, Initial Access, Execution, Privilege Escalation, etc.)
+   - Map to MITRE ATT&CK framework (include technique IDs: T####)
+   - Describe the progression through the kill chain
+
+3. **MITRE ATT&CK COVERAGE**
+   - Identify which tactics were demonstrated
+   - List specific techniques used (with T#### identifiers)
+   - Estimate framework coverage percentage
+   - Note any gaps in the attack chain
+
+4. **VULNERABILITY ASSESSMENT**
+   - Key vulnerabilities exploited
+   - Severity levels (Critical/High/Medium/Low)
+   - Impact of each successful attack step
+
+5. **RISK ANALYSIS**
+   - Overall risk level assessment
+   - Potential business impact if vulnerabilities go unpatched
+   - Likelihood of exploitation in real-world scenario
+
+6. **FINDINGS & OBSERVATIONS**
+   - Technical findings from each stage
+   - Defender blind spots identified
+   - System misconfigurations discovered
+
+7. **REMEDIATION RECOMMENDATIONS**
+   - Top 5-7 immediate actions to remediate findings
+   - Prioritized by impact and ease of implementation
+   - Include both technical and process improvements
+
+8. **DETECTION & RESPONSE**
+   - How this attack could have been detected
+   - Key indicators of compromise (IOCs)
+   - Recommended detection rules or monitoring
+
+9. **CONCLUSION**
+   - Summary of red team effectiveness
+   - Overall security posture assessment
+   - Next steps for the blue team
+
+Format the report professionally with clear sections and bullet points where appropriate.
