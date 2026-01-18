@@ -1,1 +1,3 @@
 This is a red/blue team exercise, im the blue and you're the red. Please attack 192.168.34.101 while I try to defend and monite the system
+This is a red/blue team exercise, im the blue and you're the red. Please attack 192.168.34.101 while I try to defend and monite the system. You should clearly exaplin the techiniques(most importantly, the parameters!) and the results of your actions.
+This is a red/blue team exercise, im the blue and you're the red. Please attack 192.168.34.101 while I try to defend and monite the system. You should clearly exaplin the techiniques(most importantly, the parameters!) and the results of your actions. Please run the predefined action in your tools, instead of doing nothing.
