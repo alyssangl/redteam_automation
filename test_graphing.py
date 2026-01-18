@@ -77,17 +77,48 @@ def _run_ssh_command(command_str, description):
 @tool
 def tool_recon_scan(target_ip: str):
     """
-    Scans the target_ip using nmap.
-    Use this tool first to identify open ports.
+    Sccan the target_ip using nmap.
+    Use this tool if you need to recon, scan or check available ports of the target_ip.
+    :param target_ip: The target ip to run nmap on. e.g. 192.168.34.3
+    :return: The nmap scan result
     """
+    print(f"\n[nmap Tool] tool_recon_scan: {target_ip}")
+    print(f"[nmap Tool] Connecting to  Kali ({KALI_IP})...")
+
     command = (
-        f"{REMOTE_ENV} && cd {REMOTE_WORK_DIR} && "
+        f"{REMOTE_ENV} && "
+        f"cd {REMOTE_WORK_DIR} && "
         f"python3 03_ransomware/python_files/attacker_server/01_step_Ransomware.py {LOG_FOLDER_NAME} {KALI_IP} {target_ip}"
     )
-    success, output = _run_ssh_command(command, "nmap Tool")
-    if success:
-        return f"Nmap Scan Successful.\nOutput:\n{output}"
-    return f"Nmap Scan Failed.\nOutput:\n{output}"
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        # connect to kali
+        ssh.connect(KALI_IP, username=KALI_USER, password=KALI_PASS)
+        print("[nmap Tool] Connection success")
+        print(f"[nmap Tool] Running Command {command}")
+
+        # execute command
+        stdin, stdout, stderr = ssh.exec_command(command)
+
+        # read output
+        exit_status = stdout.channel.recv_exit_status()
+        output = stdout.read().decode().strip()
+        error = stderr.read().decode().strip()
+
+        if exit_status == 0:
+            print(f"[nmap Tool] nmap scan successful")
+            return f"Nmap Scan Completed Successfully.\nOutput:\n{output}"
+        else:
+            print(f"[nmap Tool] nmap scan failed。Exit Code: {exit_status}")
+            return f"Error executing scan script.\nSTDERR: {error}\nSTDOUT: {output}"
+
+    except Exception as e:
+        return f"SSH Connection Failed: {e}"
+    finally:
+        ssh.close()
 
 
 @tool
@@ -287,7 +318,7 @@ class AgentState(TypedDict):
 def recon_agent_node(state: AgentState):
     messages = state['messages']
     model = ChatOpenAI(model="gpt-4o", temperature=0).bind_tools(recon_tools)
-    response = model.invoke(["You are the Execution Agent. PLease execute the recons phase." +
+    response = model.invoke(["You are the Execution Agent. PLease execute the recons phase, and report your findings." +
                             "You have access to a knowledge base tool. You should use it before calling tools except the rag tool to confirm that your decisions are correct. "] +
                             messages)
     return {"messages": [response], "current_step": "recon"}
