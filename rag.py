@@ -5,6 +5,7 @@ from langchain.tools import tool
 import dotenv
 
 # 1. CONFIGURATION (Must match the builder script)
+DB_PATHS = ["./db_metasploit_documents"]
 DB_PATH = "./my_knowledge_base"
 OPENAI_MODEL = "text-embedding-3-small"
 
@@ -31,6 +32,10 @@ def query_knowledge_base(query: str) -> str:
     """
     Use this tool to look up information from the internal knowledge base.
     Useful for answering questions about uploaded documents, policies, or specific data.
+    - **Query Expansion Rule**: NEVER search for just a software name (e.g., 'Samba').
+    - **Construct a Verbose Query**: Include the target software, the version, AND the desired goal.
+    - BAD: query_knowledge_base('Samba 4.3.11')
+    - GOOD: query_knowledge_base('Remote code execution exploit for Samba 4.3.11 using shared library loading or symlink vulnerabilities')
     """
     if not vector_db:
         return "Error: Database not initialized due to missing API Key."

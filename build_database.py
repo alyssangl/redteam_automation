@@ -7,7 +7,7 @@ from typing import List, Dict, Any
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter, Language
 from langchain_core.documents import Document
 
 # --- 1. CONFIGURATION ---
@@ -24,6 +24,51 @@ OPENAI_MODEL = "text-embedding-3-small"
 
 
 # --- 2. SPECIALIZED LOADERS ---
+def load_markdown(filepath: str) -> List[Document]:
+    """
+    Handles Markdown files using header-based splitting.
+    This keeps sections (Header -> Content) together semantically.
+    """
+    print(f"  [MD] Processing {os.path.basename(filepath)}")
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            text = f.read()
+
+        # Split by headers to preserve structure
+        headers_to_split_on = [
+            ("#", "Header 1"),
+            ("##", "Header 2"),
+            ("###", "Header 3"),
+        ]
+        markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
+        md_header_splits = markdown_splitter.split_text(text)
+
+        # UPDATED: Increased chunk size to 3000 to prevent fragmenting code blocks/logs
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=500)
+        final_docs = text_splitter.split_documents(md_header_splits)
+
+        # Add Metadata and Re-inject Headers into Content
+        for doc in final_docs:
+            doc.metadata["source"] = os.path.basename(filepath)
+            doc.metadata["type"] = "metasploit_doc"
+
+            # Re-inject header context into the actual text content
+            # This ensures the embedding vector includes the section title even after splitting
+            header_path = []
+            for key in ["Header 1", "Header 2", "Header 3"]:
+                if key in doc.metadata:
+                    header_path.append(doc.metadata[key])
+
+            if header_path:
+                # Prepend context: "Section: Description > Usage Example"
+                context_str = " > ".join(header_path)
+                doc.page_content = f"Section: {context_str}\n\n{doc.page_content}"
+
+        return final_docs
+
+    except Exception as e:
+        print(f"Error loading MD {filepath}: {e}")
+        return []
 
 def load_pdf(filepath: str) -> List[Document]:
     """Handles PDF splitting and loading."""
@@ -141,7 +186,8 @@ def ingest_directory(directory: str) -> List[Document]:
         ".pdf": load_pdf,
         ".csv": load_csv,
         ".yaml": load_yaml,
-        ".yml": load_yaml
+        ".yml": load_yaml,
+        ".md": load_markdown
     }
 
     for root, dirs, files in os.walk(directory):
