@@ -1,15 +1,13 @@
 import os
-import sys
 import operator
-import time
 
 import dotenv
 from typing import TypedDict, Annotated, List, Literal
-from metasploit_tools import *
+from tools.metasploit_tools import *
 
 import paramiko
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage, AIMessage
 from langchain_core.tools import tool
 
 from langgraph.graph import StateGraph, END
@@ -17,11 +15,7 @@ from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 
 # Assuming rag.py exists in your directory as implied by your import
-from rag import query_knowledge_base
-
-import atexit
-from pymetasploit3.msfrpc import MsfRpcClient
-
+from tools.rag import query_knowledge_base
 
 dotenv.load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -34,9 +28,25 @@ MSF_PORT = 55553
 MSF_USER = 'kali'
 MSF_PASS = 'kali'
 MAX_RETRIES = 10
+TOKEN_SENSITIVE_THRESHOLD = 100000  
+HEAVY_MESSAGE_THRESHOLD = 20000 
+MAX_PROMPT_MSG_CHAR = 40000  
 
+class Colors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
-# --- 1. EXISTING SSH HELPER (UNCHANGED) ---
+def print_colored(text: str, color: str):
+    """Helper to print text with ANSI colors, compatible with PowerShell/CMD."""
+    print(f"{color}{text}{Colors.ENDC}")
+
 def _run_ssh_command(command_str, description):
     """Helper to run SSH commands silently (no streaming print)"""
     # Removed the "Connecting..." print to reduce noise
@@ -84,11 +94,12 @@ def tool_metasploit_rpc(command: str):
     State is preserved. You can run 'use exploit/...' in one turn,
     and 'set RHOST ...' in the next.
     **METASPLOIT USAGE**: You have a persistent console session open.
-    1. You do NOT need to chain commands. You can issue 'use exploit/...' then wait for the result.
+    1. You do NOT need to chain commands with ';'. This is a interactive console, enter the command on at a time. You can issue 'use exploit/...' then wait for the result.
     2. If a command fails (e.g. 'Unknown command'), check your spelling or context.
     **CRITICAL** 3. When ready to attack YOU MUST ALWAYS FIRST use 'show options' to verify that all the fields are set correctly.
     4. If you ran the 'show options' and VERY VERY VERY VERY SURE THAT THE OPTIONS ARE SET, you can finally run the exploit by using 'run -z' (run in background) or just 'run'.
-    4. ALWAYS check the output. If it says 'Exploit completed, but no session', it FAILED. Try a different payload or target.
+    5. ALWAYS check the output. If it says 'Exploit completed, but no session', it FAILED. Try a different payload or target.
+    **CRITICAL** 6. After obtaining a reverse shell session, you should ALWAYS run 'exit' command to put the session in background
     """
     try:
         return msf_session.send_command(command)
@@ -98,11 +109,25 @@ def tool_metasploit_rpc(command: str):
 
 @tool
 def tool_linux_terminal(command: str):
-    """Executes a command on the remote Linux (Kali) terminal via SSH."""
+    """
+    Executes a shell command on the remote Linux (Kali) terminal via SSH.
+
+    **CRITICAL REQUIREMENT - NON-INTERACTIVE ONLY**:
+    You MUST NOT use interactive or blocking commands (dangling commands). 
+    The terminal environment cannot handle prompts (e.g., password prompts, 'yes/no' confirmations).
+    
+    FORBIDDEN:
+    - 'ftp [IP]' (Use 'curl' or 'wget' for file transfers instead).
+    - 'ssh [User]@[IP]' (Use 'sshpass' if available, or MSF modules).
+    - 'top', 'htop', 'nano', 'vi', or any command that starts a continuous UI.
+    - Commands that wait for user input indefinitely.
+
+    ALWAYS prefer non-interactive flags (e.g., 'apt-get install -y' instead of 'apt-get install').
+    """
     forbidden = ["rm -rf /", ":(){ :|:& };:"]
     if any(bad in command for bad in forbidden):
         return "Command blocked by safety guardrails."
-    print(f"\n[Terminal Tool] Executing: {command}")
+    print_colored(f"\n[Terminal Tool] Executing: {command}", Colors.OKCYAN)
     return _run_ssh_command(command, "Linux Terminal")
 
 
@@ -117,10 +142,79 @@ tools = [query_knowledge_base, tool_linux_terminal, tool_metasploit_rpc]
 
 
 # --- 3. NODE DEFINITIONS ---
+def summarize_history(messages: List[BaseMessage]) -> str:
+    """Aggressively condenses technical history."""
+    summary_model = ChatOpenAI(model=MODEL_NAME, temperature=0)
+    summary_prompt = (
+        "You are a Senior Red Team Lead. Summarize the penetration testing history below. "
+        "Keep technical details: IPs, ports, specific failed/successful exploits. "
+        "Be extremely concise to save tokens."
+    )
+    # Prepare message log for summary
+    history_str = ""
+    for m in messages:
+        content = m.content[:2000] if m.content else ""  # Don't send huge chunks to summarizer either
+        history_str += f"{type(m).__name__}: {content}\n"
+
+    response = summary_model.invoke([SystemMessage(content=summary_prompt), HumanMessage(content=history_str)])
+    return response.content
+
+
+def compress_large_message(message: BaseMessage) -> BaseMessage:
+    """Uses LLM to compress a single large message while preserving technical data."""
+    if not message.content or len(message.content) < HEAVY_MESSAGE_THRESHOLD:
+        return message
+
+    print_colored(f"--- Compressing heavy {type(message).__name__} ({len(message.content)} chars) ---", Colors.OKCYAN)
+    compressor = ChatOpenAI(model=MODEL_NAME, temperature=0)
+    prompt = (
+        "Summarize this technical output. Keep all IP addresses, port numbers, "
+        "vulnerability IDs (CVEs), and specific error codes. Remove redundant logs or fluff. "
+        "Return a technical summary of the 'Results Found'."
+    )
+    # Don't pass the full massive thing to the compressor either, take a large slice
+    input_content = message.content[:15000]
+    res = compressor.invoke([SystemMessage(content=prompt), HumanMessage(content=input_content)])
+
+    new_content = f"[TECHNICAL SUMMARY OF PREVIOUS OUTPUT]: {res.content}"
+    # Return same message type with new content
+    if isinstance(message, ToolMessage):
+        return ToolMessage(content=new_content, tool_call_id=message.tool_call_id)
+    if isinstance(message, AIMessage):
+        return AIMessage(content=new_content, tool_calls=message.tool_calls)
+    return HumanMessage(content=new_content)
+
 
 def llm_node(state: AgentState):
     """The Worker: Generates attacks or runs tools."""
     messages = state['messages']
+
+    total_chars = sum(len(m.content) if m.content else 0 for m in messages)
+
+    if total_chars > TOKEN_SENSITIVE_THRESHOLD:
+        print_colored(f"\n[System] Context volume ({total_chars} chars) high. Targeting largest data for compression...", Colors.OKCYAN)
+
+        # 1. Identify the 'Fresh Tail' (The current turn's ToolRequest -> ToolResponse chain)
+        # We walk back to find the last AI request that triggered the current tool messages.
+        keep_idx = len(messages) - 1
+        while keep_idx > 0:
+            if isinstance(messages[keep_idx], AIMessage) and messages[keep_idx].tool_calls:
+                break
+            if isinstance(messages[keep_idx], HumanMessage):
+                break
+            keep_idx -= 1
+
+        # 2. Process everything BEFORE the tail (History)
+        new_history = [messages[0]]  # Always keep original goal
+        for m in messages[1:keep_idx]:
+            if m.content and len(m.content) > HEAVY_MESSAGE_THRESHOLD:
+                # Replace the individual heavy message with its own summary
+                new_history.append(compress_large_message(m))
+            else:
+                new_history.append(m)
+
+        # 3. Reconstruct message list
+        messages = new_history + messages[keep_idx:]
 
     # Check if we have critique feedback from the previous loop
     # If the last message was from the Critic (AI), we treat it as instructions
@@ -144,6 +238,8 @@ def llm_node(state: AgentState):
             "4. **EXECUTION PHASE**:\n"
             "   - Execute the configured command.\n"
             "   - If RAG was empty, select a generic alternative (but still configure IPs correctly).\n\n"
+            "**IMPORTANT, SUCCESS CRITERIA**:"
+            "   - If you see 'Command shell session X opened' or 'Meterpreter session X opened', you have achieved SUCCESSful remote access. This is a REVERSE SHELL session. Acknowledge the session ID (e.g., 'Access gained via session 1').\n"
             "5. **REPORTING**:\n"
             "   - Report success/failure.\n"
             "   - If success, report your findings.\n"
@@ -230,7 +326,7 @@ def critic_node(state: AgentState):
     ])
 
     content = critique_response.content
-    print(f"\n[Critic] Review: {content}")
+    print_colored(f"\n[Critic] Review: {content}", Colors.OKCYAN)
 
     if "FAIL" in content:
         return {"messages": [HumanMessage(content=f"SENIOR LEAD FEEDBACK: {content}")]}
@@ -264,7 +360,7 @@ def should_loop(state: AgentState) -> Literal["llm_node", END]:
     # 2. Only check retries if we actually failed
     current_step = state.get("loop_step", 0)
     if current_step >= MAX_RETRIES:
-        print("--- MAX RETRIES REACHED ---")
+        print_colored("--- MAX RETRIES REACHED ---", Colors.FAIL)
         return END
 
     # 3. Loop back to fix the mistake
@@ -304,7 +400,7 @@ workflow.add_conditional_edges(
 checkpointer = MemorySaver()
 app = workflow.compile(checkpointer=checkpointer)
 
-print(f"--- Red Team Reflection Agent ({MODEL_NAME}) ---")
+print_colored(f"--- Red Team Reflection Agent ({MODEL_NAME}) ---", Colors.OKGREEN)
 
 config = {
     "configurable": {"thread_id": "session_reflect_1"},
@@ -329,18 +425,19 @@ try:
                         for msg in messages:
                             if isinstance(msg, BaseMessage) and msg.content:
                                 if "SENIOR LEAD" in msg.content:
-                                    print(f"\n\033[91m{msg.content}\033[0m")
+                                    pass
+                                    # print(f"\n\033[91m{msg.content}\033[0m")
                                 elif isinstance(msg, ToolMessage):
                                     # Truncate Tool Output in console to reduce noise
                                     #truncated_content = (msg.content[:200] + '... [output truncated]') if len(msg.content) > 200 else msg.content
                                     print(f"\n[Tool Output]: {msg.content}")
                                 else:
-                                    print(f"\nAgent: {msg.content}")
+                                    print_colored(f"\nAgent: {msg.content}", Colors.OKGREEN)
 
                             if hasattr(msg, "tool_calls") and msg.tool_calls:
                                 for t in msg.tool_calls:
-                                    print(f"   (Calling Tool: {t['name']} args: {t['args']}...)")
+                                    print_colored(f"   (Calling Tool: {t['name']} args: {t['args']}...)", Colors.OKCYAN)
 except KeyboardInterrupt:
-    print("program ended unexpectedly")
+    print_colored("program ended unexpectedly", Colors.FAIL)
 finally:
     msf_session.cleanup()

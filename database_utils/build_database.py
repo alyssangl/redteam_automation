@@ -1,5 +1,7 @@
 import os
+import sys
 import shutil
+import argparse
 import yaml
 import csv
 import dotenv
@@ -11,7 +13,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHea
 from langchain_core.documents import Document
 
 # --- 1. CONFIGURATION ---
-DB_PATH = "./my_knowledge_base"
+DB_BASE_DIR = "./databases"
 SOURCE_DOCS_DIR = "./documents"
 
 # YAML Config
@@ -206,46 +208,124 @@ def ingest_directory(directory: str) -> List[Document]:
     return all_documents
 
 
-# --- 4. MAIN EXECUTION ---
+# --- 4. DATABASE MANAGEMENT FUNCTIONS ---
+
+def get_db_path(name: str) -> str:
+    return os.path.join(DB_BASE_DIR, name)
+
+
+def get_embeddings():
+    return OpenAIEmbeddings(model=OPENAI_MODEL, api_key=OPENAI_API_KEY)
+
+
+def init_database(name: str) -> Chroma:
+    """Create a new empty database. Wipes if it already exists."""
+    db_path = get_db_path(name)
+    if os.path.exists(db_path):
+        shutil.rmtree(db_path)
+    os.makedirs(db_path, exist_ok=True)
+    return Chroma(persist_directory=db_path, embedding_function=get_embeddings(),
+                  collection_name="my_rag_collection")
+
+
+def open_database(name: str) -> Chroma:
+    """Open an existing database (no wipe)."""
+    db_path = get_db_path(name)
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"Database '{name}' not found at {db_path}")
+    return Chroma(persist_directory=db_path, embedding_function=get_embeddings(),
+                  collection_name="my_rag_collection")
+
+
+def add_documents(vector_db: Chroma, docs: List[Document], batch_size: int = 100):
+    """Batch-add Document objects to a ChromaDB instance."""
+    for i in range(0, len(docs), batch_size):
+        batch = docs[i:i + batch_size]
+        vector_db.add_documents(batch)
+        print(f"  Added batch {i}-{i + len(batch)}")
+    print(f"Added {len(docs)} documents total.")
+
+
+def add_file(vector_db: Chroma, filepath: str) -> int:
+    """Ingest a single file using the appropriate loader. Returns chunk count."""
+    ext = os.path.splitext(filepath)[1].lower()
+    LOADER_REGISTRY = {".pdf": load_pdf, ".csv": load_csv,
+                       ".yaml": load_yaml, ".yml": load_yaml, ".md": load_markdown}
+    loader_func = LOADER_REGISTRY.get(ext)
+    if not loader_func:
+        print(f"Unsupported file type: {ext}")
+        return 0
+    docs = loader_func(filepath)
+    if docs:
+        add_documents(vector_db, docs)
+    return len(docs)
+
+
+def clean_database(name: str):
+    """Delete a database entirely."""
+    db_path = get_db_path(name)
+    if os.path.exists(db_path):
+        shutil.rmtree(db_path)
+        print(f"Deleted database '{name}'.")
+    else:
+        print(f"Database '{name}' not found.")
+
+
+# --- 5. CLI ---
 
 def main():
-    print(f"--- RAG Ingestion Engine ---")
-    print(f"Model: {OPENAI_MODEL}")
+    parser = argparse.ArgumentParser(description="RAG Knowledge Base Manager")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # newdb
+    p_new = subparsers.add_parser("newdb", help="Create a new empty database")
+    p_new.add_argument("name", help="Database name")
+
+    # add
+    p_add = subparsers.add_parser("add", help="Add file(s) to an existing database")
+    p_add.add_argument("name", help="Database name")
+    p_add.add_argument("files", nargs="+", help="File paths to ingest")
+
+    # clean
+    p_clean = subparsers.add_parser("clean", help="Delete a database")
+    p_clean.add_argument("name", help="Database name to delete")
+
+    # ingest (bulk add from directory — replaces old main behavior)
+    p_ingest = subparsers.add_parser("ingest", help="Ingest all files from a directory into a database")
+    p_ingest.add_argument("name", help="Database name")
+    p_ingest.add_argument("--source", default=SOURCE_DOCS_DIR, help="Source directory (default: ./documents)")
+
+    args = parser.parse_args()
 
     if not OPENAI_API_KEY:
         print("ERROR: OPENAI_API_KEY not found.")
-        return
+        sys.exit(1)
 
-    embeddings = OpenAIEmbeddings(model=OPENAI_MODEL, api_key=OPENAI_API_KEY)
+    if args.command == "newdb":
+        init_database(args.name)
+        print(f"Created empty database '{args.name}' at {get_db_path(args.name)}")
 
-    # Clean previous DB
-    if os.path.exists(DB_PATH):
-        print(f"Resetting database at {DB_PATH}...")
-        shutil.rmtree(DB_PATH)
+    elif args.command == "add":
+        db = open_database(args.name)
+        for filepath in args.files:
+            if not os.path.exists(filepath):
+                print(f"File not found: {filepath}")
+                continue
+            count = add_file(db, filepath)
+            print(f"  {filepath}: {count} chunks")
 
-    # 1. LOAD (Extract & Transform)
-    docs = ingest_directory(SOURCE_DOCS_DIR)
+    elif args.command == "clean":
+        clean_database(args.name)
 
-    if not docs:
-        print("No documents found.")
-        return
-
-    # 2. STORE (Load)
-    print(f"Inserting {len(docs)} chunks into ChromaDB...")
-    vector_db = Chroma(
-        persist_directory=DB_PATH,
-        embedding_function=embeddings,
-        collection_name="my_rag_collection"
-    )
-
-    # Batch add (Chroma handles large batches better than one-by-one)
-    BATCH_SIZE = 100
-    for i in range(0, len(docs), BATCH_SIZE):
-        batch = docs[i: i + BATCH_SIZE]
-        vector_db.add_documents(batch)
-        print(f"  Added batch {i}-{i + len(batch)}")
-
-    print("Ingestion Complete.")
+    elif args.command == "ingest":
+        try:
+            db = open_database(args.name)
+        except FileNotFoundError:
+            db = init_database(args.name)
+        docs = ingest_directory(args.source)
+        if docs:
+            add_documents(db, docs)
+        print("Ingestion complete.")
 
 
 if __name__ == "__main__":

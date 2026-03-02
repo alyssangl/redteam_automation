@@ -3,19 +3,17 @@ import sys
 
 import dotenv
 import paramiko
-import time
 from typing import TypedDict, Annotated, List
 import operator
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 from datetime import datetime
-import json
 from pathlib import Path
 
-from rag import query_knowledge_base
+from tools.rag import query_knowledge_base
 
 # --- CONFIGURATION ---
 KALI_IP = "192.168.34.6"
