@@ -2,12 +2,10 @@
 Orchestrator Pipeline — top-level LangGraph workflow.
 
 Architecture:
-    Planner ⟺ RAG tools → Recon → Initial Access → Persistence* → PrivEsc* → Impact* → Critic
-                                                                                          ↓
-                                                                              PASS → Success Logger → END
-                                                                              FAIL → Planner (max 3 retries)
-
-    (* = stub stages, not yet implemented)
+    Planner ⟺ RAG tools → Recon → Initial Access → Persistence → PrivEsc → Impact → Critic
+                                                                                        ↓
+                                                                            PASS → Success Logger → END
+                                                                            FAIL → Planner (max 3 retries)
 
 Usage:
     python -m core_agents.orchestrator               # Interactive REPL
@@ -35,6 +33,9 @@ from core_agents.prompts import PLANNER_PROMPT, CRITIC_PROMPT
 
 from stages.recon import run_recon
 from stages.initial_access import run_exploitation
+from stages.persistence import run_persistence
+from stages.privesc import run_privesc
+from stages.impact import run_impact
 
 from tools.rag import query_knowledge_base, query_successful_attacks, log_successful_attack
 
@@ -156,50 +157,127 @@ def initial_access_stage_node(state: PipelineState) -> dict:
 
 
 def persistence_stage_node(state: PipelineState) -> dict:
-    """Stub — persistence stage not yet implemented."""
-    print_colored("\n[Pipeline] Persistence stage (stub — not implemented)", Colors.WARNING)
-    findings = {
-        "success": False,
-        "method": "",
-        "details": "",
-        "summary": "Persistence stage not yet implemented.",
-    }
+    """Run the persistence subgraph using exploitation findings."""
+    print_colored("\n[Pipeline] Running Persistence stage...", Colors.HEADER)
+
+    exploit = state.get("exploitation_findings", {})
+
+    # Skip if no session was obtained
+    if not exploit.get("success") or not exploit.get("session_id"):
+        print_colored("[Pipeline] No active session — skipping persistence.", Colors.WARNING)
+        findings = {
+            "success": False,
+            "method": "",
+            "details": "Skipped: no active session from initial access.",
+            "summary": "Persistence skipped — no session available.",
+        }
+        return {
+            "persistence_findings": findings,
+            "current_stage": "persistence",
+            "messages": [AIMessage(content="[Persistence] Skipped — no active session.")],
+        }
+
+    findings = run_persistence(
+        target_ip=exploit.get("target_ip", state["target_ip"]),
+        session_id=exploit["session_id"],
+        session_type=exploit["session_type"],
+        access_level=exploit.get("access_level", "unknown"),
+        objective=state["objective"],
+    )
+
     return {
-        "persistence_findings": findings,
+        "persistence_findings": dict(findings),
         "current_stage": "persistence",
-        "messages": [AIMessage(content="[Persistence] Skipped — not yet implemented.")],
+        "messages": [AIMessage(content=f"[Persistence Complete] {findings['summary']}")],
     }
 
 
 def privesc_stage_node(state: PipelineState) -> dict:
-    """Stub — privilege escalation stage not yet implemented."""
-    print_colored("\n[Pipeline] PrivEsc stage (stub — not implemented)", Colors.WARNING)
-    findings = {
-        "success": False,
-        "technique": "",
-        "previous_level": "",
-        "new_level": "",
-        "summary": "Privilege escalation stage not yet implemented.",
-    }
+    """Run the privesc subgraph using exploitation findings."""
+    print_colored("\n[Pipeline] Running PrivEsc stage...", Colors.HEADER)
+
+    exploit = state.get("exploitation_findings", {})
+    recon = state.get("recon_findings", {})
+
+    # Skip if no session
+    if not exploit.get("success") or not exploit.get("session_id"):
+        print_colored("[Pipeline] No active session — skipping privesc.", Colors.WARNING)
+        findings = {
+            "success": False,
+            "technique": "",
+            "previous_level": "",
+            "new_level": "",
+            "summary": "PrivEsc skipped — no session available.",
+        }
+        return {
+            "privesc_findings": findings,
+            "current_stage": "privesc",
+            "messages": [AIMessage(content="[PrivEsc] Skipped — no active session.")],
+        }
+
+    findings = run_privesc(
+        target_ip=exploit.get("target_ip", state["target_ip"]),
+        session_id=exploit["session_id"],
+        session_type=exploit["session_type"],
+        access_level=exploit.get("access_level", "unknown"),
+        os_info=recon.get("os_detected", ""),
+        objective=state["objective"],
+    )
+
     return {
-        "privesc_findings": findings,
+        "privesc_findings": dict(findings),
         "current_stage": "privesc",
-        "messages": [AIMessage(content="[PrivEsc] Skipped — not yet implemented.")],
+        "messages": [AIMessage(content=f"[PrivEsc Complete] {findings['summary']}")],
     }
 
 
 def impact_stage_node(state: PipelineState) -> dict:
-    """Stub — impact stage not yet implemented."""
-    print_colored("\n[Pipeline] Impact stage (stub — not implemented)", Colors.WARNING)
-    findings = {
-        "success": False,
-        "actions": [],
-        "summary": "Impact stage not yet implemented.",
-    }
+    """Run the impact subgraph to prove the objective was achieved."""
+    print_colored("\n[Pipeline] Running Impact stage...", Colors.HEADER)
+
+    exploit = state.get("exploitation_findings", {})
+    recon = state.get("recon_findings", {})
+    persist = state.get("persistence_findings", {})
+    privesc = state.get("privesc_findings", {})
+
+    # Skip if no session
+    if not exploit.get("success") or not exploit.get("session_id"):
+        print_colored("[Pipeline] No active session — skipping impact.", Colors.WARNING)
+        findings = {
+            "success": False,
+            "actions": [],
+            "summary": "Impact skipped — no session available.",
+        }
+        return {
+            "impact_findings": findings,
+            "current_stage": "impact",
+            "messages": [AIMessage(content="[Impact] Skipped — no active session.")],
+        }
+
+    # Build prior findings summary
+    prior_summary = (
+        f"Recon: {recon.get('summary', 'N/A')}\n"
+        f"Exploitation: {exploit.get('summary', 'N/A')}\n"
+        f"Persistence: {persist.get('summary', 'N/A')}\n"
+        f"PrivEsc: {privesc.get('summary', 'N/A')}\n"
+    )
+
+    # Use escalated access level if available
+    access_level = privesc.get("new_level", exploit.get("access_level", "unknown"))
+
+    findings = run_impact(
+        target_ip=exploit.get("target_ip", state["target_ip"]),
+        objective=state["objective"],
+        session_id=exploit["session_id"],
+        session_type=exploit["session_type"],
+        access_level=access_level,
+        prior_findings_summary=prior_summary,
+    )
+
     return {
-        "impact_findings": findings,
+        "impact_findings": dict(findings),
         "current_stage": "impact",
-        "messages": [AIMessage(content="[Impact] Skipped — not yet implemented.")],
+        "messages": [AIMessage(content=f"[Impact Complete] {findings['summary']}")],
     }
 
 # =============================================================================
