@@ -26,6 +26,7 @@ from langgraph.types import RetryPolicy
 
 from tools.metasploit_tools import msf_session
 from tools.rag import query_knowledge_base, add_to_knowledge_base, query_successful_attacks
+from tools.service_mapping import match_exploits
 
 # =============================================================================
 # CONFIGURATION
@@ -41,7 +42,7 @@ MSF_PORT = 55553
 MSF_USER = "kali"
 MSF_PASS = "kali"
 
-MAX_RETRIES = 10
+MAX_RETRIES = 5
 MAX_EXECUTOR_TOOL_CALLS = 15
 MAX_RESEARCHER_TOOL_CALLS = 10
 TOKEN_SENSITIVE_THRESHOLD = 100000
@@ -224,6 +225,9 @@ You receive:
 
 Your job: interpret user intent, evaluate research results for compatibility, and select ONE attack vector.
 
+**PRIORITIZATION**: If the research results include HIGH-CONFIDENCE deterministic matches (from service fingerprints),
+prefer those over RAG-sourced or general-knowledge exploits unless they've already been tried and failed.
+
 **Rules:**
 1. **USER INTENT IS THE PRIMARY DECISION DRIVER** — if the user specifies a payload type (e.g., "python reverse shell"), language, technique, or module, the chosen approach MUST actually deliver that. If no MSF module supports the user's preferred payload type for the target service, you MUST switch to approach "manual" instead of forcing an incompatible MSF payload.
 2. EVALUATE COMPATIBILITY — check each research result against the target:
@@ -274,7 +278,10 @@ Your job: query the knowledge bases to find viable exploits for the target's ser
 4. You have a MAXIMUM of 5 queries total across both tools. Cover DIVERSE services — do not spend all queries on one service. If the target has 5+ interesting ports, spread your queries across them.
 5. **GENERAL KNOWLEDGE FALLBACK**: If the knowledge base returns poor results, provide your summary using general knowledge of Metasploit modules and known CVEs.
 6. **MANUAL TECHNIQUES**: Note where manual exploitation (netcat, crafted payloads, curl-based RCE) may be viable, especially if MSF modules don't support the user's preferred payload type.
-7. When done, respond with a TEXT SUMMARY (no tool calls) listing all viable exploits found:
+7. **DETERMINISTIC MATCHES**: If HIGH-CONFIDENCE EXPLOIT MATCHES are provided in the context,
+   these are pre-verified service-to-exploit mappings. Include them in your summary as top candidates.
+   Focus your RAG queries on services NOT covered by deterministic matches.
+8. When done, respond with a TEXT SUMMARY (no tool calls) listing all viable exploits found:
    - MSF module path for each
    - Compatible payload types (e.g., cmd/unix/reverse_python, cmd/unix/reverse_perl)
    - Required parameters
@@ -349,8 +356,9 @@ You have access to the Metasploit console and a Linux terminal. Execute the atta
 10. General best practice: after `use <module>`, run `show payloads` EARLY to discover compatible payloads
 
 **Manual Attack Rules:**
-13. If the attack plan specifies a MANUAL approach (not MSF), use `tool_linux_terminal` for all commands instead of `tool_metasploit_rpc`.
-14. For listener setup in manual mode, use backgrounded commands (e.g., `nohup nc -lvnp 4444 > /tmp/shell_output.txt 2>&1 &`) to avoid blocking the terminal.
+11. Do NOT install packages (no apt-get, no pip, no gem). Use only tools already available on Kali.
+12. If the attack plan specifies a MANUAL approach (not MSF), use `tool_linux_terminal` for all commands instead of `tool_metasploit_rpc`.
+13. For listener setup in manual mode, use backgrounded commands (e.g., `nohup nc -lvnp 4444 > /tmp/shell_output.txt 2>&1 &`) to avoid blocking the terminal.
 
 **Success indicators:** "Command shell session X opened", "Meterpreter session X opened"
 **Failure indicators:** "Exploit completed, but no session", "Connection refused", "Unknown command"
@@ -395,6 +403,61 @@ Be extremely concise to save tokens."""
 COMPRESS_PROMPT = """Summarize this technical output. Keep all IP addresses, port numbers,
 vulnerability IDs (CVEs), specific error codes, and MSF module paths. Remove redundant logs or fluff.
 Return a technical summary of the 'Results Found'."""
+
+def _extract_failed_exploits(messages) -> list:
+    """Extract DO_NOT_REPEAT module paths from all critic feedback in message history.
+
+    Handles formats:
+      - Bullet list:    "- exploit/unix/..."
+      - Numbered list:  "1. exploit/unix/..."
+      - Inline CSV:     "DO_NOT_REPEAT: `mod1`, `mod2`"
+    """
+    failed = []
+    for msg in messages:
+        content = msg.content if hasattr(msg, 'content') and msg.content else ""
+        if "DO_NOT_REPEAT" not in content:
+            continue
+        lines = content.split('\n')
+        in_do_not_repeat = False
+        for line in lines:
+            stripped = line.strip()
+            if 'DO_NOT_REPEAT' in line:
+                in_do_not_repeat = True
+                # Check for inline items on the same line
+                after = line.split('DO_NOT_REPEAT', 1)[1].lstrip(':').strip()
+                # Extract backtick-wrapped items
+                items = re.findall(r'`([^`]+)`', after)
+                if items:
+                    for item in items:
+                        item = item.strip()
+                        if item and ('/' in item or item.startswith('cmd')):
+                            failed.append(item)
+                    continue
+                # Fallback: comma-separated without backticks
+                for part in after.split(','):
+                    item = part.strip().strip('`').strip()
+                    if item and ('/' in item or item.startswith('cmd')):
+                        failed.append(item)
+                continue
+            if in_do_not_repeat:
+                # Stop at empty line or new section header (e.g. "NEXT_ACTION:")
+                if not stripped or (re.match(r'^[A-Z_]+:', stripped) and '/' not in stripped):
+                    in_do_not_repeat = False
+                    continue
+                # Numbered list: "1. exploit/unix/..." or "1) exploit/..."
+                if re.match(r'^\d+[\.\)]\s*', stripped):
+                    item = re.sub(r'^\d+[\.\)]\s*', '', stripped).strip('`').strip()
+                    if item and ('/' in item or item.startswith('cmd')):
+                        failed.append(item)
+                    continue
+                # Bullet list: "- exploit/unix/..."
+                if stripped.startswith('-'):
+                    item = stripped.lstrip('- ').strip('`').strip()
+                    if item and ('/' in item or item.startswith('cmd')):
+                        failed.append(item)
+                    continue
+    return list(dict.fromkeys(failed))  # Deduplicate preserving order
+
 
 MSF_ERROR_INDICATORS = [
     "Exploit completed, but no session",
@@ -584,8 +647,20 @@ def planner_node(state: AgentState) -> dict:
         if isinstance(msg, AIMessage) and "[Recon Parser]" in (msg.content or ""):
             break
 
-    # Build context for the planner
-    context = f"USER OBJECTIVE:\n{user_input}\n\n"
+    # Extract failed exploits from ALL prior critic feedback
+    failed_modules = _extract_failed_exploits(messages)
+
+    # Build context for the planner — banned list goes FIRST
+    context = ""
+    if failed_modules:
+        banned = '\n'.join(f'  - {m}' for m in failed_modules)
+        context += (
+            f"BANNED — THESE MODULES/PAYLOADS ALREADY FAILED. DO NOT SELECT THEM:\n"
+            f"{banned}\n"
+            f"You MUST choose a completely different exploit module.\n\n"
+        )
+
+    context += f"USER OBJECTIVE:\n{user_input}\n\n"
     context += f"TARGET INFO:\n{json.dumps(target_info, indent=2)}\n\n"
     context += f"RESEARCH RESULTS:\n{researcher_summary}\n\n"
     if rag_results:
@@ -614,6 +689,39 @@ def planner_node(state: AgentState) -> dict:
         tool_candidate = {"module": None, "description": "No module selected", "source": "planner", "approach": "msf"}
     if "approach" not in tool_candidate:
         tool_candidate["approach"] = "msf"
+
+    # --- HARD GUARDRAIL: reject banned modules ---
+    selected_module = (tool_candidate.get("module") or "").strip()
+    if selected_module and failed_modules:
+        for banned in failed_modules:
+            if banned.lower() in selected_module.lower() or selected_module.lower() in banned.lower():
+                print_colored(
+                    f"[Planner] GUARDRAIL: Rejected banned module '{selected_module}'. Forcing re-pick.",
+                    Colors.WARNING,
+                )
+                # Re-prompt with a very explicit instruction
+                override_msg = (
+                    f"CRITICAL: You selected '{selected_module}' which has ALREADY FAILED and is BANNED.\n"
+                    f"BANNED modules: {', '.join(failed_modules)}\n\n"
+                    f"You MUST pick a DIFFERENT exploit module. Consider:\n"
+                    f"- Samba (exploit/linux/samba/is_known_pipename) on port 445\n"
+                    f"- UnrealIRCd (exploit/unix/irc/unreal_ircd_3281_backdoor) on port 6667\n"
+                    f"- Manual approach (SSH brute force, web app exploit, etc.)\n\n"
+                    f"TARGET INFO:\n{json.dumps(target_info, indent=2)}\n\n"
+                    f"Output your plan in PART 1 (strategy) and PART 2 (JSON) format."
+                )
+                response2 = call_llm(
+                    messages=[HumanMessage(content=override_msg)],
+                    system_prompt=PLANNER_PROMPT,
+                )
+                plan = response2.content
+                print_colored(f"[Planner] Re-picked strategy: {plan[:200]}...", Colors.OKGREEN)
+                tool_candidate = parse_json_response(plan)
+                if not tool_candidate:
+                    tool_candidate = {"module": None, "description": "No module selected", "source": "planner", "approach": "msf"}
+                if "approach" not in tool_candidate:
+                    tool_candidate["approach"] = "msf"
+                break
 
     return {
         "messages": [AIMessage(content=f"[Planner] {plan}")],
@@ -659,11 +767,37 @@ def researcher_node(state: AgentState) -> dict:
         if isinstance(msg, ToolMessage):
             researcher_tool_count += 1
 
+    # Extract failed exploits from prior critic feedback
+    failed_modules = _extract_failed_exploits(messages)
+
     # Build context from target info AND user objective
-    context = (
+    context = ""
+    if failed_modules:
+        banned = '\n'.join(f'  - {m}' for m in failed_modules)
+        context += (
+            f"BANNED — THESE MODULES ALREADY FAILED. DO NOT RECOMMEND THEM:\n"
+            f"{banned}\n"
+            f"Focus your queries on DIFFERENT services and exploits.\n\n"
+        )
+
+    context += (
         f"USER OBJECTIVE:\n{user_input}\n\n"
         f"TARGET INFO:\n{json.dumps(target_info, indent=2)}\n\n"
     )
+
+    # Deterministic exploit lookup BEFORE RAG
+    failed_list = list(failed_modules) if failed_modules else []
+    exploit_candidates = match_exploits(target_info, failed_modules=failed_list)
+    if exploit_candidates:
+        context += "\n**HIGH-CONFIDENCE EXPLOIT MATCHES (from service fingerprints):**\n"
+        for i, candidate in enumerate(exploit_candidates, 1):
+            context += f"{i}. {candidate['module']} -> port {candidate['matched_port']}/{candidate['matched_service']}\n"
+            context += f"   Payload: {candidate['default_payload']}, Confidence: {candidate['confidence']}\n"
+            if candidate.get('required_options'):
+                context += f"   Required options: {candidate['required_options']}\n"
+            context += f"   Notes: {candidate['notes']}\n"
+        context += "\nThese are deterministic matches based on exact service versions. Prioritize these over RAG results.\n\n"
+
     context += f"You have made {researcher_tool_count} knowledge base queries so far."
 
     # Include any critic feedback if retrying
@@ -687,13 +821,17 @@ def researcher_node(state: AgentState) -> dict:
                 break
 
         rag_summary = "\n---\n".join(rag_snippets) if rag_snippets else "No results found."
+        banned_reminder = ""
+        if failed_modules:
+            banned_list = ', '.join(failed_modules)
+            banned_reminder = f"\nIMPORTANT: Do NOT include these already-failed modules in your summary: {banned_list}\n"
         force_msg = HumanMessage(content=(
             f"{context}\n\n"
             f"RAG RESULTS SO FAR:\n{rag_summary}\n\n"
             "You have reached the maximum number of knowledge base queries. "
             "Provide a text summary of what you found. If the RAG results were "
             "not relevant, use your GENERAL KNOWLEDGE of Metasploit modules and "
-            "known vulnerabilities for the target services/versions listed above."
+            f"known vulnerabilities for the target services/versions listed above.{banned_reminder}"
         ))
         response = call_llm(
             messages=[force_msg],
@@ -831,7 +969,15 @@ def executor_tools_node(state: AgentState) -> dict:
     if "messages" in result:
         for msg in result["messages"]:
             if isinstance(msg, ToolMessage) and msg.content:
-                if any(ind in msg.content for ind in MSF_ERROR_INDICATORS):
+                # --- SESSION DETECTION: tell executor to STOP ---
+                if re.search(r'session \d+ opened', msg.content, re.IGNORECASE):
+                    msg.content += (
+                        "\n\n*** SESSION OPENED SUCCESSFULLY! ***\n"
+                        "STOP making tool calls immediately. Do NOT run any more commands.\n"
+                        "Provide your text assessment now: report the session ID, type, and "
+                        "that the exploit succeeded."
+                    )
+                elif any(ind in msg.content for ind in MSF_ERROR_INDICATORS):
                     try:
                         hint_response = call_llm(
                             messages=[HumanMessage(content=f"MSF tool output:\n{msg.content[-1500:]}")],
@@ -886,11 +1032,13 @@ def critic_node(state: AgentState) -> dict:
         if isinstance(msg, ToolMessage):
             tool_outputs.append(msg.content[-800:] if len(msg.content) > 800 else msg.content)
 
-    # Scan recent tool outputs for Metasploit session-opened indicators
+    # Scan ALL tool outputs since parameter solver for session-opened indicators
     session_detected = False
-    for msg in messages[-10:]:
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and "[Parameter Solver]" in (msg.content or ""):
+            break
         if isinstance(msg, ToolMessage) and msg.content:
-            if re.search(r"(session \d+ opened|Meterpreter session \d+ opened)", msg.content):
+            if re.search(r"session \d+ opened", msg.content, re.IGNORECASE):
                 session_detected = True
                 break
 
@@ -1062,13 +1210,31 @@ def _extract_findings(state: dict) -> ExploitationFindings:
     else:
         exploit_used = "unknown"
 
-    # --- access_level: infer from execution_result ---
+    # --- access_level: determine by actually running whoami on the session ---
     access_level = "unknown"
     result_lower = (execution_result or "").lower()
+
+    # Check execution output for root evidence first
     if "root" in result_lower or "uid=0" in result_lower:
         access_level = "root"
     elif session_id:
-        access_level = "user"
+        # Actually check via the MSF session — run whoami on the target
+        try:
+            from tools.metasploit_tools import msf_session as _msf
+            import time as _time
+            _msf.send_command(f"sessions {session_id}")
+            _time.sleep(2)
+            whoami_out = str(_msf.send_command("whoami")).strip().lower()
+            print_colored(f"[Access Check] whoami on session {session_id}: {whoami_out}", Colors.OKCYAN)
+            if "root" in whoami_out or "uid=0" in whoami_out:
+                access_level = "root"
+            else:
+                access_level = "user"
+            # Background back to MSF console
+            _msf.send_command("background")
+        except Exception as e:
+            print_colored(f"[Access Check] Failed to check whoami: {e}", Colors.WARNING)
+            access_level = "user"  # Conservative default
 
     # --- summary ---
     if success and session_id:
@@ -1164,6 +1330,15 @@ def route_after_researcher(state: AgentState) -> Literal["researcher_tools", "pl
 def route_after_executor(state: AgentState) -> Literal["executor_tools", "critic"]:
     """Route executor output: tool call → tools node, text → critic."""
     last_msg = state['messages'][-1]
+
+    # --- Session detection shortcut: if any tool output shows session opened, go to critic ---
+    for msg in reversed(state['messages']):
+        if isinstance(msg, AIMessage) and "[Parameter Solver]" in (msg.content or ""):
+            break
+        if isinstance(msg, ToolMessage) and msg.content:
+            if re.search(r'session \d+ opened', msg.content, re.IGNORECASE):
+                print_colored("[Executor] SESSION DETECTED in tool output — routing to critic.", Colors.OKGREEN)
+                return "critic"
 
     if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
         # Check safety valve

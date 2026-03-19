@@ -1,4 +1,5 @@
 from pymetasploit3.msfrpc import MsfRpcClient
+from langchain_core.tools import tool
 import time
 
 class MetasploitSession:
@@ -43,6 +44,67 @@ class MetasploitSession:
 
         return output
 
+    def get_session_type(self, session_id):
+        """Query session.list and return the session type string (e.g., 'shell' or 'meterpreter')."""
+        result = self.client.call('session.list')
+        # Keys can be int or str depending on msgpack decoding
+        for sid, details in result.items():
+            if str(sid) == str(session_id):
+                return details.get(b'type', details.get('type', b'shell'))
+        return None
+
+    def run_session_command(self, session_id, command, timeout=10):
+        """Execute a command directly on a session using the session API.
+
+        Auto-detects session type (command_shell vs meterpreter) and uses
+        the correct RPC method. Returns output string.
+
+        Bypasses the MSF console entirely — each command is atomic and targeted.
+        """
+        session_type = self.get_session_type(session_id)
+        if session_type is None:
+            return f"Error: Session {session_id} not found. Use tool_metasploit_rpc('sessions') to list active sessions."
+
+        # Decode bytes if needed
+        if isinstance(session_type, bytes):
+            session_type = session_type.decode('utf-8', errors='ignore')
+
+        sid = str(session_id)
+
+        if 'meterpreter' in session_type:
+            self.client.call('session.meterpreter_write', [sid, command])
+            time.sleep(2)
+            output = ""
+            elapsed = 0
+            while elapsed < timeout:
+                resp = self.client.call('session.meterpreter_read', [sid])
+                data = resp.get(b'data', resp.get('data', b''))
+                if isinstance(data, bytes):
+                    data = data.decode('utf-8', errors='ignore')
+                output += data
+                if data:
+                    break
+                time.sleep(1)
+                elapsed += 1
+            return output if output else "(no output)"
+        else:
+            # command_shell — append newline to execute
+            self.client.call('session.shell_write', [sid, command + "\n"])
+            time.sleep(2)
+            output = ""
+            elapsed = 0
+            while elapsed < timeout:
+                resp = self.client.call('session.shell_read', [sid])
+                data = resp.get(b'data', resp.get('data', b''))
+                if isinstance(data, bytes):
+                    data = data.decode('utf-8', errors='ignore')
+                output += data
+                if not data:
+                    break
+                time.sleep(1)
+                elapsed += 1
+            return output if output else "(no output)"
+
     def cleanup(self):
         """Destroy the console to free memory on Kali."""
         try:
@@ -60,3 +122,19 @@ msf_session = MetasploitSession(
     user="kali",
     password="kali"
 )
+
+
+@tool
+def tool_session_command(session_id: str, command: str):
+    """Execute a command ON THE TARGET through an active Metasploit session.
+
+    This runs directly on the compromised target machine — NOT on Kali.
+    Uses the MSF session API (session.shell_write/read) for reliable, atomic command execution.
+
+    Use for: whoami, id, crontab -l, cat /etc/passwd, mkdir, echo, chmod, etc.
+
+    Args:
+        session_id: The MSF session ID (e.g., "3")
+        command: The command to run on the target
+    """
+    return msf_session.run_session_command(session_id, command)

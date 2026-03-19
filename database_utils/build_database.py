@@ -13,8 +13,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHea
 from langchain_core.documents import Document
 
 # --- 1. CONFIGURATION ---
-DB_BASE_DIR = "./databases"
-SOURCE_DOCS_DIR = "./documents"
+DB_BASE_DIR = "../databases"
+SOURCE_DOCS_DIR = "documents"
 
 # YAML Config
 YAML_SPLIT_AT_BRANCH = "atomic_tests"

@@ -1,35 +1,40 @@
 """
-Orchestrator Pipeline — top-level LangGraph workflow.
+Graph-Driven Orchestrator — walks an AttackGraph, dispatching subagents per node.
 
 Architecture:
-    Planner ⟺ RAG tools → Recon → Initial Access → Persistence → PrivEsc → Impact → Critic
-                                                                                        ↓
-                                                                            PASS → Success Logger → END
-                                                                            FAIL → Planner (max 3 retries)
+    Load/receive AttackGraph
+        │
+        ▼
+    ┌─ LOOP ─────────────────────────────────────────────┐
+    │  ready = graph.ready_nodes()                       │
+    │  if none → done                                    │
+    │  for each ready node:                              │
+    │    context = graph.gather_preceding_findings(node)  │
+    │    dispatch to subagent (based on node.agent_type)  │
+    │    write findings + commands back to node           │
+    │    update graph status                             │
+    │    graph.save() (checkpoint)                       │
+    └────────────────────────────────────────────────────┘
 
 Usage:
-    python -m core_agents.orchestrator               # Interactive REPL
-    python -m core_agents.orchestrator --graph        # Print graph topology
+    from core_agents.orchestrator import run_graph
+    from core_agents.attack_graph import AttackGraph
 
-    from core_agents.orchestrator import run_pipeline
-    result = run_pipeline(target_ip="192.168.34.7", objective="Get a shell on the target")
+    graph = AttackGraph.load("examples/disk_wipe_graph.json")
+    result = run_graph(graph)
+
+    # Or interactively:
+    python -m core_agents.orchestrator examples/disk_wipe_graph.json
 """
 
 import sys
 import json
 import time
-from typing import Literal
+from pathlib import Path
+from typing import Optional
 
-from langchain_core.messages import HumanMessage, AIMessage
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import MemorySaver
-
-from core_agents.state import PipelineState, STAGES
-from core_agents.common import (
-    Colors, print_colored, call_llm, MAX_PIPELINE_RETRIES,
-)
-from core_agents.prompts import PLANNER_PROMPT, CRITIC_PROMPT
+from core_agents.attack_graph import AttackGraph, AttackNode, NodeStatus
+from core_agents.common import Colors, print_colored, MAX_PIPELINE_RETRIES
 
 from stages.recon import run_recon
 from stages.initial_access import run_exploitation
@@ -37,580 +42,516 @@ from stages.persistence import run_persistence
 from stages.privesc import run_privesc
 from stages.impact import run_impact
 
-from tools.rag import query_knowledge_base, query_successful_attacks, log_successful_attack
 
 # =============================================================================
-# PLANNER TOOLS (RAG lookups available to the planner)
+# SUBAGENT DISPATCH — routes a node to the right stage runner
 # =============================================================================
 
-PLANNER_TOOLS = [query_successful_attacks, query_knowledge_base]
+def dispatch_node(node: AttackNode, graph: AttackGraph) -> dict:
+    """
+    Execute a single node by dispatching to the appropriate subagent.
 
-# =============================================================================
-# NODE: PLANNER
-# =============================================================================
+    Reads the node's self-contained config (module, options, objective, etc.)
+    and upstream findings from the graph, then calls the matching stage runner.
 
-def planner_node(state: PipelineState) -> dict:
-    """LLM reads objective + past successes + critic feedback, produces attack plan."""
-    objective = state.get("objective", "")
-    target_ip = state.get("target_ip", "")
-    critic_feedback = state.get("critic_feedback", "")
-    loop_step = state.get("loop_step", 0)
+    Returns the findings dict from the subagent.
+    """
+    agent_type = node.agent_type
+    preceding = graph.gather_preceding_findings(node.id)
 
-    print_colored(f"\n[Pipeline] Planner node (attempt {loop_step + 1}/{MAX_PIPELINE_RETRIES})", Colors.HEADER)
-
-    context = f"OBJECTIVE: {objective}\nTARGET IP: {target_ip}\n"
-    if critic_feedback:
-        context += f"\nCRITIC FEEDBACK FROM PREVIOUS ATTEMPT:\n{critic_feedback}\n"
-
-    # Include prior stage findings summary on retry so planner knows what was tried
-    if loop_step > 0:
-        recon = state.get("recon_findings", {})
-        exploit = state.get("exploitation_findings", {})
-        if recon:
-            context += f"\nPREVIOUS RECON SUMMARY: {recon.get('summary', 'N/A')}\n"
-        if exploit:
-            context += f"\nPREVIOUS EXPLOITATION SUMMARY: {exploit.get('summary', 'N/A')}\n"
-            context += f"  Exploit used: {exploit.get('exploit_used', 'N/A')}\n"
-            context += f"  Success: {exploit.get('success', False)}\n"
-
-    response = call_llm(
-        messages=[HumanMessage(content=context)],
-        system_prompt=PLANNER_PROMPT,
-        tools=PLANNER_TOOLS,
+    print_colored(
+        f"\n[Orchestrator] Dispatching node '{node.id}' ({node.label}) → agent: {agent_type}",
+        Colors.HEADER,
     )
+    if preceding:
+        print_colored(
+            f"  Preceding findings from: {list(preceding.keys())}",
+            Colors.OKCYAN,
+        )
 
-    return {"messages": [response]}
+    if agent_type == "recon":
+        return _dispatch_recon(node, graph, preceding)
+    elif agent_type == "exploit":
+        return _dispatch_exploit(node, graph, preceding)
+    elif agent_type == "persistence":
+        return _dispatch_persistence(node, graph, preceding)
+    elif agent_type == "privesc":
+        return _dispatch_privesc(node, graph, preceding)
+    elif agent_type == "impact":
+        return _dispatch_impact(node, graph, preceding)
+    elif agent_type == "discovery":
+        return _dispatch_discovery(node, graph, preceding)
+    else:
+        print_colored(
+            f"  [WARNING] Unknown agent_type '{agent_type}' — skipping node.",
+            Colors.WARNING,
+        )
+        return {"success": False, "summary": f"Unknown agent_type: {agent_type}"}
 
-
-def planner_tools_node(state: PipelineState) -> dict:
-    """Execute RAG tool calls from the planner."""
-    tool_node = ToolNode(PLANNER_TOOLS)
-    return tool_node.invoke(state)
-
-
-def route_after_planner(state: PipelineState) -> Literal["planner_tools", "recon_stage"]:
-    """Route planner output: tool call -> planner_tools, text -> recon stage."""
-    last_msg = state["messages"][-1]
-    if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-        return "planner_tools"
-    # Extract plan text and store it
-    return "recon_stage"
 
 # =============================================================================
-# NODE: PLAN EXTRACTOR (captures plan text before entering stages)
+# DISPATCH IMPLEMENTATIONS — one per agent type
 # =============================================================================
 
-def plan_extractor_node(state: PipelineState) -> dict:
-    """Extract the plan text from the planner's final response."""
-    # Find the last AI message with text content (the plan)
-    plan_text = ""
-    for msg in reversed(state["messages"]):
-        if isinstance(msg, AIMessage) and msg.content and not getattr(msg, "tool_calls", None):
-            plan_text = msg.content
+def _dispatch_recon(node: AttackNode, graph: AttackGraph, preceding: dict) -> dict:
+    """Dispatch to the recon stage runner."""
+    findings = run_recon(
+        target_ip=node.target_ip or graph.target_ip,
+        goal=node.objective or graph.objective,
+    )
+    return dict(findings)
+
+
+def _dispatch_exploit(node: AttackNode, graph: AttackGraph, preceding: dict) -> dict:
+    """Dispatch to the exploitation stage runner."""
+    # Build target_info from preceding recon findings if available
+    target_info = {"ip": node.target_ip or graph.target_ip}
+    raw_recon = ""
+
+    for pred_id, pred_findings in preceding.items():
+        # Look for recon-like findings
+        if "ports" in pred_findings or "target_info" in pred_findings:
+            target_info = pred_findings.get("target_info", target_info)
+            raw_recon = pred_findings.get("raw_nmap_output", "")
             break
 
-    print_colored(f"[Pipeline] Plan captured ({len(plan_text)} chars)", Colors.OKGREEN)
-    if plan_text:
-        print_colored(f"[Pipeline] Plan preview:\n{plan_text[:500]}", Colors.OKBLUE)
-
-    return {"plan": plan_text}
-
-# =============================================================================
-# STAGE NODES
-# =============================================================================
-
-def recon_stage_node(state: PipelineState) -> dict:
-    """Run the recon subgraph and capture findings."""
-    print_colored("\n[Pipeline] Running Recon stage...", Colors.HEADER)
-
-    findings = run_recon(
-        target_ip=state["target_ip"],
-        goal=state["objective"],
-    )
-
-    return {
-        "recon_findings": dict(findings),
-        "current_stage": "recon",
-        "messages": [AIMessage(content=f"[Recon Complete] {findings['summary']}")],
-    }
-
-
-def initial_access_stage_node(state: PipelineState) -> dict:
-    """Run the exploitation subgraph using recon findings."""
-    print_colored("\n[Pipeline] Running Initial Access stage...", Colors.HEADER)
-
-    recon = state.get("recon_findings", {})
-    target_info = recon.get("target_info", {"ip": state["target_ip"]})
-    raw_nmap = recon.get("raw_nmap_output", "")
+    # Pass the node's module/options as hint in the objective
+    objective = node.objective or graph.objective
+    if node.module:
+        objective += (
+            f"\n\nSUGGESTED MODULE: {node.module}"
+            f"\nPayload: {node.payload}"
+            f"\nOptions: {json.dumps(node.module_options)}"
+        )
+        if node.payload_options:
+            objective += f"\nPayload options: {json.dumps(node.payload_options)}"
 
     findings = run_exploitation(
         target_info=target_info,
-        objective=state["objective"],
-        raw_recon=raw_nmap,
+        objective=objective,
+        raw_recon=raw_recon,
     )
-
-    return {
-        "exploitation_findings": dict(findings),
-        "current_stage": "initial_access",
-        "messages": [AIMessage(content=f"[Initial Access Complete] {findings['summary']}")],
-    }
+    return dict(findings)
 
 
-def persistence_stage_node(state: PipelineState) -> dict:
-    """Run the persistence subgraph using exploitation findings."""
-    print_colored("\n[Pipeline] Running Persistence stage...", Colors.HEADER)
+def _dispatch_persistence(node: AttackNode, graph: AttackGraph, preceding: dict) -> dict:
+    """Dispatch to the persistence stage runner."""
+    # Find session info from preceding exploit findings
+    session_id = ""
+    session_type = ""
+    access_level = "unknown"
 
-    exploit = state.get("exploitation_findings", {})
+    for pred_id, pred_findings in preceding.items():
+        if "session_id" in pred_findings and pred_findings.get("success"):
+            session_id = str(pred_findings["session_id"])
+            session_type = pred_findings.get("session_type", "shell")
+            access_level = pred_findings.get("access_level", "unknown")
+            break
 
-    # Skip if no session was obtained
-    if not exploit.get("success") or not exploit.get("session_id"):
-        print_colored("[Pipeline] No active session — skipping persistence.", Colors.WARNING)
-        findings = {
+    if not session_id:
+        return {
             "success": False,
             "method": "",
-            "details": "Skipped: no active session from initial access.",
+            "details": "No active session from preceding nodes.",
             "summary": "Persistence skipped — no session available.",
         }
-        return {
-            "persistence_findings": findings,
-            "current_stage": "persistence",
-            "messages": [AIMessage(content="[Persistence] Skipped — no active session.")],
-        }
+
+    # Pass module hint in objective
+    objective = node.objective or graph.objective
+    if node.module:
+        objective += (
+            f"\n\nSUGGESTED MODULE: {node.module}"
+            f"\nPayload: {node.payload}"
+            f"\nOptions: {json.dumps(node.module_options)}"
+        )
 
     findings = run_persistence(
-        target_ip=exploit.get("target_ip", state["target_ip"]),
-        session_id=exploit["session_id"],
-        session_type=exploit["session_type"],
-        access_level=exploit.get("access_level", "unknown"),
-        objective=state["objective"],
+        target_ip=node.target_ip or graph.target_ip,
+        session_id=session_id,
+        session_type=session_type,
+        access_level=access_level,
+        objective=objective,
     )
-
-    return {
-        "persistence_findings": dict(findings),
-        "current_stage": "persistence",
-        "messages": [AIMessage(content=f"[Persistence Complete] {findings['summary']}")],
-    }
+    return dict(findings)
 
 
-def privesc_stage_node(state: PipelineState) -> dict:
-    """Run the privesc subgraph using exploitation findings."""
-    print_colored("\n[Pipeline] Running PrivEsc stage...", Colors.HEADER)
+def _dispatch_privesc(node: AttackNode, graph: AttackGraph, preceding: dict) -> dict:
+    """Dispatch to the privilege escalation stage runner."""
+    session_id = ""
+    session_type = ""
+    access_level = "unknown"
+    os_info = ""
 
-    exploit = state.get("exploitation_findings", {})
-    recon = state.get("recon_findings", {})
+    for pred_id, pred_findings in preceding.items():
+        if "session_id" in pred_findings and pred_findings.get("success"):
+            session_id = str(pred_findings["session_id"])
+            session_type = pred_findings.get("session_type", "shell")
+            access_level = pred_findings.get("access_level", "unknown")
+        if "os_detected" in pred_findings:
+            os_info = pred_findings["os_detected"]
 
-    # Skip if no session
-    if not exploit.get("success") or not exploit.get("session_id"):
-        print_colored("[Pipeline] No active session — skipping privesc.", Colors.WARNING)
-        findings = {
+    if not session_id:
+        return {
             "success": False,
             "technique": "",
             "previous_level": "",
             "new_level": "",
             "summary": "PrivEsc skipped — no session available.",
         }
-        return {
-            "privesc_findings": findings,
-            "current_stage": "privesc",
-            "messages": [AIMessage(content="[PrivEsc] Skipped — no active session.")],
-        }
 
     findings = run_privesc(
-        target_ip=exploit.get("target_ip", state["target_ip"]),
-        session_id=exploit["session_id"],
-        session_type=exploit["session_type"],
-        access_level=exploit.get("access_level", "unknown"),
-        os_info=recon.get("os_detected", ""),
-        objective=state["objective"],
+        target_ip=node.target_ip or graph.target_ip,
+        session_id=session_id,
+        session_type=session_type,
+        access_level=access_level,
+        os_info=os_info,
+        objective=node.objective or graph.objective,
     )
-
-    return {
-        "privesc_findings": dict(findings),
-        "current_stage": "privesc",
-        "messages": [AIMessage(content=f"[PrivEsc Complete] {findings['summary']}")],
-    }
+    return dict(findings)
 
 
-def impact_stage_node(state: PipelineState) -> dict:
-    """Run the impact subgraph to prove the objective was achieved."""
-    print_colored("\n[Pipeline] Running Impact stage...", Colors.HEADER)
+def _dispatch_impact(node: AttackNode, graph: AttackGraph, preceding: dict) -> dict:
+    """Dispatch to the impact stage runner."""
+    session_id = ""
+    session_type = ""
+    access_level = "unknown"
 
-    exploit = state.get("exploitation_findings", {})
-    recon = state.get("recon_findings", {})
-    persist = state.get("persistence_findings", {})
-    privesc = state.get("privesc_findings", {})
+    for pred_id, pred_findings in preceding.items():
+        if "session_id" in pred_findings and pred_findings.get("success"):
+            session_id = str(pred_findings["session_id"])
+            session_type = pred_findings.get("session_type", "shell")
+            access_level = pred_findings.get("access_level", "unknown")
+        # PrivEsc may have escalated the level
+        if "new_level" in pred_findings and pred_findings.get("success"):
+            access_level = pred_findings["new_level"]
 
-    # Skip if no session
-    if not exploit.get("success") or not exploit.get("session_id"):
-        print_colored("[Pipeline] No active session — skipping impact.", Colors.WARNING)
-        findings = {
+    if not session_id:
+        return {
             "success": False,
             "actions": [],
             "summary": "Impact skipped — no session available.",
         }
-        return {
-            "impact_findings": findings,
-            "current_stage": "impact",
-            "messages": [AIMessage(content="[Impact] Skipped — no active session.")],
-        }
 
-    # Build prior findings summary
-    prior_summary = (
-        f"Recon: {recon.get('summary', 'N/A')}\n"
-        f"Exploitation: {exploit.get('summary', 'N/A')}\n"
-        f"Persistence: {persist.get('summary', 'N/A')}\n"
-        f"PrivEsc: {privesc.get('summary', 'N/A')}\n"
-    )
+    # Build prior findings summary from all predecessors
+    prior_lines = []
+    for pred_id, pred_findings in preceding.items():
+        prior_lines.append(f"{pred_id}: {pred_findings.get('summary', 'N/A')}")
+    prior_summary = "\n".join(prior_lines)
 
-    # Use escalated access level if available
-    access_level = privesc.get("new_level", exploit.get("access_level", "unknown"))
+    # Include pre-planned commands in the objective
+    objective = node.objective or graph.objective
+    if node.commands_to_run:
+        objective += f"\n\nPRE-PLANNED COMMANDS:\n" + "\n".join(
+            f"  {i+1}. {cmd}" for i, cmd in enumerate(node.commands_to_run)
+        )
 
     findings = run_impact(
-        target_ip=exploit.get("target_ip", state["target_ip"]),
-        objective=state["objective"],
-        session_id=exploit["session_id"],
-        session_type=exploit["session_type"],
+        target_ip=node.target_ip or graph.target_ip,
+        objective=objective,
+        session_id=session_id,
+        session_type=session_type,
         access_level=access_level,
         prior_findings_summary=prior_summary,
     )
+    return dict(findings)
 
-    return {
-        "impact_findings": dict(findings),
-        "current_stage": "impact",
-        "messages": [AIMessage(content=f"[Impact Complete] {findings['summary']}")],
-    }
 
-# =============================================================================
-# NODE: CRITIC
-# =============================================================================
+def _dispatch_discovery(node: AttackNode, graph: AttackGraph, preceding: dict) -> dict:
+    """
+    Dispatch discovery tasks.
 
-def critic_node(state: PipelineState) -> dict:
-    """Evaluate all stage findings against the objective."""
-    objective = state.get("objective", "")
-    plan = state.get("plan", "")
-    loop_step = state.get("loop_step", 0)
+    Discovery reuses the impact runner with a non-destructive objective
+    (enumerate disks, list users, etc.) since both need an active session
+    and run commands on the target.
+    """
+    session_id = ""
+    session_type = ""
+    access_level = "unknown"
 
-    print_colored(f"\n[Pipeline] Critic evaluating results (attempt {loop_step + 1})...", Colors.HEADER)
+    for pred_id, pred_findings in preceding.items():
+        if "session_id" in pred_findings and pred_findings.get("success"):
+            session_id = str(pred_findings["session_id"])
+            session_type = pred_findings.get("session_type", "shell")
+            access_level = pred_findings.get("access_level", "unknown")
+        if "new_level" in pred_findings and pred_findings.get("success"):
+            access_level = pred_findings["new_level"]
 
-    # Build evidence summary for the critic
-    evidence = f"OBJECTIVE: {objective}\n\nPLAN:\n{plan}\n\n"
+    if not session_id:
+        return {
+            "success": False,
+            "actions": [],
+            "summary": "Discovery skipped — no session available.",
+        }
 
-    recon = state.get("recon_findings", {})
-    exploit = state.get("exploitation_findings", {})
-    persist = state.get("persistence_findings", {})
-    privesc = state.get("privesc_findings", {})
-    impact = state.get("impact_findings", {})
+    prior_lines = []
+    for pred_id, pred_findings in preceding.items():
+        prior_lines.append(f"{pred_id}: {pred_findings.get('summary', 'N/A')}")
 
-    evidence += f"RECON FINDINGS:\n  Success: {recon.get('success', 'N/A')}\n  Summary: {recon.get('summary', 'N/A')}\n\n"
-    evidence += (
-        f"EXPLOITATION FINDINGS:\n"
-        f"  Success: {exploit.get('success', 'N/A')}\n"
-        f"  Session ID: {exploit.get('session_id', 'N/A')}\n"
-        f"  Session Type: {exploit.get('session_type', 'N/A')}\n"
-        f"  Exploit Used: {exploit.get('exploit_used', 'N/A')}\n"
-        f"  Access Level: {exploit.get('access_level', 'N/A')}\n"
-        f"  Summary: {exploit.get('summary', 'N/A')}\n\n"
-    )
-    evidence += f"PERSISTENCE FINDINGS:\n  Summary: {persist.get('summary', 'N/A')}\n\n"
-    evidence += f"PRIVESC FINDINGS:\n  Summary: {privesc.get('summary', 'N/A')}\n\n"
-    evidence += f"IMPACT FINDINGS:\n  Summary: {impact.get('summary', 'N/A')}\n\n"
-    evidence += f"ATTEMPT: {loop_step + 1} of {MAX_PIPELINE_RETRIES}\n"
-
-    response = call_llm(
-        messages=[HumanMessage(content=evidence)],
-        system_prompt=CRITIC_PROMPT,
-    )
-
-    verdict_text = response.content.strip()
-    print_colored(f"[Critic] {verdict_text[:400]}", Colors.OKCYAN)
-
-    # Parse verdict
-    upper = verdict_text.upper()
-    if "VERDICT: PASS" in upper or ("PASS" in upper and "FAIL" not in upper):
-        verdict = "PASS"
-    else:
-        verdict = "FAIL"
-
-    print_colored(
-        f"[Critic] Verdict: {verdict}",
-        Colors.OKGREEN if verdict == "PASS" else Colors.FAIL,
-    )
-
-    return {
-        "critic_verdict": verdict,
-        "critic_feedback": verdict_text if verdict == "FAIL" else "",
-        "loop_step": loop_step + 1,
-        "messages": [AIMessage(content=f"[Critic] {verdict}: {verdict_text[:200]}")],
-    }
-
-# =============================================================================
-# NODE: SUCCESS LOGGER
-# =============================================================================
-
-def success_logger_node(state: PipelineState) -> dict:
-    """Log the successful attack chain to the RAG knowledge base."""
-    print_colored("\n[Pipeline] Logging successful attack...", Colors.OKGREEN)
-
-    recon = state.get("recon_findings", {})
-    exploit = state.get("exploitation_findings", {})
-    objective = state.get("objective", "")
-    target_ip = state.get("target_ip", "")
-
-    log_entry = (
-        f"SUCCESSFUL ATTACK LOG\n"
-        f"Objective: {objective}\n"
-        f"Target: {target_ip}\n"
-        f"Recon: {recon.get('summary', 'N/A')}\n"
-        f"Exploit: {exploit.get('exploit_used', 'N/A')}\n"
-        f"Session: {exploit.get('session_type', 'N/A')} (ID: {exploit.get('session_id', 'N/A')})\n"
-        f"Access Level: {exploit.get('access_level', 'N/A')}\n"
-        f"Summary: {exploit.get('summary', 'N/A')}\n"
-    )
-
-    try:
-        result = log_successful_attack(
-            content=log_entry,
-            metadata={"target": target_ip, "exploit": exploit.get("exploit_used", "")},
+    objective = node.objective or "Enumerate target system"
+    if node.commands_to_run:
+        objective += f"\n\nPRE-PLANNED COMMANDS:\n" + "\n".join(
+            f"  {i+1}. {cmd}" for i, cmd in enumerate(node.commands_to_run)
         )
-        print_colored(f"[Success Logger] {result}", Colors.OKGREEN)
-    except Exception as e:
-        print_colored(f"[Success Logger] Failed to log: {e}", Colors.WARNING)
 
-    return {
-        "messages": [AIMessage(content=f"[Success Logger] Attack chain logged for future reference.")],
-    }
-
-# =============================================================================
-# ROUTING
-# =============================================================================
-
-def route_after_critic(state: PipelineState) -> Literal["success_logger", "planner"]:
-    """Route based on critic verdict: PASS -> success logger, FAIL -> planner retry."""
-    time.sleep(2)  # Rate limiting
-
-    verdict = state.get("critic_verdict", "FAIL")
-    loop_step = state.get("loop_step", 0)
-
-    if verdict == "PASS":
-        return "success_logger"
-
-    if loop_step >= MAX_PIPELINE_RETRIES:
-        print_colored(
-            f"[Pipeline] MAX RETRIES ({MAX_PIPELINE_RETRIES}) reached. Ending pipeline.",
-            Colors.FAIL,
-        )
-        # Route to success_logger anyway to log partial results, then END
-        return "success_logger"
-
-    print_colored(
-        f"[Pipeline] Critic says FAIL. Re-planning (attempt {loop_step + 1})...",
-        Colors.WARNING,
+    findings = run_impact(
+        target_ip=node.target_ip or graph.target_ip,
+        objective=objective,
+        session_id=session_id,
+        session_type=session_type,
+        access_level=access_level,
+        prior_findings_summary="\n".join(prior_lines),
     )
-    return "planner"
+    return dict(findings)
+
 
 # =============================================================================
-# GRAPH CONSTRUCTION
+# GRAPH WALKER — the main orchestration loop
 # =============================================================================
 
-def build_pipeline() -> StateGraph:
-    """Construct the orchestrator pipeline graph."""
-    workflow = StateGraph(PipelineState)
+def run_graph(
+    graph: AttackGraph,
+    checkpoint_path: Optional[str] = None,
+) -> AttackGraph:
+    """
+    Walk an AttackGraph to completion.
 
-    # Add nodes
-    workflow.add_node("planner", planner_node)
-    workflow.add_node("planner_tools", planner_tools_node)
-    workflow.add_node("plan_extractor", plan_extractor_node)
-    workflow.add_node("recon_stage", recon_stage_node)
-    workflow.add_node("initial_access_stage", initial_access_stage_node)
-    workflow.add_node("persistence_stage", persistence_stage_node)
-    workflow.add_node("privesc_stage", privesc_stage_node)
-    workflow.add_node("impact_stage", impact_stage_node)
-    workflow.add_node("critic", critic_node)
-    workflow.add_node("success_logger", success_logger_node)
-
-    # Entry point
-    workflow.set_entry_point("planner")
-
-    # Planner ReAct loop: planner <-> planner_tools, then into stages
-    workflow.add_conditional_edges(
-        "planner",
-        route_after_planner,
-        {"planner_tools": "planner_tools", "recon_stage": "plan_extractor"},
-    )
-    workflow.add_edge("planner_tools", "planner")
-
-    # Plan extractor -> recon
-    workflow.add_edge("plan_extractor", "recon_stage")
-
-    # Linear stage pipeline
-    workflow.add_edge("recon_stage", "initial_access_stage")
-    workflow.add_edge("initial_access_stage", "persistence_stage")
-    workflow.add_edge("persistence_stage", "privesc_stage")
-    workflow.add_edge("privesc_stage", "impact_stage")
-    workflow.add_edge("impact_stage", "critic")
-
-    # Critic routing
-    workflow.add_conditional_edges(
-        "critic",
-        route_after_critic,
-        {"success_logger": "success_logger", "planner": "planner"},
-    )
-
-    # Success logger -> END
-    workflow.add_edge("success_logger", END)
-
-    return workflow
-
-# =============================================================================
-# PIPELINE RUNNER
-# =============================================================================
-
-def run_pipeline(target_ip: str, objective: str) -> dict:
-    """Main entry point. Builds graph, runs to completion, returns final state.
+    Each iteration:
+      1. Find all ready nodes (pending + all incoming edges satisfied)
+      2. Execute each ready node via dispatch_node()
+      3. Write findings back to the node
+      4. Mark node success/failed
+      5. Update global graph state (sessions, credentials)
+      6. Checkpoint (save to disk)
+      7. Repeat until no ready nodes remain
 
     Args:
-        target_ip: IP address of the target.
-        objective: Attack objective string.
+        graph: The AttackGraph to execute.
+        checkpoint_path: If set, save graph state after each node completes.
 
     Returns:
-        Dict with all stage findings and pipeline metadata.
+        The same AttackGraph, now populated with findings and statuses.
     """
-    import uuid
+    if not checkpoint_path:
+        checkpoint_path = f"graphs/{graph.name}_state.json"
 
-    thread_id = f"pipeline_{uuid.uuid4().hex[:8]}"
-
-    workflow = build_pipeline()
-    checkpointer = MemorySaver()
-    app = workflow.compile(checkpointer=checkpointer)
-
-    config = {
-        "configurable": {"thread_id": thread_id},
-        "recursion_limit": 200,
-    }
-
-    initial_state = {
-        "messages": [HumanMessage(content=f"Attack objective: {objective}\nTarget: {target_ip}")],
-        "objective": objective,
-        "target_ip": target_ip,
-        "plan": "",
-        "current_stage": "",
-        "recon_findings": {},
-        "exploitation_findings": {},
-        "persistence_findings": {},
-        "privesc_findings": {},
-        "impact_findings": {},
-        "loop_step": 0,
-        "critic_verdict": "",
-        "critic_feedback": "",
-    }
+    graph.status = "running"
+    graph.started_at = graph.started_at or _now()
 
     print_colored(f"\n{'='*70}", Colors.HEADER)
-    print_colored(f"[Pipeline] Starting orchestrator pipeline", Colors.HEADER)
-    print_colored(f"  Target: {target_ip}", Colors.HEADER)
-    print_colored(f"  Objective: {objective[:100]}", Colors.HEADER)
-    print_colored(f"  Thread: {thread_id}", Colors.HEADER)
-    print_colored(f"  Max retries: {MAX_PIPELINE_RETRIES}", Colors.HEADER)
+    print_colored(f"[Orchestrator] Starting graph execution", Colors.HEADER)
+    print_colored(f"  Graph: {graph.name} ({graph.id})", Colors.HEADER)
+    print_colored(f"  Objective: {graph.objective}", Colors.HEADER)
+    print_colored(f"  Target: {graph.target_ip}", Colors.HEADER)
+    print_colored(f"  Nodes: {len(graph.nodes)}", Colors.HEADER)
     print_colored(f"{'='*70}\n", Colors.HEADER)
 
-    # Stream to completion
-    for event in app.stream(initial_state, config=config):
-        for key, value in event.items():
-            if not value or "messages" not in value:
-                continue
-            messages = value["messages"]
-            if not isinstance(messages, list):
-                messages = [messages]
-            for msg in messages:
-                if not hasattr(msg, "content") or not msg.content:
-                    continue
+    iteration = 0
+    max_iterations = len(graph.nodes) * (MAX_PIPELINE_RETRIES + 1)  # Safety cap
 
-                # Display pipeline-level messages
-                content = msg.content
-                if content.startswith("[Critic]"):
-                    color = Colors.OKGREEN if "PASS" in content else Colors.FAIL
-                    print_colored(f"\n{content[:500]}", color)
-                elif content.startswith("[Success Logger]"):
-                    print_colored(f"\n{content}", Colors.OKGREEN)
-                elif any(content.startswith(f"[{tag}") for tag in
-                         ["Recon Complete", "Initial Access Complete",
-                          "Persistence", "PrivEsc", "Impact"]):
-                    print_colored(f"\n{content}", Colors.OKCYAN)
+    while iteration < max_iterations:
+        iteration += 1
 
-                # Show tool calls
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    for t in msg.tool_calls:
+        ready = graph.ready_nodes()
+        if not ready:
+            if graph.is_complete():
+                print_colored("\n[Orchestrator] All nodes complete.", Colors.OKGREEN)
+            else:
+                # Some nodes are blocked — nothing more we can do
+                _mark_blocked_nodes(graph)
+                print_colored(
+                    "\n[Orchestrator] No ready nodes and graph incomplete — "
+                    "remaining nodes are blocked.",
+                    Colors.WARNING,
+                )
+            break
+
+        print_colored(
+            f"\n[Orchestrator] Iteration {iteration} — ready nodes: {ready}",
+            Colors.HEADER,
+        )
+
+        for node_id in ready:
+            node = graph.get_node(node_id)
+            node.mark_running()
+
+            try:
+                findings = dispatch_node(node, graph)
+
+                success = findings.get("success", False)
+                summary = findings.get("summary", "")
+
+                if success:
+                    node.mark_success(findings, summary)
+                    print_colored(
+                        f"  [OK] {node_id}: {summary}",
+                        Colors.OKGREEN,
+                    )
+                    # Track sessions globally
+                    if "session_id" in findings and findings.get("session_id"):
+                        graph.active_sessions.append({
+                            "session_id": str(findings["session_id"]),
+                            "type": findings.get("session_type", "unknown"),
+                            "target": node.target_ip or graph.target_ip,
+                            "source_node": node_id,
+                        })
+                else:
+                    reason = summary or "No success flag in findings"
+                    node.mark_failed(reason)
+                    if node.can_retry:
                         print_colored(
-                            f"   (Calling Tool: {t['name']} args: {str(t['args'])[:200]}...)",
-                            Colors.OKCYAN,
+                            f"  [RETRY] {node_id}: {reason} "
+                            f"(attempt {node.retries}/{node.max_retries})",
+                            Colors.WARNING,
+                        )
+                    else:
+                        print_colored(
+                            f"  [FAILED] {node_id}: {reason}",
+                            Colors.FAIL,
                         )
 
-    # Extract final state
-    final_snapshot = app.get_state(config)
-    final_state = final_snapshot.values
+            except Exception as e:
+                node.mark_failed(str(e))
+                print_colored(
+                    f"  [ERROR] {node_id}: {e}",
+                    Colors.FAIL,
+                )
+
+            # Checkpoint after each node
+            _checkpoint(graph, checkpoint_path)
+
+            # Brief pause between nodes for rate limiting
+            time.sleep(1)
+
+    # Final status
+    graph.status = "completed"
+    graph.completed_at = _now()
+    _checkpoint(graph, checkpoint_path)
 
     # Print summary
-    print_colored(f"\n{'='*70}", Colors.HEADER)
-    print_colored("[Pipeline] COMPLETE", Colors.HEADER)
-    print_colored(f"  Verdict: {final_state.get('critic_verdict', 'N/A')}", Colors.HEADER)
-    print_colored(f"  Attempts: {final_state.get('loop_step', 0)}", Colors.HEADER)
+    _print_summary(graph)
 
-    exploit = final_state.get("exploitation_findings", {})
-    if exploit.get("success"):
-        print_colored(f"  Session: {exploit.get('session_type', '?')} #{exploit.get('session_id', '?')}", Colors.OKGREEN)
-        print_colored(f"  Exploit: {exploit.get('exploit_used', '?')}", Colors.OKGREEN)
-    else:
-        print_colored(f"  Exploitation: No session obtained", Colors.FAIL)
+    return graph
+
+
+def _mark_blocked_nodes(graph: AttackGraph):
+    """Mark any remaining PENDING nodes as BLOCKED."""
+    for node in graph.nodes.values():
+        if node.status == NodeStatus.PENDING.value:
+            # Check if any predecessor failed
+            preds = graph.predecessors(node.id)
+            failed_preds = [
+                pid for pid in preds
+                if graph.nodes[pid].status == NodeStatus.FAILED.value
+            ]
+            if failed_preds:
+                node.mark_blocked(
+                    f"Predecessor(s) failed: {', '.join(failed_preds)}"
+                )
+
+
+def _checkpoint(graph: AttackGraph, path: str):
+    """Save graph state to disk."""
+    try:
+        graph.save(path)
+    except Exception as e:
+        print_colored(f"  [WARNING] Checkpoint save failed: {e}", Colors.WARNING)
+
+
+def _print_summary(graph: AttackGraph):
+    """Print final execution summary."""
+    print_colored(f"\n{'='*70}", Colors.HEADER)
+    print_colored("[Orchestrator] EXECUTION COMPLETE", Colors.HEADER)
+    print_colored(f"  Status: {graph.status}", Colors.HEADER)
+    print_colored(f"  Success rate: {graph.success_rate():.0%}", Colors.HEADER)
+    print()
+
+    for node in graph.nodes.values():
+        icon = {
+            "success": "✓", "failed": "✗",
+            "skipped": "⊘", "blocked": "⊗",
+        }.get(node.status, "?")
+        color = {
+            "success": Colors.OKGREEN, "failed": Colors.FAIL,
+            "skipped": Colors.WARNING, "blocked": Colors.FAIL,
+        }.get(node.status, Colors.ENDC)
+        print_colored(f"  {icon} {node.id}: {node.summary or node.status}", color)
+
+    if graph.active_sessions:
+        print_colored("\n  Active sessions:", Colors.OKCYAN)
+        for s in graph.active_sessions:
+            print_colored(
+                f"    Session {s['session_id']} ({s['type']}) → {s['target']} "
+                f"(from {s['source_node']})",
+                Colors.OKCYAN,
+            )
 
     print_colored(f"{'='*70}\n", Colors.HEADER)
 
-    return {
-        "objective": final_state.get("objective", ""),
-        "target_ip": final_state.get("target_ip", ""),
-        "plan": final_state.get("plan", ""),
-        "critic_verdict": final_state.get("critic_verdict", ""),
-        "attempts": final_state.get("loop_step", 0),
-        "recon_findings": final_state.get("recon_findings", {}),
-        "exploitation_findings": final_state.get("exploitation_findings", {}),
-        "persistence_findings": final_state.get("persistence_findings", {}),
-        "privesc_findings": final_state.get("privesc_findings", {}),
-        "impact_findings": final_state.get("impact_findings", {}),
-    }
+
+def _now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
 
 # =============================================================================
-# MAIN / REPL
+# CLI — run a graph from a JSON file
 # =============================================================================
 
 def main():
-    """Interactive standalone mode or graph visualization."""
-
-    if "--graph" in sys.argv:
-        workflow = build_pipeline()
-        app = workflow.compile()
-        try:
-            print(app.get_graph().draw_ascii())
-        except Exception:
-            graph = app.get_graph()
-            print("Nodes:", [n for n in graph.nodes])
-            print("Edges:", [(e.source, e.target) for e in graph.edges])
+    if len(sys.argv) < 2:
+        print_colored("Usage: python -m core_agents.orchestrator <graph.json>", Colors.FAIL)
+        print_colored("       python -m core_agents.orchestrator --interactive", Colors.FAIL)
         return
 
-    print_colored("--- Orchestrator Pipeline ---", Colors.OKGREEN)
-    print_colored("Stages: Planner -> Recon -> Initial Access -> Persistence* -> PrivEsc* -> Impact* -> Critic", Colors.OKCYAN)
-    print_colored("(* = stub, not yet implemented)\n", Colors.OKCYAN)
+    if sys.argv[1] == "--interactive":
+        _interactive_mode()
+        return
+
+    graph_path = sys.argv[1]
+    if not Path(graph_path).exists():
+        print_colored(f"Graph file not found: {graph_path}", Colors.FAIL)
+        return
+
+    graph = AttackGraph.load(graph_path)
+    print_colored(f"Loaded graph: {graph.name}", Colors.OKGREEN)
+    print(graph.summary())
+    print()
+
+    confirm = input("Execute this graph? [y/N]: ").strip().lower()
+    if confirm != "y":
+        print_colored("Aborted.", Colors.WARNING)
+        return
+
+    run_graph(graph)
+
+
+def _interactive_mode():
+    """Build a simple graph interactively then run it."""
+    from examples.disk_wipe_graph import build_disk_wipe_graph
+
+    print_colored("--- Graph-Driven Orchestrator ---", Colors.OKGREEN)
 
     target_ip = input("[Target IP]: ").strip()
     if not target_ip:
         print_colored("No target IP provided. Exiting.", Colors.FAIL)
         return
 
-    objective = input("[Objective]: ").strip()
-    if not objective:
-        objective = f"Gain initial access (shell) on {target_ip}"
-        print_colored(f"Using default objective: {objective}", Colors.WARNING)
+    attacker_ip = input("[Attacker IP] (default: 192.168.34.6): ").strip()
+    if not attacker_ip:
+        attacker_ip = "192.168.34.6"
 
-    result = run_pipeline(target_ip=target_ip, objective=objective)
+    # For now, use the disk wipe template
+    graph = build_disk_wipe_graph(target_ip=target_ip, attacker_ip=attacker_ip)
+    print()
+    print(graph.summary())
+    print()
 
-    print("\n" + json.dumps(result, indent=2, default=str))
+    confirm = input("Execute this graph? [y/N]: ").strip().lower()
+    if confirm != "y":
+        print_colored("Aborted.", Colors.WARNING)
+        return
+
+    run_graph(graph)
 
 
 if __name__ == "__main__":

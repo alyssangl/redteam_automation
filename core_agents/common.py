@@ -65,7 +65,7 @@ def call_llm(
     temperature: float = 0
 ) -> BaseMessage:
     """Invoke LLM with optional system prompt and tools."""
-    model = ChatOpenAI(model=model_name, temperature=temperature)
+    model = ChatOpenAI(model=model_name, temperature=temperature, timeout=120)
 
     if tools:
         model = model.bind_tools(tools)

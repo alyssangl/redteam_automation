@@ -39,7 +39,7 @@ from core_agents.common import (
 )
 from core_agents.state import PrivEscFindings
 from tools.rag import query_knowledge_base
-from tools.metasploit_tools import msf_session
+from tools.metasploit_tools import msf_session, tool_session_command
 
 # =============================================================================
 # CONSTANTS
@@ -75,8 +75,12 @@ class PrivEscState(TypedDict):
 @tool
 def tool_linux_terminal(command: str):
     """
-    Execute a shell command on the Kali machine via SSH.
-    Use this to run enumeration and escalation commands through the active session.
+    Execute a shell command on the KALI ATTACKER machine via SSH.
+    This runs on Kali — NOT on the target. Use ONLY for Kali-side tasks:
+    - Hosting exploits, starting listeners, compiling payloads.
+
+    To run commands on the TARGET, use tool_session_command instead.
+
     NON-INTERACTIVE ONLY. No ftp, ssh, vi, nano, top.
     """
     if any(bad in command for bad in FORBIDDEN_COMMANDS):
@@ -88,11 +92,13 @@ def tool_linux_terminal(command: str):
 @tool
 def tool_metasploit_rpc(command: str):
     """
-    Execute a command on the active Metasploit console.
-    Use for interacting with sessions, running post modules, or local exploit suggesters.
-    - 'sessions -i <id>' to interact with a session
+    Execute a command on the Metasploit CONSOLE.
+    Use ONLY for MSF console commands: listing sessions, background, use, set, run,
+    post modules (local_exploit_suggester, escalate modules).
+
+    Do NOT use this for running commands on the target — use tool_session_command instead.
+    - 'sessions' to list sessions (do NOT use -i flag)
     - 'run post/multi/recon/local_exploit_suggester' for automated suggestions
-    - 'run post/linux/escalate/*' for escalation modules
     """
     try:
         return msf_session.send_command(command)
@@ -101,9 +107,9 @@ def tool_metasploit_rpc(command: str):
 
 
 # Tool sets
-ENUM_TOOLS = [tool_linux_terminal, tool_metasploit_rpc]
+ENUM_TOOLS = [tool_linux_terminal, tool_metasploit_rpc, tool_session_command]
 PLANNER_TOOLS = [query_knowledge_base]
-EXECUTOR_TOOLS = [tool_linux_terminal, tool_metasploit_rpc]
+EXECUTOR_TOOLS = [tool_linux_terminal, tool_metasploit_rpc, tool_session_command]
 
 # =============================================================================
 # SYSTEM PROMPTS
@@ -111,26 +117,27 @@ EXECUTOR_TOOLS = [tool_linux_terminal, tool_metasploit_rpc]
 
 ENUMERATOR_PROMPT = f"""You are a Privilege Escalation Enumerator for a Red Team agent. Your attacker IP is {KALI_IP}.
 
-You have access to `tool_linux_terminal` (SSH to Kali) and `tool_metasploit_rpc` (MSF console).
+You have 3 tools — each runs in a DIFFERENT place:
 
-**Your job:** Run enumeration commands on the target (through the active session) to discover privilege escalation vectors.
+**TOOL CLARITY:**
+- `tool_session_command(session_id, command)` → runs ON THE TARGET (use for ALL enumeration commands)
+- `tool_linux_terminal(command)` → runs ON KALI only (hosting exploits, starting listeners)
+- `tool_metasploit_rpc(command)` → MSF console only (listing sessions, running post modules like local_exploit_suggester)
 
-**Enumeration checklist — run these in order of priority:**
+**CRITICAL:** To run enumeration commands ON THE TARGET, use `tool_session_command`.
+Do NOT use `tool_linux_terminal` for enumeration — that would scan Kali, not the target!
+Do NOT use `tool_metasploit_rpc` for target commands — use it only for MSF console operations.
 
-1. **Basic info**: `whoami`, `id`, `uname -a`, `cat /etc/os-release`
+**Your job:** Run enumeration commands on the target to discover privilege escalation vectors.
+
+**Enumeration checklist — run these in order of priority (via tool_session_command):**
+
+1. **Basic info**: `whoami`, `id`, `uname -a`
 2. **Sudo check**: `sudo -l` (most common privesc vector)
 3. **SUID binaries**: `find / -perm -4000 -type f 2>/dev/null`
-4. **Writable paths**: `find / -writable -type d 2>/dev/null | head -20`
-5. **Cron jobs**: `cat /etc/crontab`, `ls -la /etc/cron*`
+4. **Cron jobs**: `cat /etc/crontab`
+5. **Kernel version**: `uname -r` (for kernel exploit matching)
 6. **Running processes**: `ps aux | head -30`
-7. **Kernel version**: `uname -r` (for kernel exploit matching)
-8. **Capabilities**: `getcap -r / 2>/dev/null`
-9. **LinPEAS** (if available): Download and run for comprehensive check
-
-**How to execute commands through the session:**
-- If session_type is "meterpreter": use `tool_metasploit_rpc` with 'sessions -i <id>', then 'shell', then commands
-- If session_type is "command_shell": use `tool_metasploit_rpc` with 'sessions -i <id>', then run commands directly
-- Alternative: use `tool_linux_terminal` to pipe commands through a reverse shell
 
 **Rules:**
 1. Execute commands ONE AT A TIME
@@ -192,36 +199,24 @@ EXPECTED_RESULT: "whoami returns root" or "id shows uid=0"
 
 EXECUTOR_PROMPT = f"""You are a Privilege Escalation Executor for a Red Team agent. Your attacker IP is {KALI_IP}.
 
-You have access to `tool_linux_terminal` (SSH to Kali) and `tool_metasploit_rpc` (MSF console).
+You have 3 tools — each runs in a DIFFERENT place:
 
-**Your job:** Execute the escalation plan step by step.
+**TOOL CLARITY:**
+- `tool_session_command(session_id, command)` → runs ON THE TARGET (use for ALL escalation commands)
+- `tool_linux_terminal(command)` → runs ON KALI only (hosting exploits, starting listeners, compiling payloads)
+- `tool_metasploit_rpc(command)` → MSF console only (listing sessions, running post modules)
+
+**CRITICAL:** To run escalation commands ON THE TARGET, use `tool_session_command`.
+Only use `tool_linux_terminal` for Kali-side tasks (hosting exploits, starting listeners).
+
+**Your job:** Execute the escalation plan step by step ON THE TARGET.
 
 **Rules:**
 1. Execute commands ONE AT A TIME
 2. READ each output carefully
-3. After the escalation attempt, ALWAYS verify with `whoami` and `id`
+3. After the escalation attempt, ALWAYS verify with `tool_session_command(session_id, "whoami")` and `tool_session_command(session_id, "id")`
 4. If `whoami` returns `root` or `id` shows `uid=0`, the escalation SUCCEEDED
 5. Do NOT run more than {MAX_EXECUTOR_TOOL_CALLS} commands
-
-**Common escalation execution patterns:**
-
-Sudo abuse (GTFOBins):
-- `sudo <binary>` with the specific escape sequence from GTFOBins
-- e.g., `sudo find . -exec /bin/sh \\; -quit`
-- e.g., `sudo python3 -c 'import os; os.execl("/bin/sh", "sh")'`
-
-SUID abuse:
-- `./<suid_binary>` with the shell escape for that binary
-- e.g., `find / -exec /bin/sh -p \\; -quit` (if find is SUID)
-
-Kernel exploit:
-- Download exploit to target (via wget/curl from Kali or compile on target)
-- Compile if needed: `gcc exploit.c -o exploit`
-- Run: `./exploit`
-- Verify: `whoami`
-
-MSF post modules:
-- `sessions -i <id>` then `run post/linux/escalate/<module>`
 
 **When done, provide a text summary:**
 - Did `whoami` return `root`?
@@ -730,41 +725,68 @@ def run_privesc(
     print_colored(f"  Thread: {thread_id}", Colors.HEADER)
     print_colored(f"{'='*60}\n", Colors.HEADER)
 
-    for event in app.stream(initial_state, config=config):
-        for key, value in event.items():
-            if not value or "messages" not in value:
-                continue
-            msgs = value["messages"]
-            if not isinstance(msgs, list):
-                msgs = [msgs]
-            for msg in msgs:
-                if not isinstance(msg, BaseMessage) or not msg.content:
-                    continue
-                if "CRITIC FEEDBACK" in msg.content:
-                    print_colored(f"\n{msg.content}", Colors.FAIL)
-                elif isinstance(msg, ToolMessage):
-                    display = msg.content[:500]
-                    if len(msg.content) > 500:
-                        display += "... [truncated]"
-                    print(f"\n[Tool Output]: {display}")
-                elif isinstance(msg, AIMessage):
-                    content = msg.content
-                    if "[PrivEsc Enumerator]" in content:
-                        print_colored(f"\n{content[:400]}", Colors.HEADER)
-                    elif "[PrivEsc Planner]" in content:
-                        print_colored(f"\n{content[:400]}", Colors.OKBLUE)
-                    elif "[PrivEsc Critic]" in content:
-                        color = Colors.OKGREEN if "PASS" in content else Colors.FAIL
-                        print_colored(f"\n{content[:400]}", color)
-                    else:
-                        print_colored(f"\nAgent: {content[:400]}", Colors.OKGREEN)
+    # --- Session health check: verify session is still alive ---
+    try:
+        session_check = msf_session.send_command(f"sessions -c 'echo alive' -i {session_id}")
+        session_check_str = str(session_check).lower()
+        if "invalid session" in session_check_str or "no active sessions" in session_check_str:
+            print_colored(f"[PrivEsc] Session {session_id} is DEAD — skipping privesc.", Colors.WARNING)
+            return PrivEscFindings(
+                success=False,
+                technique="session_lost",
+                previous_level=access_level,
+                new_level=access_level,
+                summary=f"PrivEsc skipped — session {session_id} is no longer active.",
+            )
+    except Exception as e:
+        print_colored(f"[PrivEsc] Session health check failed: {e}", Colors.WARNING)
 
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    for t in msg.tool_calls:
-                        print_colored(
-                            f"   (Calling Tool: {t['name']} args: {str(t['args'])[:200]}...)",
-                            Colors.OKCYAN
-                        )
+    try:
+        for event in app.stream(initial_state, config=config):
+            for key, value in event.items():
+                if not value or "messages" not in value:
+                    continue
+                msgs = value["messages"]
+                if not isinstance(msgs, list):
+                    msgs = [msgs]
+                for msg in msgs:
+                    if not isinstance(msg, BaseMessage) or not msg.content:
+                        continue
+                    if "CRITIC FEEDBACK" in msg.content:
+                        print_colored(f"\n{msg.content}", Colors.FAIL)
+                    elif isinstance(msg, ToolMessage):
+                        display = msg.content[:500]
+                        if len(msg.content) > 500:
+                            display += "... [truncated]"
+                        print(f"\n[Tool Output]: {display}")
+                    elif isinstance(msg, AIMessage):
+                        content = msg.content
+                        if "[PrivEsc Enumerator]" in content:
+                            print_colored(f"\n{content[:400]}", Colors.HEADER)
+                        elif "[PrivEsc Planner]" in content:
+                            print_colored(f"\n{content[:400]}", Colors.OKBLUE)
+                        elif "[PrivEsc Critic]" in content:
+                            color = Colors.OKGREEN if "PASS" in content else Colors.FAIL
+                            print_colored(f"\n{content[:400]}", color)
+                        else:
+                            print_colored(f"\nAgent: {content[:400]}", Colors.OKGREEN)
+
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        for t in msg.tool_calls:
+                            print_colored(
+                                f"   (Calling Tool: {t['name']} args: {str(t['args'])[:200]}...)",
+                                Colors.OKCYAN
+                            )
+    except Exception as e:
+        print_colored(f"\n[PrivEsc] Subgraph crashed: {e}", Colors.FAIL)
+        print_colored("[PrivEsc] Returning graceful failure.", Colors.WARNING)
+        return PrivEscFindings(
+            success=False,
+            technique="error",
+            previous_level=access_level,
+            new_level=access_level,
+            summary=f"PrivEsc crashed: {str(e)[:200]}",
+        )
 
     final_snapshot = app.get_state(config)
     final_state = final_snapshot.values

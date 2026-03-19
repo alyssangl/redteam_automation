@@ -220,7 +220,13 @@ You receive:
 2. GOAL — overall operator objective
 3. CRITIC FEEDBACK — if retrying, what was missing from the previous scan
 
-Your job: produce a numbered sequence of nmap commands to execute on the target.
+Your job: produce a numbered sequence of nmap commands to execute on the TARGET IP provided in the scan plan.
+
+**CRITICAL — TARGET IP ENFORCEMENT:**
+- The TARGET IP is specified in the SCAN PLAN below. You MUST ONLY scan that IP.
+- NEVER scan your own attacker IP ({KALI_IP}). NEVER scan 127.0.0.1 or localhost.
+- If a scan returns "host seems down", DO NOT switch to a different IP. Instead add -Pn flag.
+- Every nmap command you produce MUST target the EXACT IP from the scan plan.
 
 **You have access to `query_knowledge_base`** — a RAG tool that searches your internal knowledge base of
 penetration testing techniques, nmap strategies, and service-specific recon approaches.
@@ -234,40 +240,52 @@ penetration testing techniques, nmap strategies, and service-specific recon appr
 
 **Strategy — use a two-phase approach:**
 
-Phase 1: Quick discovery scan
-- `nmap -sS -T4 -p- <target>` (full port SYN scan, fast timing)
-- OR `nmap -sS -T4 --top-ports 1000 <target>` if time is limited
+Phase 1: Quick discovery scan (ALWAYS use -Pn to skip host discovery)
+- `nmap -Pn -sS -T4 --top-ports 1000 <target>` (SYN scan, skip ping, fast timing)
+- OR `nmap -Pn -sS -T4 -p- <target>` (full port SYN scan if time permits)
 
 Phase 2: Deep scan on discovered ports
-- `nmap -sV -sC -O -p<port1,port2,...> <target>` (version detection, default scripts, OS detection)
+- `nmap -Pn -sV -sC -O -p<port1,port2,...> <target>` (version detection, default scripts, OS detection)
 - Only scan ports found open in Phase 1
+
+**IMPORTANT: Always use -Pn flag.** Lab targets often block ICMP pings, causing nmap to
+report "host seems down" without -Pn. This is the #1 cause of failed recon.
+**IMPORTANT: Do NOT use sudo.** Run nmap directly without sudo — it works fine for our scan types.
 
 **On retry (critic feedback present):**
 - Read the critic's feedback carefully
 - Query the knowledge base for techniques to address specific gaps
 - If no version info: add `-sV` flag
 - If no OS info: add `-O` or `-A` flag
-- If no ports found: try `-Pn` (skip host discovery) or UDP scan `-sU --top-ports 50`
+- If no ports found: try UDP scan `-sU --top-ports 50` (with -Pn)
 - If scan errored: adjust timing (`-T3`) or try a different scan type
+- NEVER change the target IP — always use the one from the scan plan
 
 **Output format (final answer — no tool calls):**
 Provide a numbered list of nmap commands, one per line. Include brief comments explaining each phase.
 
 Example:
-1. nmap -sS -T4 --top-ports 1000 192.168.34.7  # Phase 1: Quick SYN scan
-2. nmap -sV -sC -O -p22,80,445 192.168.34.7    # Phase 2: Deep scan on discovered ports
+1. nmap -Pn -sS -T4 --top-ports 1000 192.168.34.7  # Phase 1: Quick SYN scan
+2. nmap -Pn -sV -sC -O -p22,80,445 192.168.34.7    # Phase 2: Deep scan on discovered ports
 """
 
 EXECUTOR_PROMPT = f"""You are a Recon Execution Specialist. Your attacker IP is {KALI_IP}.
 
 You have access to `tool_linux_terminal` to run commands on the Kali machine.
 
+**CRITICAL — TARGET IP ENFORCEMENT:**
+- Execute ONLY the nmap commands from the plan. Do NOT modify the target IP.
+- NEVER scan your own IP ({KALI_IP}). NEVER scan 127.0.0.1.
+- If a scan says "host seems down", add -Pn flag to the SAME target IP. Do NOT switch IPs.
+- The target IP is in the planner's commands — use it exactly as written.
+
 **Rules:**
 1. Execute the nmap commands from the plan ONE AT A TIME via `tool_linux_terminal`
 2. READ each command's output carefully before running the next
 3. ADAPT between phases: if Phase 1 finds open ports, use those specific ports in Phase 2
-4. If a scan returns no results or errors, try adjusting (e.g., add `-Pn`, change timing)
+4. If a scan returns "host seems down", re-run with `-Pn` on the SAME target IP
 5. Do NOT run more than {MAX_EXECUTOR_TOOL_CALLS} commands total
+6. Do NOT install packages (no apt-get, no pip). Use only tools already available.
 
 **When done scanning, provide a TEXT SUMMARY of all findings:**
 - List all open ports with service names and versions
@@ -278,7 +296,8 @@ You have access to `tool_linux_terminal` to run commands on the Kali machine.
 **Important:**
 - nmap scans can take time — this is normal, be patient
 - If a full port scan is too slow, fall back to top-ports scan
-- Always use `sudo` with nmap for SYN scans (`sudo nmap -sS ...`)
+- Do NOT use sudo — run nmap directly without sudo
+- Always include `-Pn` flag to skip host discovery (lab targets may block ICMP)
 """
 
 CRITIC_PROMPT = f"""You are a Recon Quality Assessor for a Red Team operation. Your IP is {KALI_IP}.
@@ -289,16 +308,22 @@ You evaluate whether the reconnaissance scan gathered sufficient data for the ex
 - The executor's scan summary and raw nmap outputs
 - The original scan plan and goal
 
+**CRITICAL — WRONG TARGET CHECK:**
+- If the scan results show YOUR OWN IP ({KALI_IP}) as the target instead of the intended target, this is an AUTOMATIC FAIL.
+- The target IP is specified in the SCAN PLAN. Verify the scanned IP matches.
+- FEEDBACK must say: "WRONG TARGET: Scanned {KALI_IP} instead of the intended target. Re-scan the correct target IP with -Pn flag."
+
 **Evaluation criteria:**
 
-1. **Open ports found?** — At least 1 open port must be identified
-2. **Service versions?** — Services should have version strings (e.g., "OpenSSH 7.9p1", "Apache 2.4.38")
-3. **OS detection?** — OS guess should be present (even approximate is acceptable)
-4. **Scan completeness?** — Were both quick and deep scans performed?
+1. **Correct target?** — Scanned IP must NOT be {KALI_IP} (your own machine)
+2. **Open ports found?** — At least 1 open port must be identified
+3. **Service versions?** — Services should have version strings (e.g., "OpenSSH 7.9p1", "Apache 2.4.38")
+4. **OS detection?** — OS guess should be present (even approximate is acceptable)
+5. **Scan completeness?** — Were both quick and deep scans performed?
 
 **Verdict:**
-- **PASS** if: at least 1 open port with service AND version identified. OS detection is preferred but not required for PASS.
-- **FAIL** if: no open ports found, OR ports found but NO version info on any service, OR scan errored out completely
+- **PASS** if: correct target scanned, at least 1 open port with service AND version identified. OS detection is preferred but not required for PASS.
+- **FAIL** if: wrong target scanned, OR no open ports found, OR ports found but NO version info on any service, OR scan errored out completely
 
 **Output format:**
 
@@ -308,7 +333,7 @@ FINDINGS_QUALITY: <brief assessment of what was found>
 
 MISSING: <what specific data is missing, if any>
 
-FEEDBACK: <specific instructions for retry if FAIL — e.g., "Rescan with -sV to get version info on ports 22,80,443">
+FEEDBACK: <specific instructions for retry if FAIL — e.g., "Rescan with -sV -Pn to get version info on ports 22,80,443">
 
 **When PASS, also output a structured JSON block with the parsed target info:**
 
@@ -419,13 +444,20 @@ def executor_node(state: ReconState) -> dict:
             executor_tool_count += 1
 
     # Build executor message window: from planner output onwards
+    # Truncate individual tool outputs to prevent context bloat
     executor_msgs = []
     capturing = False
     for msg in messages:
         if isinstance(msg, AIMessage) and "[Recon Planner]" in (msg.content or ""):
             capturing = True
         if capturing:
-            executor_msgs.append(msg)
+            if isinstance(msg, ToolMessage) and msg.content and len(msg.content) > 4000:
+                from copy import copy
+                truncated = copy(msg)
+                truncated.content = msg.content[:4000] + "\n... [output truncated for context]"
+                executor_msgs.append(truncated)
+            else:
+                executor_msgs.append(msg)
 
     if not executor_msgs:
         executor_msgs = [messages[-1]]

