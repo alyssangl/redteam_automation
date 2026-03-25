@@ -209,6 +209,116 @@ class AttackNode:
 
 
 # =============================================================================
+# EDGE CHECK — a single testable predicate on source findings
+# =============================================================================
+
+@dataclass
+class EdgeCheck:
+    """
+    A single testable condition on the source node's findings.
+
+    Each check looks at a specific field in findings and tests it.
+    ALL checks on an edge must pass for the edge to be traversable.
+
+    Supported operators:
+        "exists"      — field is present and non-empty
+        "not_exists"  — field is missing or empty
+        "equals"      — field == expected
+        "not_equals"  — field != expected
+        "contains"    — expected is a substring of field value
+        "in"          — field value is in the expected list
+        "gt" / "gte"  — numeric greater than / greater or equal
+        "lt" / "lte"  — numeric less than / less or equal
+        "any_port"    — special: checks if any port in findings.ports matches
+
+    Examples:
+        EdgeCheck(field="ports", operator="any_port", expected={"port": 8181})
+        EdgeCheck(field="os_detected", operator="contains", expected="Linux")
+        EdgeCheck(field="access_level", operator="equals", expected="user")
+        EdgeCheck(field="session_id", operator="exists")
+    """
+    field: str                      # Dot-path into source.findings: "ports", "os_detected", etc.
+    operator: str = "exists"        # Test operator
+    expected: Any = None            # Expected value (type depends on operator)
+    description: str = ""           # Human-readable: "Port 8181 is open"
+
+    def evaluate(self, findings: dict) -> bool:
+        """Run this check against a findings dict. Returns True if check passes."""
+        try:
+            if self.operator == "any_port":
+                return self._check_any_port(findings)
+
+            value = _resolve_dotpath(findings, self.field) if self.field else findings
+        except (KeyError, TypeError, IndexError):
+            # Field doesn't exist in findings
+            return self.operator == "not_exists"
+
+        if self.operator == "exists":
+            return value is not None and value != "" and value != []
+        elif self.operator == "not_exists":
+            return value is None or value == "" or value == []
+        elif self.operator == "equals":
+            return str(value) == str(self.expected)
+        elif self.operator == "not_equals":
+            return str(value) != str(self.expected)
+        elif self.operator == "contains":
+            return str(self.expected).lower() in str(value).lower()
+        elif self.operator == "in":
+            return str(value) in [str(v) for v in self.expected]
+        elif self.operator == "gt":
+            return float(value) > float(self.expected)
+        elif self.operator == "gte":
+            return float(value) >= float(self.expected)
+        elif self.operator == "lt":
+            return float(value) < float(self.expected)
+        elif self.operator == "lte":
+            return float(value) <= float(self.expected)
+        else:
+            return False  # Unknown operator
+
+    def _check_any_port(self, findings: dict) -> bool:
+        """
+        Check if any port entry in findings['ports'] matches the expected criteria.
+
+        expected can be:
+            {"port": 8181}                          — port number only
+            {"port": 22, "service": "ssh"}          — port + service
+            {"service": "http"}                     — service only
+            {"port": 21, "version": "ProFTPD 1.3.5"} — port + version substring
+        """
+        ports = findings.get("ports", [])
+        if not isinstance(ports, list):
+            return False
+
+        expected = self.expected or {}
+        for port_entry in ports:
+            if not isinstance(port_entry, dict):
+                continue
+            match = True
+            for key, val in expected.items():
+                port_val = port_entry.get(key, "")
+                if key in ("port", "rport"):
+                    # Numeric comparison
+                    match = match and (str(port_val) == str(val))
+                else:
+                    # Substring match for service/version
+                    match = match and (str(val).lower() in str(port_val).lower())
+            if match:
+                return True
+        return False
+
+    def __str__(self) -> str:
+        if self.description:
+            return self.description
+        if self.operator == "exists":
+            return f"{self.field} exists"
+        elif self.operator == "any_port":
+            return f"port matching {self.expected} is open"
+        else:
+            return f"{self.field} {self.operator} {self.expected}"
+
+
+# =============================================================================
 # ATTACK EDGE — the decision / reasoning between nodes
 # =============================================================================
 
@@ -217,38 +327,56 @@ class AttackEdge:
     """
     A directed edge from source → target that documents WHY this path was taken.
 
-    The edge is the decision point. It records:
-      - What evidence/observation triggered this transition
-      - What the agent's reasoning was
-      - Under what condition this edge activates (gate)
+    The edge has three layers:
+      1. GATE (condition) — basic status check: did the source succeed/fail?
+      2. CHECKS — testable predicates on the source's findings data
+         (e.g., "port 8181 is open", "OS contains Linux", "access_level == user")
+      3. REASONING (evidence + rationale) — human-readable documentation of
+         why this path was chosen, filled in during or after execution
+
+    The edge is traversable when:
+      - The gate condition is met (on_success, on_failure, always)
+      - AND all checks pass against the source node's findings
 
     Examples:
-      - recon → exploit_proftpd:
-            evidence: "Nmap found ProFTPD 1.3.5 on port 21, OS: Linux"
-            rationale: "ProFTPD 1.3.5 is vulnerable to modcopy RCE (CVE-2015-3306)"
+      recon → rails_exploit:
+          condition: on_success
+          checks:
+            - {field: "ports", operator: "any_port", expected: {"port": 8181},
+               description: "Rails app on port 8181 is open"}
+            - {field: "os_detected", operator: "contains", expected: "Linux",
+               description: "Target is running Linux"}
+          rationale: "Rails app with known secret_key_base on Linux"
 
-      - exploit → privesc:
-            evidence: "Got shell session 1 as user 'www-data'"
-            rationale: "Need root for disk wipe, current access is unprivileged"
+      rails_exploit → persistence:
+          condition: on_success
+          checks:
+            - {field: "session_id", operator: "exists",
+               description: "Got an active session"}
+            - {field: "session_type", operator: "equals", expected: "meterpreter",
+               description: "Session is meterpreter (needed for post modules)"}
+          rationale: "Meterpreter session required for service_persistence module"
 
-      - exploit_primary → exploit_fallback:
-            evidence: "EternalBlue failed — target not vulnerable"
-            rationale: "Falling back to SSH brute force"
-            condition: on_failure
+      exploit_primary → exploit_fallback:
+          condition: on_failure
+          checks: []  (no checks needed — just needs failure)
+          rationale: "Primary exploit failed, trying alternative vector"
     """
     source: str                     # Source node ID
     target: str                     # Target node ID
 
-    # --- The decision ---
-    evidence: str = ""              # What was observed: "Found ProFTPD 1.3.5 on port 21"
-    rationale: str = ""             # Why this path: "ProFTPD 1.3.5 has known RCE CVE-2015-3306"
-
-    # --- Gate condition ---
+    # --- Gate: basic status check ---
     condition: str = EdgeCondition.ON_SUCCESS.value
-    condition_expr: str = ""        # For CONDITIONAL: "findings.access_level == 'user'"
+
+    # --- Checks: testable predicates on source findings ---
+    checks: list[EdgeCheck] = field(default_factory=list)
+
+    # --- Reasoning: the WHY (documentation / audit trail) ---
+    evidence: str = ""              # What was observed: "Found ProFTPD 1.3.5 on port 21"
+    rationale: str = ""             # Why this path: "ProFTPD 1.3.5 has known RCE"
 
     # --- Extensibility ---
-    label: str = ""                 # Short display label for graph rendering
+    label: str = ""
     metadata: dict = field(default_factory=dict)
 
 
@@ -330,15 +458,17 @@ class AttackGraph:
         self,
         source_id: str,
         target_id: str,
+        checks: list[EdgeCheck] = None,
         evidence: str = "",
         rationale: str = "",
         condition: str = EdgeCondition.ON_SUCCESS.value,
         **kwargs,
     ) -> AttackEdge:
-        """Shorthand: create and add an edge with reasoning."""
+        """Shorthand: create and add an edge with checks and reasoning."""
         edge = AttackEdge(
             source=source_id,
             target=target_id,
+            checks=checks or [],
             evidence=evidence,
             rationale=rationale,
             condition=condition,
@@ -395,41 +525,36 @@ class AttackGraph:
         return ready
 
     def _edge_satisfied(self, edge: AttackEdge) -> bool:
+        """
+        Check if an edge is traversable. Two layers:
+          1. GATE — source node status matches edge.condition
+          2. CHECKS — all EdgeCheck predicates pass against source.findings
+        """
         source = self.nodes.get(edge.source)
         if not source:
             return False
-        if edge.condition == EdgeCondition.ALWAYS.value:
-            return source.status in (NodeStatus.SUCCESS.value, NodeStatus.FAILED.value)
-        elif edge.condition == EdgeCondition.ON_SUCCESS.value:
-            return source.status == NodeStatus.SUCCESS.value
-        elif edge.condition == EdgeCondition.ON_FAILURE.value:
-            return source.status == NodeStatus.FAILED.value
-        elif edge.condition == EdgeCondition.CONDITIONAL.value:
-            return self._evaluate_condition(edge)
-        return False
 
-    def _evaluate_condition(self, edge: AttackEdge) -> bool:
-        if not edge.condition_expr:
-            return True
-        source = self.nodes.get(edge.source)
-        if not source:
+        # Layer 1: Gate — check source status
+        gate_passed = False
+        if edge.condition == EdgeCondition.ALWAYS.value:
+            gate_passed = source.status in (NodeStatus.SUCCESS.value, NodeStatus.FAILED.value)
+        elif edge.condition == EdgeCondition.ON_SUCCESS.value:
+            gate_passed = source.status == NodeStatus.SUCCESS.value
+        elif edge.condition == EdgeCondition.ON_FAILURE.value:
+            gate_passed = source.status == NodeStatus.FAILED.value
+        elif edge.condition == EdgeCondition.CONDITIONAL.value:
+            # CONDITIONAL: gate passes if source is done (success or failed),
+            # actual decision is in the checks
+            gate_passed = source.status in (NodeStatus.SUCCESS.value, NodeStatus.FAILED.value)
+
+        if not gate_passed:
             return False
-        try:
-            if "==" in edge.condition_expr:
-                path, expected = edge.condition_expr.split("==", 1)
-                path = path.strip().removeprefix("findings.").strip()
-                expected = expected.strip().strip("'\"")
-                value = _resolve_dotpath(source.findings, path)
-                return str(value) == expected
-            elif "!=" in edge.condition_expr:
-                path, expected = edge.condition_expr.split("!=", 1)
-                path = path.strip().removeprefix("findings.").strip()
-                expected = expected.strip().strip("'\"")
-                value = _resolve_dotpath(source.findings, path)
-                return str(value) != expected
-        except (KeyError, TypeError, AttributeError):
-            return False
-        return True
+
+        # Layer 2: Checks — evaluate each predicate against source findings
+        if not edge.checks:
+            return True  # No checks = gate is sufficient
+
+        return all(check.evaluate(source.findings) for check in edge.checks)
 
     def is_complete(self) -> bool:
         return all(
@@ -505,7 +630,12 @@ class AttackGraph:
             node = _node_from_dict(node_data)
             graph.nodes[node.id] = node
         for edge_data in data.get("edges", []):
-            graph.edges.append(AttackEdge(**edge_data))
+            checks_data = edge_data.pop("checks", [])
+            edge = AttackEdge(
+                **edge_data,
+                checks=[EdgeCheck(**c) for c in checks_data],
+            )
+            graph.edges.append(edge)
         return graph
 
     @classmethod
@@ -546,6 +676,8 @@ class AttackGraph:
                 cond = f" [{edge.condition}]" if edge.condition != "on_success" else ""
                 reason = f' — "{edge.rationale}"' if edge.rationale else ""
                 lines.append(f"    {edge.source} → {edge.target}{cond}{reason}")
+                for check in edge.checks:
+                    lines.append(f"      ? {check}")
 
         return "\n".join(lines)
 
