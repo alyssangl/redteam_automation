@@ -118,17 +118,36 @@ class AttackNode:
     agent_type: str = ""            # Which subagent: "recon", "exploit", "privesc", etc.
 
     # --- What to do (self-contained) ---
-    objective: str = ""             # Plain English: "Exploit ProFTPD 1.3.5 to get a shell"
+    goal: str = ""                  # High-level intent: "Establish persistence", "Wipe disk"
+                                    # Used by replanner to find alternative paths to same goal
+    objective: str = ""             # Specific plan: "Exploit ProFTPD 1.3.5 to get a shell"
     target_ip: str = ""
     tool_name: str = ""             # "nmap", "metasploit", "wipe", "ssh", etc.
     module: str = ""                # MSF module: "exploit/unix/ftp/proftpd_modcopy_exec"
     module_options: dict = field(default_factory=dict)
     # ^ {"RHOSTS": "10.0.0.5", "RPORT": 21, "LHOST": "192.168.34.6", ...}
+    module_options_alternatives: dict = field(default_factory=dict)
+    # ^ Tweakable field overrides for retries.
+    #   Keys = field names that are safe to vary (the rest are fixed).
+    #   Values = list of alternate values to try on successive retries.
+    #   Example: {"SITEPATH": ["/var/www/html", "/var/tmp"],
+    #             "PAYLOAD": ["cmd/unix/reverse_python", "cmd/unix/reverse_bash"]}
+    #   Retry N uses alts[N-1] for each tweakable field (if available).
     payload: str = ""               # MSF payload: "cmd/unix/reverse_python"
     payload_options: dict = field(default_factory=dict)
     # ^ {"LHOST": "192.168.34.6", "LPORT": 4444}
     commands_to_run: list[str] = field(default_factory=list)
-    # ^ Pre-planned commands: ["apt install wipe -y", "wipe -f /tmp"]
+    # ^ Pre-planned commands. May contain {placeholder} references resolved
+    #   from `command_params`. Example:
+    #   ["echo '{marker}' > {target_file}", "cat {target_file}"]
+    command_params: dict = field(default_factory=dict)
+    # ^ Named values substituted into commands_to_run via {name} placeholders.
+    #   Example: {"target_file": "/tmp/pwned.txt", "marker": "PWNED"}
+    #   Identity fields (paths, IPs) are normally fixed here.
+    command_params_alternatives: dict = field(default_factory=dict)
+    # ^ Alternative values for command_params keys, used on retries.
+    #   Same semantics as module_options_alternatives.
+    #   Example: {"target_file": ["/tmp/.hidden", "/var/tmp/proof.txt"]}
 
     # --- Status ---
     status: str = NodeStatus.PENDING.value
@@ -172,7 +191,7 @@ class AttackNode:
 
     @property
     def can_retry(self) -> bool:
-        return self.is_failed and self.retries < self.max_retries
+        return self.retries < self.max_retries
 
     def mark_running(self):
         self.status = NodeStatus.RUNNING.value
@@ -451,6 +470,12 @@ class AttackGraph:
             raise ValueError(f"Source node '{edge.source}' not found")
         if edge.target not in self.nodes:
             raise ValueError(f"Target node '{edge.target}' not found")
+        # Deduplicate — don't add if same source→target with same condition exists
+        for existing in self.edges:
+            if (existing.source == edge.source and
+                existing.target == edge.target and
+                existing.condition == edge.condition):
+                return existing  # Already exists
         self.edges.append(edge)
         return edge
 
@@ -511,7 +536,11 @@ class AttackGraph:
         return [nid for nid in self.nodes if nid not in sources]
 
     def ready_nodes(self) -> list[str]:
-        """Nodes that are PENDING and have all incoming edge conditions met."""
+        """
+        Nodes that are PENDING and have ALL incoming edge conditions met.
+
+        Root nodes (no incoming edges) are always ready when PENDING.
+        """
         ready = []
         for node_id, node in self.nodes.items():
             if node.status != NodeStatus.PENDING.value:
@@ -714,14 +743,18 @@ def _node_from_dict(data: dict) -> AttackNode:
         technique_id=data.get("technique_id", ""),
         technique_name=data.get("technique_name", ""),
         agent_type=data.get("agent_type", ""),
+        goal=data.get("goal", ""),
         objective=data.get("objective", ""),
         target_ip=data.get("target_ip", ""),
         tool_name=data.get("tool_name", ""),
         module=data.get("module", ""),
         module_options=data.get("module_options", {}),
+        module_options_alternatives=data.get("module_options_alternatives", {}),
         payload=data.get("payload", ""),
         payload_options=data.get("payload_options", {}),
         commands_to_run=data.get("commands_to_run", []),
+        command_params=data.get("command_params", {}),
+        command_params_alternatives=data.get("command_params_alternatives", {}),
         status=data.get("status", NodeStatus.PENDING.value),
         retries=data.get("retries", 0),
         max_retries=data.get("max_retries", 3),

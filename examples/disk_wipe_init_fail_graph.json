@@ -1,0 +1,248 @@
+{
+  "id": "99b3660f",
+  "name": "init_fail_192.168.34.7",
+  "description": "Failure-recovery test: SSH brute fails \u2192 replanner finds new path.",
+  "objective": "Compromise the target via SSH and write a proof-of-compromise file. NOTE: Initial credentials are root/root which WILL NOT work on this Metasploitable 3 target. The replanner must find an alternative.",
+  "target_ip": "192.168.34.7",
+  "attacker_ip": "192.168.34.6",
+  "scope": [
+    "192.168.34.7"
+  ],
+  "nodes": {
+    "recon": {
+      "id": "recon",
+      "label": "Nmap Full Scan",
+      "tactic": "reconnaissance",
+      "technique_id": "T1046",
+      "technique_name": "Network Service Discovery",
+      "agent_type": "recon",
+      "goal": "Map the target's attack surface",
+      "objective": "Full port scan with OS detection and service versioning on 192.168.34.7.",
+      "target_ip": "192.168.34.7",
+      "tool_name": "nmap",
+      "module": "",
+      "module_options": {},
+      "module_options_alternatives": {},
+      "payload": "",
+      "payload_options": {},
+      "commands_to_run": [
+        "nmap -O -A -p 0-65535 192.168.34.7"
+      ],
+      "command_params": {},
+      "command_params_alternatives": {},
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 3,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-04-15T06:48:46.100205+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {},
+      "tags": [
+        "nmap",
+        "full_scan"
+      ]
+    },
+    "ssh_bruteforce": {
+      "id": "ssh_bruteforce",
+      "label": "SSH Login as root/root (WILL FAIL)",
+      "tactic": "credential_access",
+      "technique_id": "T1110.001",
+      "technique_name": "Brute Force: Password Guessing",
+      "agent_type": "exploit",
+      "goal": "Gain initial access to the target",
+      "objective": "Try SSH login on 192.168.34.7:22 with root/root. NOTE: This target uses vagrant/vagrant, not root/root. This attempt is expected to fail.",
+      "target_ip": "192.168.34.7",
+      "tool_name": "metasploit",
+      "module": "auxiliary/scanner/ssh/ssh_login",
+      "module_options": {
+        "USERNAME": "root",
+        "PASSWORD": "root",
+        "RHOSTS": "192.168.34.7",
+        "RPORT": 22,
+        "STOP_ON_SUCCESS": true
+      },
+      "module_options_alternatives": {},
+      "payload": "",
+      "payload_options": {},
+      "commands_to_run": [],
+      "command_params": {},
+      "command_params_alternatives": {},
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 1,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-04-15T06:48:46.100205+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {},
+      "tags": [
+        "ssh",
+        "brute_force",
+        "expected_to_fail"
+      ]
+    },
+    "privesc_verify": {
+      "id": "privesc_verify",
+      "label": "Verify Sudo Privilege Escalation",
+      "tactic": "privilege_escalation",
+      "technique_id": "T1548.003",
+      "technique_name": "Abuse Elevation Control Mechanism: Sudo",
+      "agent_type": "impact",
+      "goal": "Confirm we can elevate to root via sudo",
+      "objective": "Verify the current user has passwordless sudo (NOPASSWD: ALL).",
+      "target_ip": "192.168.34.7",
+      "tool_name": "session",
+      "module": "",
+      "module_options": {},
+      "module_options_alternatives": {},
+      "payload": "",
+      "payload_options": {},
+      "commands_to_run": [
+        "id",
+        "sudo -n whoami",
+        "sudo -n id"
+      ],
+      "command_params": {},
+      "command_params_alternatives": {},
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 1,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-04-15T06:48:46.100205+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {},
+      "tags": [
+        "privesc",
+        "sudo",
+        "verify"
+      ]
+    },
+    "file_drop": {
+      "id": "file_drop",
+      "label": "Drop Proof-of-Compromise File",
+      "tactic": "impact",
+      "technique_id": "T1485",
+      "technique_name": "Data Destruction",
+      "agent_type": "impact",
+      "goal": "Demonstrate target compromise by writing a file",
+      "objective": "Write a proof-of-compromise text file on the target.",
+      "target_ip": "192.168.34.7",
+      "tool_name": "session",
+      "module": "",
+      "module_options": {},
+      "module_options_alternatives": {},
+      "payload": "",
+      "payload_options": {},
+      "commands_to_run": [
+        "echo '{marker}' > {target_file}",
+        "echo \"Compromised at $(date)\" >> {target_file}",
+        "echo \"User: $(whoami)\" >> {target_file}",
+        "cat {target_file}",
+        "ls -la {target_file}"
+      ],
+      "command_params": {
+        "target_file": "/tmp/pwned_replanner.txt",
+        "marker": "PWNED via replanner recovery"
+      },
+      "command_params_alternatives": {
+        "target_file": [
+          "/var/tmp/pwned_replanner.txt",
+          "/dev/shm/pwned_replanner.txt"
+        ]
+      },
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 3,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-04-15T06:48:46.100205+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {
+        "target_file": "/tmp/pwned_replanner.txt"
+      },
+      "tags": [
+        "impact",
+        "file_drop",
+        "proof"
+      ]
+    }
+  },
+  "edges": [
+    {
+      "source": "recon",
+      "target": "ssh_bruteforce",
+      "condition": "on_success",
+      "checks": [
+        {
+          "field": "ports",
+          "operator": "any_port",
+          "expected": {
+            "port": 22,
+            "service": "ssh"
+          },
+          "description": "SSH service is open on port 22"
+        }
+      ],
+      "evidence": "Nmap found SSH on port 22",
+      "rationale": "Try root/root credentials on SSH (will fail \u2014 replanner recovers)",
+      "label": "",
+      "metadata": {}
+    },
+    {
+      "source": "ssh_bruteforce",
+      "target": "privesc_verify",
+      "condition": "on_success",
+      "checks": [
+        {
+          "field": "session_id",
+          "operator": "exists",
+          "expected": null,
+          "description": "Active session obtained"
+        }
+      ],
+      "evidence": "Got SSH session",
+      "rationale": "Verify sudo access before proceeding",
+      "label": "",
+      "metadata": {}
+    },
+    {
+      "source": "privesc_verify",
+      "target": "file_drop",
+      "condition": "on_success",
+      "checks": [
+        {
+          "field": "success",
+          "operator": "equals",
+          "expected": "True",
+          "description": "Privesc verification succeeded"
+        }
+      ],
+      "evidence": "Confirmed sudo access",
+      "rationale": "Execute the final objective \u2014 drop the proof file",
+      "label": "",
+      "metadata": {}
+    }
+  ],
+  "known_credentials": [],
+  "active_sessions": [],
+  "discovered_hosts": [],
+  "status": "planned",
+  "created_at": "2026-04-15T06:48:46.100205+00:00",
+  "started_at": "",
+  "completed_at": "",
+  "metadata": {
+    "scenario": "init_fail_recovery",
+    "target_type": "metasploitable3"
+  },
+  "version": "1.0"
+}

