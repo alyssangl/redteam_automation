@@ -667,6 +667,152 @@ def _dispatch_discovery(node: AttackNode, graph: AttackGraph, preceding: dict, e
 
 
 # =============================================================================
+# MSF MODULE → TARGET REQUIREMENTS — programmatic version validation
+# =============================================================================
+#
+# Maps MSF module names to the service/version they require.
+# Used to reject replanner proposals that don't match the actual target.
+
+MSF_MODULE_REQUIREMENTS: dict = {
+    # ProFTPD
+    "exploit/unix/ftp/proftpd_133c_backdoor": {
+        "service_contains": "ftp",
+        "version_contains": "1.3.3c",  # ONLY 1.3.3c, NOT 1.3.5
+    },
+    "exploit/unix/ftp/proftpd_modcopy_exec": {
+        "service_contains": "ftp",
+        "version_contains": "1.3.5",   # 1.3.5 (mod_copy)
+    },
+    # Samba
+    "exploit/multi/samba/usermap_script": {
+        "service_contains": "samba",
+        # Vulnerable: 3.0.20 - 3.0.25rc3 only. NOT 4.x.
+        "version_pattern": r"3\.0\.2[0-5]",
+    },
+    "exploit/linux/samba/is_known_pipename": {
+        "service_contains": "samba",
+        # Vulnerable: 3.5.0 to 4.6.4 (CVE-2017-7494)
+        "version_pattern": r"(3\.[5-9]|3\.1[0-9]|4\.[0-5]|4\.6\.[0-4])",
+    },
+    # UnrealIRCd
+    "exploit/unix/irc/unreal_ircd_3281_backdoor": {
+        "service_contains": "irc",
+        "version_contains": "Unreal",
+    },
+    # Rails
+    "exploit/multi/http/rails_secret_deserialization": {
+        "service_contains": "http",
+        # Needs the Rails app actually serving on the configured RPORT
+    },
+    # Drupal
+    "exploit/multi/http/drupal_drupageddon": {
+        "service_contains": "http",
+        "version_pattern": r"7\.([0-9]|[12][0-9]|3[01])(?!\d)",  # 7.0 - 7.31
+    },
+}
+
+
+def _validate_msf_module_for_target(
+    module: str, recon_findings: dict, log: logging.Logger,
+) -> tuple[bool, str]:
+    """
+    Check if an MSF module is applicable to the target based on recon findings.
+
+    Returns (ok, reason). If module is not in MSF_MODULE_REQUIREMENTS,
+    returns (True, "no requirements known") — we don't block unknown modules.
+    """
+    if module not in MSF_MODULE_REQUIREMENTS:
+        return True, "no version requirements known for this module"
+
+    req = MSF_MODULE_REQUIREMENTS[module]
+    ports = recon_findings.get("ports", [])
+    if not ports:
+        return False, "no ports in recon findings"
+
+    service_filter = req.get("service_contains", "").lower()
+    version_contains = req.get("version_contains", "")
+    version_pattern = req.get("version_pattern", "")
+
+    matching_ports = []
+    for p in ports:
+        service = (p.get("service", "") or "").lower()
+        version = p.get("version", "") or ""
+        if service_filter and service_filter not in service:
+            continue
+        # Check version constraints
+        if version_contains and version_contains not in version:
+            continue
+        if version_pattern and not re.search(version_pattern, version):
+            continue
+        matching_ports.append(f"{p.get('port')}/{service} {version}")
+
+    if matching_ports:
+        return True, f"matching ports found: {', '.join(matching_ports)}"
+
+    # Build a useful failure reason
+    found_services = [
+        f"{p.get('port')}/{p.get('service','')} {p.get('version','')}"
+        for p in ports if service_filter in (p.get("service", "") or "").lower()
+    ]
+    reason = (
+        f"no port matches requirements for {module} "
+        f"(needs service~{service_filter!r}"
+    )
+    if version_contains:
+        reason += f", version contains {version_contains!r}"
+    if version_pattern:
+        reason += f", version matches /{version_pattern}/"
+    reason += ")"
+    if found_services:
+        reason += f". Found {service_filter} on: {found_services}"
+    return False, reason
+
+
+def _build_msf_module_checks(module: str) -> list[EdgeCheck]:
+    """
+    Build EdgeCheck objects from MSF_MODULE_REQUIREMENTS for a given module.
+    These get attached to the edge so the walker enforces them on every traversal.
+    """
+    if module not in MSF_MODULE_REQUIREMENTS:
+        return []
+
+    req = MSF_MODULE_REQUIREMENTS[module]
+    checks = []
+    service_filter = req.get("service_contains", "")
+    version_contains = req.get("version_contains", "")
+    version_pattern = req.get("version_pattern", "")
+
+    if service_filter and version_contains:
+        # Composite check: any port with matching service AND version substring
+        checks.append(EdgeCheck(
+            field="ports",
+            operator="any_port",
+            expected={"service": service_filter, "version": version_contains},
+            description=f"port with service~{service_filter} AND version~{version_contains} "
+                        f"(required by {module})",
+        ))
+    elif service_filter:
+        checks.append(EdgeCheck(
+            field="ports",
+            operator="any_port",
+            expected={"service": service_filter},
+            description=f"port with service~{service_filter} (required by {module})",
+        ))
+    # Note: version_pattern (regex) isn't directly expressible as an EdgeCheck operator,
+    # so the programmatic validation in _validate_msf_module_for_target catches those.
+    # The persisted check above provides a coarse safety net that survives JSON reload.
+    return checks
+
+
+def _gather_recon_findings(graph: AttackGraph) -> dict:
+    """Find the most relevant recon findings in the graph (any node with ports)."""
+    for node in graph.nodes.values():
+        if node.status == NodeStatus.SUCCESS.value and node.findings.get("ports"):
+            return node.findings
+    return {}
+
+
+# =============================================================================
 # REPLANNER — grow new edges/nodes when the graph is stuck
 # =============================================================================
 
@@ -771,6 +917,13 @@ Rules:
 - Prefer creating NEW NODES with specific commands over reusing failed nodes
 - For MSF modules: ALWAYS use the actual ATTACKER IP from the context for LHOST,
   and the actual TARGET IP for RHOSTS. NEVER use placeholders like "..." or "<ip>".
+- VERSION COMPATIBILITY IS CRITICAL. Look at the recon findings (services + versions)
+  in the stuck node's findings. Only propose exploits that match the ACTUAL detected
+  versions. Common mistakes to avoid:
+    * proftpd_133c_backdoor only works on ProFTPD 1.3.3c — NOT 1.3.5
+    * samba/usermap_script only works on Samba 3.0.20-3.0.25 — NOT Samba 4.x
+    * is_known_pipename works on Samba 3.5.0-4.6.4 — NOT older
+  Your proposal will be REJECTED if the version doesn't match.
 - ONE proposal per call. Keep it concrete and actionable.
 """
 
@@ -828,12 +981,27 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
                 "failure_reason": node.metadata.get("last_failure_reason", "unknown"),
             }
 
+    # Always surface recon findings (services + versions) explicitly,
+    # even if the stuck node isn't the recon node — the replanner needs
+    # version info to pick compatible exploits.
+    recon_findings = _gather_recon_findings(graph)
+    detected_services = []
+    if recon_findings.get("ports"):
+        for p in recon_findings["ports"]:
+            detected_services.append({
+                "port": p.get("port"),
+                "service": p.get("service", ""),
+                "version": p.get("version", ""),
+            })
+
     context = (
         f"OBJECTIVE: {graph.objective}\n\n"
         f"TARGET (RHOSTS): {graph.target_ip}\n"
         f"ATTACKER (LHOST): {graph.attacker_ip}\n\n"
+        f"DETECTED SERVICES (from recon — match exploit versions to these!):\n"
+        f"{json.dumps(detected_services, indent=2)}\n\n"
         f"STUCK AT NODE: {stuck_node_id} ({stuck_node.label})\n"
-        f"FINDINGS: {json.dumps(trimmed_findings, indent=2, default=str)}\n\n"
+        f"STUCK NODE FINDINGS: {json.dumps(trimmed_findings, indent=2, default=str)}\n\n"
         f"FAILED OUTGOING EDGES:\n{json.dumps(failed_edges, indent=2, default=str)}\n\n"
         f"REMAINING NODES:\n{json.dumps(remaining, indent=2, default=str)}\n"
     )
@@ -884,6 +1052,26 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
             log.warning(f"[Replanner] Invalid new node ID: '{nid}'")
             return None
 
+        proposed_module = result.get("module", "")
+        edge_checks = []
+
+        # PROGRAMMATIC VALIDATION: if it's an MSF module, verify it matches recon
+        if proposed_module:
+            recon_findings = _gather_recon_findings(graph)
+            ok, reason = _validate_msf_module_for_target(
+                proposed_module, recon_findings, log,
+            )
+            if not ok:
+                log.warning(
+                    f"[Replanner] REJECTED proposal {proposed_module}: {reason}"
+                )
+                return None
+            log.info(f"[Replanner] Module validation OK: {reason}")
+
+            # Persist the validation as EdgeChecks on the new edge so the walker
+            # re-enforces them and the requirement survives JSON reload.
+            edge_checks = _build_msf_module_checks(proposed_module)
+
         new_node = AttackNode(
             id=nid,
             label=result.get("label", nid),
@@ -892,7 +1080,7 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
             objective=result.get("objective", ""),
             target_ip=graph.target_ip,
             tool_name=result.get("tool_name", "session"),
-            module=result.get("module", ""),
+            module=proposed_module,
             module_options=result.get("module_options", {}),
             module_options_alternatives=result.get("module_options_alternatives", {}),
             payload=result.get("payload", ""),
@@ -906,12 +1094,16 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
         graph.add_node(new_node)
         graph.connect(
             stuck_node_id, nid,
+            checks=edge_checks,
             evidence=f"Replanner: new step from {stuck_node_id}",
             rationale=rationale,
             condition="on_success",
         )
         log.info(f"[Replanner] NEW NODE: {nid} ({new_node.label})")
         log.info(f"[Replanner] NEW EDGE: {stuck_node_id} → {nid} — {rationale}")
+        if edge_checks:
+            for c in edge_checks:
+                log.info(f"  ? {c}")
         return nid
 
     elif action == "give_up":
