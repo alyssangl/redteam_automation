@@ -540,6 +540,46 @@ def _execute_session_commands(
 _SUDO_GROUPS = {"sudo", "wheel", "admin"}
 
 
+# Stage C: ordered failure-cause patterns. First match wins, so put specific
+# patterns before generic ones. Each entry: (compiled regex, category).
+# Categories are short stable labels the LLM can react to programmatically.
+_MSF_FAILURE_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"Failed to load module", re.IGNORECASE), "module_load_failed"),
+    (re.compile(r"is not a compatible payload", re.IGNORECASE), "incompatible_payload"),
+    (re.compile(r"directory not writable", re.IGNORECASE), "writable_path_missing"),
+    (re.compile(r"website path", re.IGNORECASE), "writable_path_missing"),
+    (re.compile(r"(adjust TARGETURI|Cookie not found|No cookie found)", re.IGNORECASE), "wrong_targeturi"),
+    (re.compile(r"Connection refused", re.IGNORECASE), "network_refused"),
+    (re.compile(r"could not resolve host", re.IGNORECASE), "network_dns"),
+    (re.compile(r"bad-config:", re.IGNORECASE), "config_problem"),
+    (re.compile(r"timeout|timed out", re.IGNORECASE), "timeout"),
+    (re.compile(r"Authentication failed|Login failed", re.IGNORECASE), "auth_failed"),
+]
+
+
+def _classify_msf_failure(output: str) -> tuple[str, str]:
+    """
+    Scan MSF output for known failure patterns and return (category, phrase).
+
+    `category` is a short stable label (writable_path_missing, etc.) for
+    programmatic use. `phrase` is the actual matched substring with a bit
+    of surrounding context, for human/LLM consumption.
+
+    Returns ("generic", "") if no pattern matches.
+    """
+    if not output:
+        return "generic", ""
+    for pattern, category in _MSF_FAILURE_PATTERNS:
+        m = pattern.search(output)
+        if m:
+            # Snip ~120 chars of surrounding context for the phrase
+            start = max(0, m.start() - 40)
+            end = min(len(output), m.end() + 80)
+            phrase = output[start:end].replace("\n", " ").strip()
+            return category, phrase
+    return "generic", ""
+
+
 def _extract_privilege_from_msf_output(output: str) -> dict:
     """
     Parse `id` / `uid=N(name) gid=N(name) groups=N(name),N(name) ...` strings
@@ -666,6 +706,14 @@ def _parse_msf_output(output: str, node: AttackNode, target_ip: str, log: loggin
     else:
         findings["summary"] = f"Module execution completed — result unclear via {node.module}"
         log.info(f"  [direct] COMPLETED: result unclear, checking output...")
+
+    # Stage C: tag the actual failure cause so the replanner can pivot
+    # intelligently instead of guessing from a generic "no session" summary.
+    category, phrase = _classify_msf_failure(output)
+    findings["failure_category"] = category
+    findings["failure_cause"] = phrase
+    if category != "generic":
+        log.info(f"  [direct] FAILURE CATEGORY: {category} -- {phrase[:120]}")
 
     return findings
 
@@ -1406,6 +1454,11 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
                 "module": node.module,                          # what was tried
                 "commands_to_run": node.commands_to_run[:3],    # first 3 cmds
                 "failure_reason": node.metadata.get("last_failure_reason", "unknown"),
+                # Stage C: specific category + phrase so the LLM can pivot
+                # intelligently. e.g. writable_path_missing -> try a different
+                # SITEPATH; wrong_targeturi -> try a different path; etc.
+                "failure_category": node.findings.get("failure_category", "generic"),
+                "failure_cause": node.findings.get("failure_cause", ""),
             }
 
     # Always surface recon findings (services + versions) explicitly,
