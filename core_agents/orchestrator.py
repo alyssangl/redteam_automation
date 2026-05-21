@@ -384,10 +384,71 @@ def _render_command(template: str, params: dict) -> str:
         return template
 
 
+# Concrete failure-indicator phrases. These are case-insensitive substring
+# matches against command output. The list comes from observed false positives
+# in live runs (see reports/stage_{1,2,3}_live_test.md) — every entry here is
+# a phrase that previously got marked success=True despite being a clear failure.
+_FAILURE_INDICATORS: list[str] = [
+    "permission denied",
+    "no such file or directory",
+    "cannot access",
+    "command not found",
+    "operation not permitted",
+    "connection refused",
+    "exec format error",
+    "is a directory",          # "echo > /etc/passwd" style mistakes
+    "bad substitution",        # bash syntax error
+    "syntax error",
+    "does not exist",          # covers "file does not exist" etc.
+    "ssh connection/execution error",   # from common.run_ssh_command
+    "(exit code:",             # from common.run_ssh_command's non-zero-exit wrap
+    "could not resolve host",
+    "host key verification failed",
+]
+
+
+def _command_output_indicates_failure(output: str) -> tuple[bool, str]:
+    """
+    Scan one command's stdout/stderr for known failure phrases.
+
+    Returns (is_failure, matched_phrase). The match is case-insensitive
+    substring. Used by the session/SSH executors to overrule the previous
+    loose "any non-empty output = success" heuristic that caused multiple
+    Stage 1-3 live runs to mark nodes SUCCESS when commands clearly failed.
+
+    `(no output)` is NOT a failure on its own — many useful commands
+    (mkdir, chmod, echo > file) legitimately produce nothing.
+    """
+    if not output:
+        return False, ""
+    low = output.lower()
+    for phrase in _FAILURE_INDICATORS:
+        if phrase in low:
+            return True, phrase
+    return False, ""
+
+
+def _scan_commands_for_failure(
+    node: AttackNode, log: logging.Logger,
+) -> tuple[bool, str]:
+    """
+    Walk the node's CommandRecord list and return the first failure
+    detected, if any. Returns (any_failed, summary_line).
+    """
+    for rec in node.commands:
+        bad, phrase = _command_output_indicates_failure(rec.output)
+        if bad:
+            summary = (
+                f"Command failed ({phrase!r}): {rec.command[:80]}"
+            )
+            log.warning(f"  [direct] {summary}")
+            return True, summary
+    return False, ""
+
+
 def _execute_ssh_commands(node: AttackNode, log: logging.Logger) -> dict:
     """Execute shell commands on Kali via SSH (with templated params)."""
     all_output = ""
-    success = True
     params = _resolve_command_params(node, log)
 
     for template in node.commands_to_run:
@@ -401,11 +462,16 @@ def _execute_ssh_commands(node: AttackNode, log: logging.Logger) -> dict:
         if preview:
             log.info(f"  [direct]   {preview}")
 
-        if "failed" in output.lower() or "error" in output.lower():
-            success = False
+    failed, fail_summary = _scan_commands_for_failure(node, log)
+    if failed:
+        return {
+            "success": False,
+            "summary": fail_summary,
+            "output": all_output[:5000],
+        }
 
     return {
-        "success": success,
+        "success": True,
         "summary": f"Executed {len(node.commands_to_run)} command(s) on Kali",
         "output": all_output[:5000],
     }
@@ -417,7 +483,6 @@ def _execute_session_commands(
 ) -> dict:
     """Execute commands on the target through an active MSF session (with templated params)."""
     all_output = ""
-    success = True
     params = _resolve_command_params(node, log)
 
     for template in node.commands_to_run:
@@ -431,11 +496,17 @@ def _execute_session_commands(
         if preview:
             log.info(f"  [direct]   {preview}")
 
-        if "error" in output.lower() and "not found" in output.lower():
-            success = False
+    failed, fail_summary = _scan_commands_for_failure(node, log)
+    if failed:
+        return {
+            "success": False,
+            "session_id": session_id,
+            "summary": fail_summary,
+            "output": all_output[:5000],
+        }
 
     return {
-        "success": success,
+        "success": True,
         "session_id": session_id,
         "summary": f"Executed {len(node.commands_to_run)} command(s) on target via session {session_id}",
         "output": all_output[:5000],

