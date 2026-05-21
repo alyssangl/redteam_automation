@@ -837,6 +837,119 @@ def _recent_command_excerpts(node: AttackNode, n: int = 3, cap: int = 2048) -> l
 
 
 # =============================================================================
+# JUDGE — layer-2 strategic decision after each node attempt
+# =============================================================================
+#
+# A small LLM call that runs at three trigger points:
+#   post_retry — inside _execute_node after each failed attempt; decides whether
+#                another retry will help or whether to escalate to the replanner.
+#   post_node  — in run_graph after a node completes; decides whether to follow
+#                the planned outgoing edges or jump straight to the replanner.
+#   pre_replan — implicit in escalate decisions above.
+#
+# Output is a tiny intent: {action, hint}. Code interprets the action; the hint
+# is for human readability in logs.
+
+JUDGE_PROMPT = """You are a step-by-step strategic judge for an autonomous pentest.
+
+After a node attempt, decide what to do NEXT. Choose ONE action:
+
+  continue — Node succeeded, or failure is transient (timeout, race condition,
+             port flapping). Proceed with the existing plan.
+  adapt    — Node failed AND a parameter tweak (alt payload, alt path, alt
+             credentials) plausibly fixes it. Only choose this if
+             alternatives_remaining > 0 — otherwise the next retry will be
+             identical.
+  escalate — This approach is dead. The next retry will not help. Call the
+             replanner now rather than burning more attempts.
+
+Respond ONLY with JSON:
+  {"action": "continue" | "adapt" | "escalate", "hint": "one short sentence"}
+
+The hint should briefly explain your reasoning so it shows up in logs."""
+
+
+def _build_judge_context(trigger: str, node: AttackNode, graph: AttackGraph) -> str:
+    """Minimal context: just node state, recent commands, and edge count."""
+    recent_cmds = _recent_command_excerpts(node, n=3, cap=1024)
+    alternatives_remaining = max(0, node.max_retries - node.retries)
+    outgoing_edges_count = len(graph.outgoing_edges(node.id))
+
+    return (
+        f"TRIGGER: {trigger}\n"
+        f"NODE: {node.id} ({node.label})\n"
+        f"STATUS: {node.status}\n"
+        f"RETRIES: {node.retries}/{node.max_retries}  "
+        f"ALTERNATIVES_REMAINING: {alternatives_remaining}\n"
+        f"LAST FAILURE: {node.metadata.get('last_failure_reason', '(none)')}\n"
+        f"OUTGOING EDGES DEFINED: {outgoing_edges_count}\n\n"
+        f"RECENT COMMAND OUTPUT (last 3, tails capped at 1KB):\n"
+        f"{json.dumps(recent_cmds, indent=2, default=str)}\n"
+    )
+
+
+def judge(
+    trigger: str, node: AttackNode, graph: AttackGraph, log: logging.Logger,
+) -> dict:
+    """
+    One LLM call. Returns {'action': 'continue'|'adapt'|'escalate', 'hint': str}.
+
+    On any failure (LLM error, parse error, unknown action), defaults to
+    'continue' so the existing flow is never broken by judge failures.
+    """
+    context = _build_judge_context(trigger, node, graph)
+    log.debug(f"[Judge] Context ({trigger}, {len(context)} chars):\n{context}")
+
+    try:
+        resp = call_llm(
+            messages=[HumanMessage(content=context)],
+            system_prompt=JUDGE_PROMPT,
+        )
+        result = parse_json_response(resp.content)
+    except Exception as e:
+        log.warning(f"[Judge] LLM call failed ({e}) — defaulting to continue")
+        return {"action": "continue", "hint": "(judge call failed)"}
+
+    action = result.get("action", "continue")
+    if action not in ("continue", "adapt", "escalate"):
+        log.warning(f"[Judge] Unknown action '{action}' — defaulting to continue")
+        action = "continue"
+    hint = result.get("hint", "")
+    log.info(f"[Judge] {trigger}: {action} -- {hint}")
+    return {"action": action, "hint": hint}
+
+
+def _try_replanner(
+    graph: AttackGraph, current: str, log: logging.Logger,
+    checkpoint_path: str, replan_attempts: int, max_replan_attempts: int,
+    explore: bool,
+) -> tuple[Optional[str], int]:
+    """
+    Try to replan from `current`. Returns (new_target_or_None, updated_attempts).
+
+    Returns (None, replan_attempts) without firing the LLM if explore is off,
+    the budget is exhausted, or the LLM gave up.
+    """
+    if not explore:
+        return None, replan_attempts
+    if replan_attempts >= max_replan_attempts:
+        log.info(
+            f"[Orchestrator] Replan budget exhausted "
+            f"({replan_attempts}/{max_replan_attempts})"
+        )
+        return None, replan_attempts
+    replan_attempts += 1
+    log.info(
+        f"[Orchestrator] Replan attempt {replan_attempts}/{max_replan_attempts} "
+        f"from '{current}'"
+    )
+    new_target = _replan_from(graph, current, log)
+    if new_target:
+        _checkpoint(graph, checkpoint_path, log)
+    return new_target, replan_attempts
+
+
+# =============================================================================
 # REPLANNER — grow new edges/nodes when the graph is stuck
 # =============================================================================
 
@@ -1188,11 +1301,15 @@ def _find_next(graph: AttackGraph, node_id: str, tried: set, log: logging.Logger
 
 def _execute_node(
     node_id: str, graph: AttackGraph, log: logging.Logger,
-    explore: bool, checkpoint_path: str,
-) -> bool:
+    explore: bool, checkpoint_path: str, use_judge: bool = True,
+) -> tuple[bool, str]:
     """
-    Execute a single node. Returns True on success, False on failure.
-    Handles retries internally.
+    Execute a single node. Returns (success, reason).
+
+    reason is one of:
+      "success"           — node succeeded
+      "retries_exhausted" — node failed after burning all max_retries
+      "judge_escalate"    — judge cut retries short; replanner should run
     """
     node = graph.get_node(node_id)
 
@@ -1227,18 +1344,34 @@ def _execute_node(
                     log.info(f"  [{node_id}] New session tracked: {session_info}")
 
                 _checkpoint(graph, checkpoint_path, log)
-                return True
+                return True, "success"
 
             else:
                 reason = summary or "No success flag in findings"
                 node.mark_failed(reason)
-                if node.can_retry:
-                    log.warning(f"  [{node_id}] STATUS → retry ({node.retries}/{node.max_retries}): {reason}")
-                    time.sleep(2)
-                    continue  # Retry
-                else:
+                if not node.can_retry:
                     log.error(f"  [{node_id}] STATUS → failed: {reason}")
-                    return False
+                    return False, "retries_exhausted"
+
+                # Layer 2: consult the judge before burning the next retry.
+                # If it says escalate, return early so the walker can replan.
+                if use_judge:
+                    decision = judge("post_retry", node, graph, log)
+                    if decision["action"] == "escalate":
+                        log.info(
+                            f"  [{node_id}] Judge cut retries short -- "
+                            f"escalating to replanner"
+                        )
+                        return False, "judge_escalate"
+                    # 'adapt' and 'continue' both retry; 'adapt' is honoured
+                    # by the existing alts[] cycling via node.retries.
+
+                log.warning(
+                    f"  [{node_id}] STATUS → retry "
+                    f"({node.retries}/{node.max_retries}): {reason}"
+                )
+                time.sleep(2)
+                continue  # Retry
 
         except Exception as e:
             node.mark_failed(str(e))
@@ -1246,13 +1379,14 @@ def _execute_node(
             if node.can_retry:
                 time.sleep(2)
                 continue
-            return False
+            return False, "retries_exhausted"
 
 
 def run_graph(
     graph: AttackGraph,
     checkpoint_path: Optional[str] = None,
     explore: bool = False,
+    use_judge: bool = True,
 ) -> AttackGraph:
     """
     Walk an AttackGraph using backtracking depth-first traversal.
@@ -1260,11 +1394,13 @@ def run_graph(
     Flow:
       1. Start at a root node
       2. Execute it
-      3. On success: evaluate outgoing edges, follow the first that passes
+      3. On success: optional judge call (post_node) — if it says escalate, go to
+         replanner. Otherwise evaluate outgoing edges, follow first that passes.
       4. On stuck (no edges pass):
          - If explore=True: replanner grows a new edge from here
          - If explore=False: backtrack to predecessor, try next edge
-      5. On node failure: retry if possible, else backtrack
+      5. On node failure: retry if possible (judge can cut retries short via
+         post_retry), else backtrack
       6. Repeat until objective reached or no more options
     """
     log = _setup_logger(graph.name)
@@ -1281,7 +1417,7 @@ def run_graph(
     log.info(f"  Objective: {graph.objective}")
     log.info(f"  Target: {graph.target_ip}  Attacker: {graph.attacker_ip}")
     log.info(f"  Nodes: {len(graph.nodes)}  Edges: {len(graph.edges)}")
-    log.info(f"  Explore: {explore}")
+    log.info(f"  Explore: {explore}  Judge: {use_judge}")
     log.info(f"  Checkpoint: {checkpoint_path}")
     log.info(f"{'='*70}")
 
@@ -1289,9 +1425,10 @@ def run_graph(
     tried_edges: set[str] = set()
     # Path stack for backtracking
     path: list[str] = []
-    # Replan budget
+    # Replan budget — raised from 5 to 10 since the judge triggers replans
+    # earlier; per-call cost is unchanged, just more attempts allowed.
     replan_attempts = 0
-    max_replan_attempts = 5
+    max_replan_attempts = 10
 
     # Find first root node
     roots = graph.root_nodes()
@@ -1311,15 +1448,14 @@ def run_graph(
             # If we backtracked here, go straight to replanner
             if needs_replan:
                 needs_replan = False
-                if explore and replan_attempts < max_replan_attempts:
-                    replan_attempts += 1
-                    log.info(f"[Orchestrator] Replan attempt {replan_attempts}/{max_replan_attempts} from '{current}'")
-                    new_target = _replan_from(graph, current, log)
-                    if new_target:
-                        _checkpoint(graph, checkpoint_path, log)
-                        path.append(current)
-                        current = new_target
-                        continue
+                new_target, replan_attempts = _try_replanner(
+                    graph, current, log, checkpoint_path,
+                    replan_attempts, max_replan_attempts, explore,
+                )
+                if new_target:
+                    path.append(current)
+                    current = new_target
+                    continue
                 # Replanner failed or not in explore mode — backtrack further
                 if path:
                     current = path.pop()
@@ -1337,32 +1473,53 @@ def run_graph(
                 path.append(current)
                 current = next_node
                 continue
-            else:
-                # All existing edges exhausted — try replanner
-                if explore and replan_attempts < max_replan_attempts:
-                    replan_attempts += 1
-                    log.info(f"[Orchestrator] Replan attempt {replan_attempts}/{max_replan_attempts} from '{current}'")
-                    new_target = _replan_from(graph, current, log)
-                    if new_target:
-                        _checkpoint(graph, checkpoint_path, log)
-                        path.append(current)
-                        current = new_target
-                        continue
 
-                # Backtrack
-                if path:
-                    current = path.pop()
-                    log.info(f"[Orchestrator] Backtracking to: {current}")
-                    continue
-                else:
-                    log.info("[Orchestrator] Path exhausted — no more options.")
-                    break
+            # All existing edges exhausted — try replanner
+            new_target, replan_attempts = _try_replanner(
+                graph, current, log, checkpoint_path,
+                replan_attempts, max_replan_attempts, explore,
+            )
+            if new_target:
+                path.append(current)
+                current = new_target
+                continue
+
+            # Backtrack
+            if path:
+                current = path.pop()
+                log.info(f"[Orchestrator] Backtracking to: {current}")
+                continue
+            else:
+                log.info("[Orchestrator] Path exhausted — no more options.")
+                break
 
         # Execute the node
         log.info(f"\n[Orchestrator] Executing node: {current} ({node.label})")
-        success = _execute_node(current, graph, log, explore, checkpoint_path)
+        success, reason = _execute_node(
+            current, graph, log, explore, checkpoint_path, use_judge=use_judge,
+        )
 
         if success:
+            # Post-node judge: even on success, judge can force escalation
+            # (e.g. node nominally succeeded but didn't actually advance toward
+            # the goal — false positive). If escalate, skip edge eval.
+            if use_judge:
+                decision = judge("post_node", node, graph, log)
+                if decision["action"] == "escalate":
+                    log.info(
+                        f"  [{current}] Judge escalated post-node -- "
+                        f"forcing replanner before edge evaluation"
+                    )
+                    new_target, replan_attempts = _try_replanner(
+                        graph, current, log, checkpoint_path,
+                        replan_attempts, max_replan_attempts, explore,
+                    )
+                    if new_target:
+                        path.append(current)
+                        current = new_target
+                        continue
+                    # Replanner declined; fall through to normal edge eval.
+
             # Find next node via outgoing edges
             log.info(f"  [{current}] Evaluating outgoing edges...")
             next_node = _find_next(graph, current, tried_edges, log)
@@ -1380,15 +1537,14 @@ def run_graph(
             # Have outgoing edges but all failed checks — stuck, go to replanner
             log.warning(f"  [{current}] All outgoing edges failed checks — stuck!")
 
-            if explore and replan_attempts < max_replan_attempts:
-                replan_attempts += 1
-                log.info(f"[Orchestrator] Replan attempt {replan_attempts}/{max_replan_attempts} from '{current}'")
-                new_target = _replan_from(graph, current, log)
-                if new_target:
-                    _checkpoint(graph, checkpoint_path, log)
-                    path.append(current)
-                    current = new_target
-                    continue
+            new_target, replan_attempts = _try_replanner(
+                graph, current, log, checkpoint_path,
+                replan_attempts, max_replan_attempts, explore,
+            )
+            if new_target:
+                path.append(current)
+                current = new_target
+                continue
 
             # Can't replan — backtrack with replan flag for predecessor
             if path:
@@ -1402,8 +1558,12 @@ def run_graph(
 
         else:
             # Node failed — mark the edge that led here as tried, then backtrack
-            # Set needs_replan so the backtrack target goes straight to replanner
-            log.warning(f"  [{current}] Node failed — backtracking with replan flag...")
+            # Set needs_replan so the backtrack target goes straight to replanner.
+            # `reason` is "retries_exhausted" or "judge_escalate".
+            log.warning(
+                f"  [{current}] Node failed ({reason}) -- "
+                f"backtracking with replan flag..."
+            )
             if path:
                 predecessor = path[-1]
                 tried_edges.add(f"{predecessor}→{current}")
