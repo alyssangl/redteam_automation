@@ -51,6 +51,23 @@ from stages.impact import run_impact
 
 
 # =============================================================================
+# MODEL CONFIGURATION — replanner + judge call LLM directly here
+# =============================================================================
+# Stages 1-4 + Fix 1 fixed the orchestrator's process around replanning. Live
+# evidence (see reports/) showed the remaining bottleneck is the LLM's
+# instruction-following quality — gpt-4o-mini ignored "DO NOT repeat" hints in
+# Stage 4 v2, and hallucinates MSF module paths ~20% of the time. Pinning these
+# two calls to gpt-4o (~10x cost of mini) is an experiment to see how much
+# improves with model strength alone, before pursuing the more invasive
+# replanner_reliability_plan.md stages.
+#
+# Stage subagents (recon, exploit, persistence, etc.) still use whatever model
+# their own modules pick — out of scope for this experiment.
+REPLAN_MODEL_NAME = "gpt-4o"
+JUDGE_MODEL_NAME = "gpt-4o"
+
+
+# =============================================================================
 # LOGGING — file + console, so we can tail progress in real-time
 # =============================================================================
 
@@ -975,6 +992,7 @@ def judge(
         resp = call_llm(
             messages=[HumanMessage(content=context)],
             system_prompt=JUDGE_PROMPT,
+            model_name=JUDGE_MODEL_NAME,
         )
         result = parse_json_response(resp.content)
     except Exception as e:
@@ -1282,6 +1300,7 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
         response = call_llm(
             messages=[HumanMessage(content=context)],
             system_prompt=REPLAN_PROMPT,
+            model_name=REPLAN_MODEL_NAME,
         )
         result = parse_json_response(response.content)
     except Exception as e:
@@ -1549,6 +1568,7 @@ def run_graph(
     log.info(f"  Target: {graph.target_ip}  Attacker: {graph.attacker_ip}")
     log.info(f"  Nodes: {len(graph.nodes)}  Edges: {len(graph.edges)}")
     log.info(f"  Explore: {explore}  Judge: {use_judge}")
+    log.info(f"  Models: replanner={REPLAN_MODEL_NAME}  judge={JUDGE_MODEL_NAME}")
     log.info(f"  Checkpoint: {checkpoint_path}")
     log.info(f"{'='*70}")
 
