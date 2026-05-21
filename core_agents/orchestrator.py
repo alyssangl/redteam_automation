@@ -426,6 +426,18 @@ _FAILURE_INDICATORS: list[str] = [
     "(exit code:",             # from common.run_ssh_command's non-zero-exit wrap
     "could not resolve host",
     "host key verification failed",
+    # CLI usage hints that mean the command did NOTHING. Caught when a tool
+    # prints a help-style message instead of doing the work. Real example:
+    # `wipe -f -q /tmp` prints "Use -r option to wipe directories" and exits
+    # without wiping. Previously marked success because no failure phrase
+    # matched -- but the operation clearly didn't happen.
+    "use -r option",
+    "use --recursive",
+    "missing operand",
+    "invalid option",
+    "unrecognized option",
+    "try '",                   # "try 'cmd --help' for more information"
+    "try \"",                  # same with double quotes
 ]
 
 
@@ -454,10 +466,17 @@ def _scan_commands_for_failure(
     node: AttackNode, log: logging.Logger,
 ) -> tuple[bool, str]:
     """
-    Walk the node's CommandRecord list and return the first failure
-    detected, if any. Returns (any_failed, summary_line).
+    Walk the CURRENT attempt's CommandRecord entries and return the first
+    failure detected, if any. Returns (any_failed, summary_line).
+
+    Only scans the most recent N records where N = len(node.commands_to_run)
+    -- otherwise prior-attempt failures leak into the current attempt's
+    verdict (e.g. retry succeeds, but a stale "Use -r option" from the
+    failed first attempt still in node.commands causes a false re-fail).
     """
-    for rec in node.commands:
+    n = len(node.commands_to_run) if node.commands_to_run else len(node.commands)
+    recent = node.commands[-n:] if n > 0 else []
+    for rec in recent:
         bad, phrase = _command_output_indicates_failure(rec.output)
         if bad:
             summary = (
@@ -1201,6 +1220,57 @@ def judge(
     return {"action": action, "hint": hint}
 
 
+_COMMAND_REWRITE_PROMPT = """You rewrite a single failing shell command using a hint.
+Output ONLY the rewritten command(s), one per line. No explanation. No backticks.
+If multiple commands are needed to address the hint, list them in execution order.
+If you can't improve it, output the original command unchanged."""
+
+
+def _rewrite_commands_with_hint(
+    node: AttackNode, hint: str, log: logging.Logger,
+) -> Optional[list[str]]:
+    """
+    Ask the LLM to rewrite the failing command(s) given the judge's adapt hint.
+    Used when judge says `adapt` for a session/SSH-command node that has no
+    pre-configured `command_params_alternatives` to cycle through.
+
+    Returns the new list of commands or None on failure (caller keeps original).
+    """
+    if not node.commands_to_run or not hint.strip():
+        return None
+    last_rec = node.commands[-1] if node.commands else None
+    last_cmd = last_rec.command if last_rec else node.commands_to_run[-1]
+    last_output = (last_rec.output if last_rec else "")[-500:]
+
+    user_msg = (
+        f"Original commands (current `commands_to_run`):\n"
+        + "\n".join(f"  {c}" for c in node.commands_to_run)
+        + f"\n\nLast attempted command: {last_cmd}\n"
+        f"Last command output (last 500 chars):\n{last_output}\n\n"
+        f"Judge hint: {hint}\n\n"
+        f"Rewrite the commands."
+    )
+    try:
+        resp = call_llm(
+            messages=[HumanMessage(content=user_msg)],
+            system_prompt=_COMMAND_REWRITE_PROMPT,
+            model_name=JUDGE_MODEL_NAME,
+        )
+        text = (resp.content or "").strip()
+    except Exception as e:
+        log.warning(f"[Judge adapt] command rewrite LLM call failed: {e}")
+        return None
+
+    # Strip code fences if the LLM added them despite instructions
+    text = re.sub(r"^```\w*\n", "", text)
+    text = re.sub(r"\n```$", "", text)
+    new_cmds = [line.strip() for line in text.split("\n") if line.strip()]
+    if not new_cmds:
+        return None
+    # Cap to keep things sane
+    return new_cmds[:8]
+
+
 def _try_replanner(
     graph: AttackGraph, current: str, log: logging.Logger,
     checkpoint_path: str, replan_attempts: int, max_replan_attempts: int,
@@ -1764,8 +1834,24 @@ def _execute_node(
                             f"escalating to replanner"
                         )
                         return False, "judge_escalate"
-                    # 'adapt' and 'continue' both retry; 'adapt' is honoured
-                    # by the existing alts[] cycling via node.retries.
+
+                    # 'adapt' with a concrete hint: rewrite the commands_to_run
+                    # using the LLM. This addresses the previously-broken case
+                    # where the node had no command_params_alternatives, so
+                    # 'adapt' degraded to a no-op same-command retry.
+                    if (decision["action"] == "adapt"
+                            and decision.get("hint")
+                            and node.commands_to_run):
+                        new_cmds = _rewrite_commands_with_hint(
+                            node, decision["hint"], log,
+                        )
+                        if new_cmds and new_cmds != node.commands_to_run:
+                            log.info(
+                                f"  [{node_id}] Judge adapt: rewriting commands "
+                                f"based on hint -> {new_cmds}"
+                            )
+                            node.commands_to_run = new_cmds
+                    # 'continue' falls through to a plain retry.
 
                 log.warning(
                     f"  [{node_id}] STATUS → retry "
