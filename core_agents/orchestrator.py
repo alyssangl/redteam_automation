@@ -812,6 +812,30 @@ def _gather_recon_findings(graph: AttackGraph) -> dict:
     return {}
 
 
+def _cap_text(s: str, cap: int) -> str:
+    """Truncate `s` to `cap` chars, preserving the tail (recent stderr is what matters)."""
+    if not s or len(s) <= cap:
+        return s or ""
+    return "...[truncated]...\n" + s[-cap:]
+
+
+def _recent_command_excerpts(node: AttackNode, n: int = 3, cap: int = 2048) -> list[dict]:
+    """
+    Return the last `n` CommandRecord entries from `node`, with each `output`
+    capped at `cap` chars (tail preserved). Used to feed prose context — banners,
+    stderr, exit codes — to the replanner, not just structured findings.
+    """
+    out = []
+    for rec in node.commands[-n:]:
+        out.append({
+            "command": rec.command,
+            "tool": rec.tool,
+            "exit_code": rec.exit_code,
+            "output_tail": _cap_text(rec.output or "", cap),
+        })
+    return out
+
+
 # =============================================================================
 # REPLANNER — grow new edges/nodes when the graph is stuck
 # =============================================================================
@@ -940,9 +964,13 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
     stuck_node = graph.nodes[stuck_node_id]
     log.info(f"[Replanner] Stuck at '{stuck_node_id}' — asking LLM for next step...")
 
-    # Build compact context
-    trimmed_findings = {k: v for k, v in stuck_node.findings.items()
-                        if k != "raw_nmap_output"}
+    # Build context — keep everything, but cap raw_nmap_output at 8 KB
+    # so a 200 KB scan dump doesn't blow the context window.
+    full_findings = dict(stuck_node.findings)
+    if "raw_nmap_output" in full_findings:
+        full_findings["raw_nmap_output"] = _cap_text(
+            full_findings["raw_nmap_output"], 8192,
+        )
 
     # Failed outgoing edges — include target node's goal
     failed_edges = []
@@ -994,6 +1022,10 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
                 "version": p.get("version", ""),
             })
 
+    # Recent raw command output — what an operator would actually read
+    # (banners, stderr, exit codes) — not just typed findings.
+    recent_cmds = _recent_command_excerpts(stuck_node, n=3, cap=2048)
+
     context = (
         f"OBJECTIVE: {graph.objective}\n\n"
         f"TARGET (RHOSTS): {graph.target_ip}\n"
@@ -1001,12 +1033,14 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
         f"DETECTED SERVICES (from recon — match exploit versions to these!):\n"
         f"{json.dumps(detected_services, indent=2)}\n\n"
         f"STUCK AT NODE: {stuck_node_id} ({stuck_node.label})\n"
-        f"STUCK NODE FINDINGS: {json.dumps(trimmed_findings, indent=2, default=str)}\n\n"
+        f"STUCK NODE FINDINGS: {json.dumps(full_findings, indent=2, default=str)}\n\n"
+        f"RECENT COMMAND OUTPUT (last 3, tails capped at 2KB):\n"
+        f"{json.dumps(recent_cmds, indent=2, default=str)}\n\n"
         f"FAILED OUTGOING EDGES:\n{json.dumps(failed_edges, indent=2, default=str)}\n\n"
         f"REMAINING NODES:\n{json.dumps(remaining, indent=2, default=str)}\n"
     )
 
-    log.debug(f"[Replanner] Context:\n{context[:1000]}...")
+    log.debug(f"[Replanner] Context (full, {len(context)} chars):\n{context}")
 
     try:
         response = call_llm(
