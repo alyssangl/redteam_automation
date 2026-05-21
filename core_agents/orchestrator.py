@@ -905,6 +905,61 @@ def _gather_recon_findings(graph: AttackGraph) -> dict:
     return {}
 
 
+# =============================================================================
+# MSF MODULE CATALOG — ground-truth check that a proposed module actually exists
+# =============================================================================
+# Loaded lazily on first use; queries the connected MSF RPC. Different from
+# MSF_MODULE_REQUIREMENTS (heuristic version table, advisory only): this is
+# ground truth -- if MSF doesn't have the module, it cannot run, period.
+
+_MSF_MODULE_CATALOG: Optional[set[str]] = None
+
+
+def _load_msf_module_catalog(log: logging.Logger) -> set[str]:
+    """Lazy-load and cache the set of all MSF module paths available on RPC.
+
+    Returns an empty set on failure (network down, MSF not running, etc.) --
+    which we treat as "catalog disabled" so we don't block proposals just
+    because the cache couldn't be populated.
+    """
+    global _MSF_MODULE_CATALOG
+    if _MSF_MODULE_CATALOG is not None:
+        return _MSF_MODULE_CATALOG
+    try:
+        from tools.metasploit_tools import msf_session
+        client = msf_session.client
+        catalog: set[str] = set()
+        for name in client.modules.exploits:
+            catalog.add(f"exploit/{name}")
+        for name in client.modules.auxiliary:
+            catalog.add(f"auxiliary/{name}")
+        for name in client.modules.post:
+            catalog.add(f"post/{name}")
+        _MSF_MODULE_CATALOG = catalog
+        log.info(f"[MSF Catalog] Loaded {len(catalog)} modules from RPC")
+    except Exception as e:
+        log.warning(
+            f"[MSF Catalog] Load failed ({e}) -- catalog validation disabled "
+            f"for this run"
+        )
+        _MSF_MODULE_CATALOG = set()
+    return _MSF_MODULE_CATALOG
+
+
+def _module_exists_in_msf(module_path: str, log: logging.Logger) -> bool:
+    """
+    Ground-truth: does this module path actually exist in MSF's catalog?
+
+    Returns True if the catalog is empty / unavailable -- failsafe so a
+    disconnected MSF doesn't break the orchestrator. Returns False ONLY
+    when the catalog is loaded AND the path is missing from it.
+    """
+    catalog = _load_msf_module_catalog(log)
+    if not catalog:
+        return True
+    return module_path in catalog
+
+
 def _cap_text(s: str, cap: int) -> str:
     """Truncate `s` to `cap` chars, preserving the tail (recent stderr is what matters)."""
     if not s or len(s) <= cap:
@@ -1350,6 +1405,17 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
                 f"target_hint={result.get('target_hint', '')!r})"
             )
             return None
+
+        # Stage A: catalog check. If MSF doesn't have this module, it cannot
+        # possibly run. Different from Stage 1's removal of heuristic version
+        # rejection: this is GROUND TRUTH from MSF RPC, not a guess.
+        if new_node.module:
+            if not _module_exists_in_msf(new_node.module, log):
+                log.warning(
+                    f"[Replanner] REJECTED {new_node.module}: not in MSF "
+                    f"catalog (likely hallucinated path)"
+                )
+                return None
 
         # Anti-repetition guard: reject if THIS EXACT module (or command set)
         # already failed in a prior node. This is rejection-by-observed-failure,
