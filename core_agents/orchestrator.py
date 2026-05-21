@@ -348,8 +348,13 @@ def _execute_msf_module(
         cmds.append(f"set {k} {v}")
     if effective_payload:
         cmds.append(f"set PAYLOAD {effective_payload}")
-        for k, v in effective_payload_options.items():
-            cmds.append(f"set {k} {v}")
+    # Always set LHOST/LPORT/etc. from payload_options so the module's
+    # default payload (when no explicit PAYLOAD is set) still gets our
+    # values -- otherwise MSF binds LHOST to 127.0.0.1 and the reverse
+    # handler never sees the callback. Fixes Stage 4 v1/v2's 70+ "binding
+    # to a loopback address" warnings.
+    for k, v in effective_payload_options.items():
+        cmds.append(f"set {k} {v}")
     cmds.append("run")
 
     # Execute each command
