@@ -1055,7 +1055,10 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
         proposed_module = result.get("module", "")
         edge_checks = []
 
-        # PROGRAMMATIC VALIDATION: if it's an MSF module, verify it matches recon
+        # ADVISORY VALIDATION: if it's an MSF module, log a version-mismatch
+        # warning but do NOT reject. Failure is signal — let the proposal run
+        # and fail naturally; the failure output then feeds the next replan.
+        # We also do NOT persist the requirement as a hard EdgeCheck.
         if proposed_module:
             recon_findings = _gather_recon_findings(graph)
             ok, reason = _validate_msf_module_for_target(
@@ -1063,14 +1066,11 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
             )
             if not ok:
                 log.warning(
-                    f"[Replanner] REJECTED proposal {proposed_module}: {reason}"
+                    f"[Replanner] ADVISORY mismatch for {proposed_module}: "
+                    f"{reason} — allowing anyway"
                 )
-                return None
-            log.info(f"[Replanner] Module validation OK: {reason}")
-
-            # Persist the validation as EdgeChecks on the new edge so the walker
-            # re-enforces them and the requirement survives JSON reload.
-            edge_checks = _build_msf_module_checks(proposed_module)
+            else:
+                log.info(f"[Replanner] Module validation OK: {reason}")
 
         new_node = AttackNode(
             id=nid,
