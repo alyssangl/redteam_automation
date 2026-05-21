@@ -1273,10 +1273,17 @@ RESPOND WITH EXACTLY ONE of these JSON shapes:
     "rationale": "..."}
 
 Rules:
+- *** STRONGLY PREFER `new_edge` when any REMAINING NODE has
+    `preconditions_met: true` (look for the `note: READY` marker). The
+    pre-planned chain is closest to achieving the OBJECTIVE; skip-connect to
+    it instead of spinning up new freelance steps. Example: if you have a
+    session and `disk_wipe` shows `preconditions_met: true`, emit
+    {"action": "new_edge", "target_hint": "disk_wipe", "rationale": "..."}.
 - For use_module: target_hint is JUST the module path. Don't include options.
 - For run_commands: target_hint is the literal command(s). The system picks
   session vs. SSH based on whether an active session exists.
-- For new_edge: target_hint must be a PENDING/BLOCKED node id (NOT FAILED).
+- For new_edge: target_hint must be a PENDING/BLOCKED node id (NOT FAILED)
+  shown in REMAINING NODES.
 - *** NEVER propose a module path or command that already appears in the
     FAILED entries of REMAINING NODES. *** Read those entries' `module` and
     `commands_to_run` fields carefully -- if it's there, it already failed.
@@ -1433,19 +1440,41 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
                 "rationale": edge.rationale,
             })
 
+    # Compute whether we currently have an active session — this is the
+    # most common precondition for session-based nodes (persistence,
+    # disk_wipe, etc.) being immediately reachable from the current state.
+    _has_session = any(
+        n.findings.get("session_id")
+        for n in graph.nodes.values()
+        if n.status == NodeStatus.SUCCESS.value
+    )
+
     # Remaining unreached nodes — include goals and failure info.
-    # For FAILED nodes, also include the module/command summary so the LLM
-    # can see what was actually tried (and avoid proposing the same thing).
+    # PENDING/BLOCKED nodes are annotated with whether they are NOW reachable,
+    # so the LLM can use `new_edge` to skip-connect from the current node to a
+    # planned node whose preconditions are met -- instead of always spinning
+    # up a new exploration step.
     remaining = {}
     for nid, node in graph.nodes.items():
         if node.status in (NodeStatus.PENDING.value, NodeStatus.BLOCKED.value):
-            remaining[nid] = {
+            needs_session = node.tool_name == "session"
+            preconditions_met = (not needs_session) or _has_session
+            entry: dict = {
                 "label": node.label,
                 "goal": node.goal,
                 "agent_type": node.agent_type,
                 "objective": node.objective[:200],
                 "tool_name": node.tool_name,
+                # Annotation so the LLM can prefer reconnecting (new_edge) over
+                # freelance new_node when a planned step is already reachable.
+                "needs_session": needs_session,
+                "preconditions_met": preconditions_met,
             }
+            if preconditions_met:
+                entry["note"] = (
+                    "READY -- you can connect to this node with action=new_edge"
+                )
+            remaining[nid] = entry
         elif node.status == NodeStatus.FAILED.value:
             remaining[nid] = {
                 "label": node.label,
@@ -1519,9 +1548,16 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
     rationale = result.get("rationale", "")
 
     if action == "new_edge":
-        target_id = result.get("target", "")
+        # Accept either field name -- Stage 4's tiny-intent prompt tells the
+        # LLM to use `target_hint`, but the old verbose prompt used `target`.
+        # Bug fix: previously we only read `target`, so every new_edge proposal
+        # under the new prompt was silently rejected with empty target_id.
+        target_id = (result.get("target_hint") or result.get("target") or "").strip()
         if target_id not in graph.nodes:
-            log.warning(f"[Replanner] Target node '{target_id}' not found")
+            log.warning(
+                f"[Replanner] Target node '{target_id}' not found "
+                f"(available: {sorted(graph.nodes.keys())})"
+            )
             return None
 
         # Don't re-route to a node that exhausted its retries
@@ -1895,8 +1931,33 @@ def run_graph(
                 current = next_node
                 continue
 
-            # No outgoing edges pass — are we at a leaf? That's success (end of chain)
+            # No outgoing edges pass — are we at a leaf?
             if not graph.outgoing_edges(current):
+                # A replanner-issued leaf is NOT a real chain endpoint -- the
+                # replanner only proposed one step. If there's still planned
+                # work pending (objective not yet met), grow another step from
+                # this node instead of terminating.
+                is_replanner_leaf = "replanner_generated" in (node.tags or [])
+                unmet_work = any(
+                    n.status in (NodeStatus.PENDING.value,
+                                 NodeStatus.BLOCKED.value)
+                    for n in graph.nodes.values()
+                )
+                if is_replanner_leaf and unmet_work and explore:
+                    log.info(
+                        f"  [{current}] Replanner-issued leaf -- objective "
+                        f"unmet (PENDING/BLOCKED work remains); attempting "
+                        f"to grow another step instead of terminating"
+                    )
+                    new_target, replan_attempts = _try_replanner(
+                        graph, current, log, checkpoint_path,
+                        replan_attempts, max_replan_attempts, explore,
+                    )
+                    if new_target:
+                        path.append(current)
+                        current = new_target
+                        continue
+                    # Replanner declined -- fall through to terminate.
                 log.info(f"  [{current}] Leaf node — chain complete!")
                 break
 
