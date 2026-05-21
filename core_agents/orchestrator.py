@@ -535,6 +535,55 @@ def _execute_session_commands(
     }
 
 
+# Groups that confer ALL-command sudo rights on common Linux distros. If the
+# session user is in any of these, we treat access_level as "user_with_sudo".
+_SUDO_GROUPS = {"sudo", "wheel", "admin"}
+
+
+def _extract_privilege_from_msf_output(output: str) -> dict:
+    """
+    Parse `id` / `uid=N(name) gid=N(name) groups=N(name),N(name) ...` strings
+    out of MSF output (typically embedded in ssh_login's Success line).
+
+    Returns a dict like:
+        {"uid": 900, "user": "vagrant", "gid": 900, "gid_name": "vagrant",
+         "groups": ["vagrant", "sudo"], "in_sudo_group": True, "is_root": False}
+
+    Returns {} if no uid= pattern found. Be liberal — different shells emit
+    fields in different orders.
+    """
+    uid_match = re.search(r'uid=(\d+)\((\w+)\)', output)
+    if not uid_match:
+        return {}
+    info: dict = {
+        "uid": int(uid_match.group(1)),
+        "user": uid_match.group(2),
+    }
+    gid_match = re.search(r'gid=(\d+)\((\w+)\)', output)
+    if gid_match:
+        info["gid"] = int(gid_match.group(1))
+        info["gid_name"] = gid_match.group(2)
+    groups_match = re.search(r'groups=([^\s\'"]+)', output)
+    if groups_match:
+        # Format: 900(vagrant),27(sudo),...
+        group_names = re.findall(r'\d+\((\w+)\)', groups_match.group(1))
+        info["groups"] = group_names
+        info["in_sudo_group"] = any(g in _SUDO_GROUPS for g in group_names)
+    info["is_root"] = info["uid"] == 0
+    return info
+
+
+def _derive_access_level(priv: dict) -> str:
+    """Map privilege dict to a coarse access_level label."""
+    if not priv:
+        return "unknown"
+    if priv.get("is_root"):
+        return "root"
+    if priv.get("in_sudo_group"):
+        return "user_with_sudo"
+    return "user"
+
+
 def _parse_msf_output(output: str, node: AttackNode, target_ip: str, log: logging.Logger) -> dict:
     """
     Parse Metasploit output to determine success and extract findings.
@@ -543,6 +592,9 @@ def _parse_msf_output(output: str, node: AttackNode, target_ip: str, log: loggin
       - "session X opened" → session created
       - "Login Successful" → credentials found
       - "Exploit completed, but no session" → failed
+
+    Also tries to extract session privilege info (uid/gid/groups) from the
+    output and store it as findings.session_user_info + access_level.
     """
     findings = {
         "success": False,
@@ -553,6 +605,17 @@ def _parse_msf_output(output: str, node: AttackNode, target_ip: str, log: loggin
         "access_level": "unknown",
         "summary": "",
     }
+
+    # Stage B: extract privilege from any embedded id-style output
+    priv = _extract_privilege_from_msf_output(output)
+    if priv:
+        findings["session_user_info"] = priv
+        findings["access_level"] = _derive_access_level(priv)
+        log.info(
+            f"  [direct] Session privilege: {priv.get('user')} "
+            f"(uid={priv.get('uid')}, groups={priv.get('groups', [])}, "
+            f"access_level={findings['access_level']})"
+        )
 
     # Check for session opened
     session_match = re.search(
@@ -1017,23 +1080,45 @@ Respond ONLY with JSON:
 The hint should briefly explain your reasoning so it shows up in logs."""
 
 
+def _format_session_privilege_line(graph: AttackGraph) -> str:
+    """One-line summary of the most recently-acquired session's privilege.
+    Empty string if no session has been opened yet."""
+    for n in reversed(list(graph.nodes.values())):
+        if n.status != NodeStatus.SUCCESS.value:
+            continue
+        priv = n.findings.get("session_user_info")
+        if priv:
+            return (
+                f"SESSION PRIVILEGE: {priv.get('user')} (uid={priv.get('uid')}); "
+                f"groups={priv.get('groups', [])}; "
+                f"access_level={n.findings.get('access_level', 'unknown')}; "
+                f"can_sudo={priv.get('in_sudo_group', False)}"
+            )
+    return ""
+
+
 def _build_judge_context(trigger: str, node: AttackNode, graph: AttackGraph) -> str:
-    """Minimal context: just node state, recent commands, and edge count."""
+    """Minimal context: just node state, recent commands, edge count, privilege."""
     recent_cmds = _recent_command_excerpts(node, n=3, cap=1024)
     alternatives_remaining = max(0, node.max_retries - node.retries)
     outgoing_edges_count = len(graph.outgoing_edges(node.id))
+    priv_line = _format_session_privilege_line(graph)
 
-    return (
-        f"TRIGGER: {trigger}\n"
-        f"NODE: {node.id} ({node.label})\n"
-        f"STATUS: {node.status}\n"
+    parts = [
+        f"TRIGGER: {trigger}",
+        f"NODE: {node.id} ({node.label})",
+        f"STATUS: {node.status}",
         f"RETRIES: {node.retries}/{node.max_retries}  "
-        f"ALTERNATIVES_REMAINING: {alternatives_remaining}\n"
-        f"LAST FAILURE: {node.metadata.get('last_failure_reason', '(none)')}\n"
-        f"OUTGOING EDGES DEFINED: {outgoing_edges_count}\n\n"
-        f"RECENT COMMAND OUTPUT (last 3, tails capped at 1KB):\n"
-        f"{json.dumps(recent_cmds, indent=2, default=str)}\n"
-    )
+        f"ALTERNATIVES_REMAINING: {alternatives_remaining}",
+        f"LAST FAILURE: {node.metadata.get('last_failure_reason', '(none)')}",
+        f"OUTGOING EDGES DEFINED: {outgoing_edges_count}",
+    ]
+    if priv_line:
+        parts.append(priv_line)
+    parts.append("")
+    parts.append("RECENT COMMAND OUTPUT (last 3, tails capped at 1KB):")
+    parts.append(json.dumps(recent_cmds, indent=2, default=str))
+    return "\n".join(parts) + "\n"
 
 
 def judge(
@@ -1340,10 +1425,16 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
     # (banners, stderr, exit codes) — not just typed findings.
     recent_cmds = _recent_command_excerpts(stuck_node, n=3, cap=2048)
 
+    # Stage B: surface the current session's user/privilege so the LLM
+    # doesn't propose root-only operations as an unprivileged user.
+    priv_line = _format_session_privilege_line(graph)
+    priv_block = f"{priv_line}\n\n" if priv_line else ""
+
     context = (
         f"OBJECTIVE: {graph.objective}\n\n"
         f"TARGET (RHOSTS): {graph.target_ip}\n"
         f"ATTACKER (LHOST): {graph.attacker_ip}\n\n"
+        f"{priv_block}"
         f"DETECTED SERVICES (from recon — match exploit versions to these!):\n"
         f"{json.dumps(detected_services, indent=2)}\n\n"
         f"STUCK AT NODE: {stuck_node_id} ({stuck_node.label})\n"
