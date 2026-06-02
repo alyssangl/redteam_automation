@@ -121,6 +121,28 @@ Target: repair the privesc 'tool'/'tool_calls' message ordering crash; make all
 stages' message-window logic pair-safe; impact falls back to newest live session
 on target; keep all v4 bounding.
 
-## v6 — final (pending)
+## v6 — id-aware pair-safe (privesc) + recursion headroom (commit `af0d816`)
+- privesc: rewrote `_make_pair_safe` to be id-aware/atomic — an assistant
+  tool_calls message is kept only if EVERY tool_call_id has a matching ToolMessage
+  in the following run, else the whole group is dropped (fixes the v4/v5 parallel
+  tool-call 400 crash in both directions; proven on unit cases).
+- recursion_limit headroom for the bounded ReAct sub-loops: persistence 100→250
+  (R5 hit 100), privesc 120→200, impact 80→150.
+**Result (R6):** privesc CRASH ELIMINATED — 0 occurrences of "did not have
+response" / "PrivEsc crashed" / "Recursion limit" across the goalonly run. recon
+✅, gain_access ✅ (session 7), success regression ✅. escalate now runs honestly
+(grounded id-checks, no false root, no crash) but EXHAUSTS privesc vectors against
+a non-root user (boba_fett) — goalonly hit the 40-min runner cap doing thorough
+(bounded) privesc. Not a hang/crash; a thoroughness-vs-speed tuning item
+(time-box escalate). persist recursion fix validated via the generalization batch.
 
-## v6 — final (pending)
+## Post-v6 generalization batch (flawed + proftpd + jenkins)
+flawed: recon→gain_access→persist→impact (privesc dropped) — validates persist/
+impact subagents + the recursion fix + fallback. proftpd (21/80 open): should work
+directly. jenkins (8484 closed): prescribed exploit fails → fallback improvises.
+
+### Net arc v0→v6
+v0 recon crash-loops → v1 works end-to-end → v2 honest (grounded, no false success)
+→ v3 resilient (session recovery) + direct→subagent fallback → v4 bounded (no hangs)
+→ v5 partial pair-safe → v6 id-aware pair-safe (crash gone) + recursion headroom.
+Open tuning item: time-box escalate so exhaustive privesc doesn't blow the clock.
