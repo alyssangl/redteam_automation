@@ -1,0 +1,26 @@
+# Secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Runtime artifacts / data
+logs/
+graphs/
+creme_logs/
+databases/
+my_knowledge_base/
+.refine_snapshots/
+database_utils/documents/
+
+# Editor / tooling
+.claude/
+.idea/
+
+# Archives & misc
+*.7z
+*.rar
+nul

