@@ -9,6 +9,23 @@ Priority key: P1 = highest leverage. Effort/Risk: L/M/H.
 
 ---
 
+## Progress (autonomous, post-v7) — all pushed, offline-tested, NEED live validation
+- **v8 `d0c50ef` — lazy MSF connection.** Imports no longer connect to msfrpcd
+  (verified `connected_at_import=False`); decouples import from the lab, unblocks
+  offline tests. ⚠️ live-validate the proxy forwards correctly under real use.
+- **v9 `716aeb7` — offline test suite** (`tests/run_offline.py`, 12→18 checks):
+  pair-safe, graph shapes, lazy-MSF, retry-policy. Also fixed full-port-scan
+  recon hints (`-p 0-65535` → `--top-ports 1000`) in 10 graphs.
+- **v10 `63dbad2` — category-aware retry seed** (`_is_retryable_failure`): deterministic
+  failures (time-boxed escalate, FAIL_EXHAUSTED) short-circuit to replan instead
+  of burning identical retries. ⚠️ live-validate.
+- Done earlier: P3 escalate time-box (v7 `7563ad4`), escalate max_retries=1 (`acd66b6`).
+
+**Next:** live-validate v8+v10 (one goalonly/proftpd run) BEFORE more core edits.
+Then remaining items below.
+
+---
+
 ## P1 — Category-aware retry policy  (effort M, risk M)
 **Problem:** node retries fire blindly on `max_retries` regardless of *why* the
 node failed. Identical-param retries of a deterministic failure are pure waste
