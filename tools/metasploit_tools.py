@@ -114,14 +114,31 @@ class MetasploitSession:
             pass
 
 
-# --- GLOBAL SESSION INSTANCE ---
-# Initialize this ONCE at the top of your script
-msf_session = MetasploitSession(
-    host="192.168.34.6",
-    port=55553,
-    user="kali",
-    password="kali"
-)
+# --- GLOBAL SESSION INSTANCE (LAZY) ---
+# Previously this connected to msfrpcd at import time, which coupled importing
+# ANY stage/orchestrator module to a live lab and made offline unit-testing
+# impossible. _LazyMsfSession defers the real connection until the first
+# attribute access, so `import stages.*` / `import core_agents.orchestrator`
+# succeed with no lab, and the RPC connection is made on first actual use.
+class _LazyMsfSession:
+    _CFG = dict(host="192.168.34.6", port=55553, user="kali", password="kali")
+
+    def __init__(self):
+        self._real = None
+
+    def _ensure(self):
+        if self._real is None:
+            self._real = MetasploitSession(**self._CFG)
+        return self._real
+
+    def __getattr__(self, name):
+        # __getattr__ runs only for attrs not found normally (i.e. everything
+        # except _real/_ensure/_CFG) -> delegate to the real session, connecting
+        # on first use.
+        return getattr(self._ensure(), name)
+
+
+msf_session = _LazyMsfSession()
 
 
 @tool
