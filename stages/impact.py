@@ -23,6 +23,7 @@ import json
 import re
 import time
 import operator
+import concurrent.futures
 from typing import TypedDict, Annotated, List, Literal
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
@@ -47,6 +48,15 @@ MAX_IMPACT_RETRIES = 3
 MAX_PLANNER_TOOL_CALLS = 3
 MAX_EXECUTOR_TOOL_CALLS = 10
 
+# Hard wall-clock caps (seconds) for blocking RPC/session calls. send_command /
+# run_session_command have their own inner read-loop timeouts, but a blocking
+# 'run'/'exploit' MSF command (or a wedged session) can keep the console 'busy'
+# for minutes. We enforce a hard ceiling here so a single tool call can never
+# hang the whole impact stage. Mirrors the pattern used in stages/privesc.py.
+_MSF_WALLCLOCK_TIMEOUT = 90       # outer cap for tool_metasploit_rpc
+_MSF_SEND_TIMEOUT = 85            # inner send_command read-loop timeout
+_SESSION_WALLCLOCK_TIMEOUT = 20   # outer cap for a single session command
+
 # =============================================================================
 # STATE
 # =============================================================================
@@ -70,6 +80,38 @@ class ImpactState(TypedDict):
 # =============================================================================
 # TOOL DEFINITIONS
 # =============================================================================
+
+def _run_with_timeout(fn, args=(), kwargs=None, timeout=20, on_timeout="(timed out)"):
+    """Run a blocking callable with a hard wall-clock cap. Returns the result,
+    or `on_timeout` if it does not complete in time, or an error string on
+    exception. The worker thread is abandoned (daemon-style) on timeout so the
+    stage never blocks waiting for it. Mirrors stages/privesc.py."""
+    kwargs = kwargs or {}
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        fut = ex.submit(fn, *args, **kwargs)
+        try:
+            return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            return on_timeout
+        except Exception as e:  # surface the underlying error rather than hang
+            return f"(call failed: {e})"
+    finally:
+        # Do NOT block on a lingering worker; let it die in the background.
+        ex.shutdown(wait=False)
+
+
+def _session_command_capped(session_id: str, command: str,
+                            timeout: int = _SESSION_WALLCLOCK_TIMEOUT) -> str:
+    """Invoke tool_session_command with a hard wall-clock cap, so a wedged
+    session or a blocked shell_write RPC can never stall the stage."""
+    return str(_run_with_timeout(
+        tool_session_command.invoke,
+        args=({"session_id": session_id, "command": command},),
+        timeout=timeout,
+        on_timeout=f"(session command timed out after {timeout}s — treating as failure)",
+    ))
+
 
 @tool
 def tool_linux_terminal(command: str):
@@ -96,15 +138,34 @@ def tool_metasploit_rpc(command: str):
 
     Do NOT use this for running commands on the target — use tool_session_command instead.
     """
+    # Enforce a hard wall-clock cap. send_command's own timeout only fires when
+    # the console reports 'busy == False'; a blocking 'run'/'exploit' callback
+    # can keep it busy for minutes. The outer ThreadPoolExecutor guarantees this
+    # call returns within ~90s no matter what the console does. Mirrors privesc.
+    # Connection errors are retried (up to 3 attempts), but each attempt is still
+    # bounded by its own wall-clock cap so the total can never hang the stage.
+    last_err = None
     for attempt in range(3):
-        try:
-            return msf_session.send_command(command)
-        except Exception as e:
-            if attempt < 2 and "connection" in str(e).lower():
+        result = _run_with_timeout(
+            msf_session.send_command,
+            args=(command,),
+            kwargs={"timeout": _MSF_SEND_TIMEOUT},
+            timeout=_MSF_WALLCLOCK_TIMEOUT,
+            on_timeout=(
+                f"MSF command timed out after {_MSF_WALLCLOCK_TIMEOUT}s — treating as "
+                "failure. The module likely blocked waiting for a callback; try a "
+                "different, non-blocking technique."
+            ),
+        )
+        if isinstance(result, str) and result.startswith("(call failed:"):
+            last_err = result
+            if attempt < 2 and "connection" in result.lower():
                 print_colored(f"[Impact MSF] Connection error, retrying ({attempt+1}/3)...", Colors.WARNING)
                 time.sleep(2)
                 continue
-            return f"RPC Error: {str(e)}"
+            return f"RPC Error: {result}"
+        return result
+    return f"RPC Error: {last_err}"
 
 
 # Tool sets
@@ -845,13 +906,27 @@ def run_impact(
     print_colored(f"{'='*60}\n", Colors.HEADER)
 
     # --- Session health check: verify session is still alive ---
+    # Wall-clock capped: a busy/wedged console must not block the stage on the
+    # very first call before any impact work begins.
     try:
-        session_check = msf_session.send_command(f"sessions")
+        session_check = _run_with_timeout(
+            msf_session.send_command,
+            args=("sessions",),
+            kwargs={"timeout": _MSF_SEND_TIMEOUT},
+            timeout=_MSF_WALLCLOCK_TIMEOUT,
+            on_timeout="(sessions list timed out)",
+        )
         session_check_str = str(session_check)
+        # If the capped call timed out or errored, don't falsely declare the
+        # session dead — proceed optimistically and let the graph discover the
+        # truth (the executor's own session calls are individually capped too).
+        if session_check_str.strip() in ("(sessions list timed out)",) \
+                or session_check_str.startswith("(call failed:"):
+            print_colored(f"[Impact] Session health check inconclusive ({session_check_str[:80]}) — proceeding.", Colors.WARNING)
         # Line-anchored match: MSF `sessions` lists the ID as a standalone token
         # at the start of a line ("3  shell ..."). A bare substring check would
         # false-positive when session_id='3' but only sessions 13/30 are alive.
-        if not re.search(r'(?m)^\s*' + re.escape(str(session_id)) + r'\s', session_check_str):
+        elif not re.search(r'(?m)^\s*' + re.escape(str(session_id)) + r'\s', session_check_str):
             print_colored(f"[Impact] Session {session_id} NOT found in active sessions — skipping impact.", Colors.WARNING)
             print_colored(f"[Impact] Active sessions output: {session_check_str[:300]}", Colors.WARNING)
             return ImpactFindings(
@@ -859,7 +934,8 @@ def run_impact(
                 actions=[],
                 summary=f"Impact skipped — session {session_id} is no longer active.",
             )
-        print_colored(f"[Impact] Session {session_id} confirmed alive.", Colors.OKGREEN)
+        else:
+            print_colored(f"[Impact] Session {session_id} confirmed alive.", Colors.OKGREEN)
     except Exception as e:
         print_colored(f"[Impact] Session health check failed: {e}", Colors.WARNING)
         # Try to continue anyway — the session might still work

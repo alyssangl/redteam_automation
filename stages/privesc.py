@@ -25,6 +25,7 @@ import json
 import re
 import time
 import operator
+import concurrent.futures
 from typing import TypedDict, Annotated, List, Literal
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
@@ -72,6 +73,48 @@ class PrivEscState(TypedDict):
 # TOOL DEFINITIONS
 # =============================================================================
 
+# Hard wall-clock caps (seconds) for blocking RPC/session calls. The underlying
+# send_command / run_session_command have their own read-loop timeouts, but a
+# blocking 'run'/'exploit' MSF command (or a wedged session) can keep the
+# console 'busy' for minutes. We enforce a hard ceiling here so a single tool
+# call can never hang the whole stage.
+_MSF_WALLCLOCK_TIMEOUT = 90      # outer cap for tool_metasploit_rpc
+_MSF_SEND_TIMEOUT = 85           # inner send_command read-loop timeout
+_SESSION_WALLCLOCK_TIMEOUT = 20  # outer cap for a single session command
+
+
+def _run_with_timeout(fn, args=(), kwargs=None, timeout=20, on_timeout="(timed out)"):
+    """Run a blocking callable with a hard wall-clock cap. Returns the result,
+    or `on_timeout` if it does not complete in time, or an error string on
+    exception. The worker thread is abandoned (daemon-style) on timeout so the
+    stage never blocks waiting for it."""
+    kwargs = kwargs or {}
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        fut = ex.submit(fn, *args, **kwargs)
+        try:
+            return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            return on_timeout
+        except Exception as e:  # surface the underlying error rather than hang
+            return f"(call failed: {e})"
+    finally:
+        # Do NOT block on lingering worker; let it die in the background.
+        ex.shutdown(wait=False)
+
+
+def _session_command_capped(session_id: str, command: str,
+                            timeout: int = _SESSION_WALLCLOCK_TIMEOUT) -> str:
+    """Invoke tool_session_command with a hard wall-clock cap, so a wedged
+    session or a blocked shell_write RPC can never stall the stage."""
+    return str(_run_with_timeout(
+        tool_session_command.invoke,
+        args=({"session_id": session_id, "command": command},),
+        timeout=timeout,
+        on_timeout=f"(session command timed out after {timeout}s — treating as failure)",
+    ))
+
+
 @tool
 def tool_linux_terminal(command: str):
     """
@@ -100,10 +143,24 @@ def tool_metasploit_rpc(command: str):
     - 'sessions' to list sessions (do NOT use -i flag)
     - 'run post/multi/recon/local_exploit_suggester' for automated suggestions
     """
-    try:
-        return msf_session.send_command(command)
-    except Exception as e:
-        return f"RPC Error: {str(e)}"
+    # Enforce a hard wall-clock cap. send_command's own timeout only fires when
+    # the console reports 'busy == False'; a blocking 'run'/'exploit' callback
+    # can keep it busy for minutes. The outer ThreadPoolExecutor guarantees this
+    # call returns within ~90s no matter what the console does.
+    result = _run_with_timeout(
+        msf_session.send_command,
+        args=(command,),
+        kwargs={"timeout": _MSF_SEND_TIMEOUT},
+        timeout=_MSF_WALLCLOCK_TIMEOUT,
+        on_timeout=(
+            f"MSF command timed out after {_MSF_WALLCLOCK_TIMEOUT}s — treating as "
+            "failure. The module likely blocked waiting for a callback; try a "
+            "different, non-blocking technique."
+        ),
+    )
+    if isinstance(result, str) and result.startswith("(call failed:"):
+        return f"RPC Error: {result}"
+    return result
 
 
 # Tool sets
@@ -132,13 +189,14 @@ Do NOT use `tool_metasploit_rpc` for target commands — use it only for MSF con
 
 **Enumeration checklist — run these in order of priority (via tool_session_command):**
 
-1. **Basic info**: `whoami`, `id`, `uname -a`
-2. **Sudo check**: `sudo -l` (most common privesc vector)
-3. **SUID binaries**: `find / -perm -4000 -type f 2>/dev/null`
-4. **Cron jobs**: `cat /etc/crontab`
-5. **Kernel version**: `uname -r` (for kernel exploit matching)
-6. **Running processes**: `ps aux | head -30`
-7. **Capabilities**: `getcap -r / 2>/dev/null` (cap_setuid/cap_net_raw etc.)
+1. **Basic info**: `whoami`, `id`, `uname -a` (via tool_session_command)
+2. **Auto-suggester (do this early)**: `tool_metasploit_rpc("run post/multi/recon/local_exploit_suggester SESSION=<session_id>")` — auto-enumerates kernel and local exploit candidates. This is fast and high-yield; run it before the slow manual scans below. (Only works for meterpreter sessions; if it errors on a command_shell, skip it and continue manually.)
+3. **Sudo check**: `sudo -l` (most common privesc vector)
+4. **SUID binaries**: `find / -perm -4000 -type f 2>/dev/null`
+5. **Cron jobs**: `cat /etc/crontab`
+6. **Kernel version**: `uname -r` (for kernel exploit matching)
+7. **Running processes**: `ps aux | head -30`
+8. **Capabilities**: `getcap -r / 2>/dev/null` (cap_setuid/cap_net_raw etc.)
 
 **Rules:**
 1. Execute commands ONE AT A TIME
@@ -173,6 +231,11 @@ You may make up to {MAX_PLANNER_TOOL_CALLS} queries.
 
 **Technique priority (based on enumeration results):**
 
+0. **local_exploit_suggester hits** — if the enumeration results contain
+   `local_exploit_suggester` output listing one or more "appears to be
+   vulnerable" / "the target appears to be vulnerable" modules, PRIORITIZE the
+   top-ranked suggested MSF module (run it via tool_metasploit_rpc with the
+   correct SESSION) before falling back to the manual techniques below.
 1. **Sudo misconfig** — `sudo -l` shows NOPASSWD entries → check GTFOBins for that binary
 2. **SUID abuse** — SUID binaries that allow shell escape (find, vim, python, nmap, etc.)
 3. **Cron job abuse** — Writable cron scripts running as root
@@ -243,6 +306,13 @@ You evaluate whether privilege escalation succeeded.
 - Loop step count
 
 **Primary success criterion:** `whoami` returns `root` OR `id` shows `uid=0(root)`.
+
+**GROUNDING RULE (critical):** You are given a `DIRECT ID CHECK` field — the raw
+output of `id` run by YOU on the target moments ago. This is authoritative. If
+it shows `uid=0(root)`, escalation succeeded (PASS) regardless of the prose. If
+it does NOT show `uid=0` (e.g. `uid=1000(vagrant)`, an error, empty, or a
+timeout message), you MUST NOT return PASS even if the EXECUTION RESULT prose
+claims success — the executor is hallucinating. Classify it as a failure.
 
 **3-way failure classification:**
 
@@ -449,14 +519,15 @@ def executor_node(state: PrivEscState) -> dict:
         # Force one direct ground-truth verification before summarizing, so the
         # cap summary (and the critic) has a real whoami result rather than a
         # context-window guess.
-        direct_verify = ""
-        try:
-            dv = tool_session_command.invoke(
-                {"session_id": state.get("session_id", ""), "command": "whoami"}
-            )
-            direct_verify = str(dv)[:500]
-        except Exception as e:
-            direct_verify = f"(verification call failed: {e})"
+        sid = state.get("session_id", "")
+        direct_verify = _session_command_capped(sid, "whoami", timeout=15) if sid else "(no session_id)"
+        # Retry once if the first read came back empty / preamble-only — a
+        # command_shell can return an empty first chunk (metasploit_tools breaks
+        # on the first read), losing the actual 'root'/'user' line.
+        if (not str(direct_verify).strip()) or str(direct_verify).strip() in ("(no output)",):
+            time.sleep(2)
+            direct_verify = _session_command_capped(sid, "whoami", timeout=15) if sid else "(no session_id)"
+        direct_verify = str(direct_verify)[:500]
         response = call_llm(
             messages=executor_msgs + [HumanMessage(content=(
                 f"DIRECT VERIFICATION: whoami returned: {direct_verify}\n"
@@ -514,10 +585,30 @@ def critic_node(state: PrivEscState) -> dict:
     current_step = state.get("loop_step", 0)
     print_colored("\n[PrivEsc Critic] Evaluating...", Colors.HEADER)
 
+    # Independent ground-truth check: the critic must NOT trust the executor's
+    # prose summary alone (a hallucinating executor can claim 'whoami returned
+    # root' while the real output is 'vagrant' or an error). Run `id` directly
+    # on the target under a hard wall-clock cap and feed the RAW output to the
+    # critic LLM as authoritative evidence.
+    direct_id = ""
+    sid = state.get("session_id", "")
+    if sid:
+        direct_id = _session_command_capped(sid, "id", timeout=15)
+        # Retry once if the command shell returned nothing / only preamble —
+        # command_shell reads can return an empty first chunk.
+        if (not direct_id.strip()) or direct_id.strip() in ("(no output)",):
+            time.sleep(2)
+            direct_id = _session_command_capped(sid, "id", timeout=15)
+    else:
+        direct_id = "(no live session_id available for a direct check)"
+    print_colored(f"[PrivEsc Critic] DIRECT ID CHECK: {str(direct_id)[:200]}", Colors.OKCYAN)
+
     evidence = (
         f"ENUMERATION RESULTS:\n{state.get('enum_results', '')[:2000]}\n\n"
         f"ESCALATION PLAN:\n{state.get('escalation_plan', '')}\n\n"
         f"EXECUTION RESULT:\n{state.get('escalation_result', '')}\n\n"
+        f"DIRECT ID CHECK (authoritative ground-truth, run by the critic just now "
+        f"on the target — trust THIS over the execution prose):\n{str(direct_id)[:600]}\n\n"
         f"LOOP STEP: {current_step} of {MAX_PRIVESC_RETRIES}\n"
     )
 
@@ -631,6 +722,23 @@ def route_after_executor(state: PrivEscState) -> Literal["executor_tools", "crit
     return "critic"
 
 
+def _count_consecutive_fail_exec(messages: List[BaseMessage]) -> int:
+    """Count how many consecutive critic verdicts (most recent backwards) were
+    FAIL_EXEC, stopping at the first non-FAIL_EXEC critic feedback or PASS. Used
+    to break identical-action executor loops by forcing a technique switch."""
+    count = 0
+    for msg in reversed(messages):
+        content = getattr(msg, "content", "") or ""
+        if isinstance(msg, HumanMessage) and "CRITIC FEEDBACK" in content:
+            if "FAIL_EXEC" in content.upper():
+                count += 1
+            else:
+                break  # a different verdict resets the streak
+        elif isinstance(msg, AIMessage) and "[PrivEsc Critic] PASS" in content:
+            break
+    return count
+
+
 def route_after_critic(state: PrivEscState) -> Literal["enumerator", "planner", "executor", "__end__"]:
     time.sleep(2)
     current_step = state.get("loop_step", 0)
@@ -645,6 +753,16 @@ def route_after_critic(state: PrivEscState) -> Literal["enumerator", "planner", 
     elif verdict == "FAIL_TECHNIQUE":
         return "planner"
     elif verdict == "FAIL_EXEC":
+        # Defect #7: guard against identical-action FAIL_EXEC → executor loops.
+        # The current verdict's CRITIC FEEDBACK is already in messages, so a
+        # count >= 2 means this is at least the 2nd consecutive FAIL_EXEC.
+        if _count_consecutive_fail_exec(state["messages"]) >= 2:
+            print_colored(
+                "[PrivEsc] 2+ consecutive FAIL_EXEC — forcing a technique switch "
+                "(routing to planner instead of re-running the same commands).",
+                Colors.WARNING,
+            )
+            return "planner"
         return "executor"
     else:
         return "planner"
@@ -789,9 +907,24 @@ def run_privesc(
             Colors.OKCYAN,
         )
         try:
-            quick = tool_session_command.invoke(
-                {"session_id": session_id, "command": "sudo -n whoami"}
-            )
+            quick = _session_command_capped(session_id, "sudo -n whoami", timeout=15)
+            # Retry up to 2 more times if the first read is empty or shows only
+            # preamble — command_shell sessions often return the real output in a
+            # later chunk, and concluding 'no NOPASSWD' from an empty first read
+            # would skip a trivially escalatable session.
+            attempts = 0
+            while attempts < 2 and (
+                (not str(quick).strip())
+                or str(quick).strip() in ("(no output)",)
+                or "root" not in str(quick).lower()
+                and not any(
+                    s in str(quick).lower()
+                    for s in ("not allowed", "password is required", "may not run")
+                )
+            ):
+                time.sleep(3)
+                quick = _session_command_capped(session_id, "sudo -n whoami", timeout=15)
+                attempts += 1
             quick_str = str(quick).lower()
             # Require 'root' to appear as a standalone whoami result line, not
             # merely as a substring (e.g. '/root/', 'superroot', or an error
@@ -863,58 +996,119 @@ def run_privesc(
                 parts.append(_decode(sdata.get(k)))
         return " ".join(str(p) for p in parts)
 
+    def _is_shell_session(sdata: dict) -> bool:
+        """True if a session dict looks like a usable command_shell/meterpreter."""
+        if not isinstance(sdata, dict):
+            return False
+        for k in (b"type", "type"):
+            if k in sdata:
+                t = _decode(sdata.get(k)).lower()
+                if "shell" in t or "meterpreter" in t:
+                    return True
+        # If 'type' is absent, assume usable (msgpack key may be missing).
+        return not any(k in sdata for k in (b"type", "type"))
+
     sl = {}
     alive = True  # optimistic default if the check itself errors
     try:
         sl = msf_session.client.call("session.list") or {}
-        alive = any(str(k) == str(session_id) for k in sl)
+        # Defect #2: the orchestrator passes session_id as a string ('5') while
+        # msgpack-decoded session.list keys are often ints (5). Match on both the
+        # string form AND the int form so a live session is not declared dead.
+        sid_is_digit = str(session_id).isdigit()
+        alive = any(str(k) == str(session_id) for k in sl) or (
+            sid_is_digit and int(session_id) in sl
+        )
     except Exception as e:
         print_colored(f"[PrivEsc] Session list check failed: {e}", Colors.WARNING)
         alive = True  # optimistic: proceed and let the graph discover the truth
 
+    session_dead = False  # tracks whether we entered the graph without a known-live session
     if not alive:
-        # Defect #2: before a hard abort, scan for ANY live session to the same
-        # target (a newer session may have been created by a different exploit
-        # attempt). Swap to it and continue into the graph rather than giving up.
+        # Defect #1 & #2: before giving up, try progressively wider matching.
         alt_id = None
         try:
+            # Pass 1: any session whose connection/identity string mentions the
+            # target IP (handle the 'IP:port' tunnel_peer format by also
+            # stripping the port and matching the bare IP).
+            bare_ip = str(target_ip).split(":")[0] if target_ip else ""
             for sid_key, sdata in sl.items():
                 conn = _session_conn_str(sdata)
-                if target_ip and target_ip in conn:
+                conn_bare = conn.split(":")[0] if conn else conn
+                if bare_ip and (bare_ip in conn or bare_ip == conn_bare):
                     alt_id = str(sid_key)
                     break
+            # Pass 2: if no IP match, accept ANY live shell session. When the
+            # session list is small, a lone shell is almost certainly the right
+            # foothold (tunnel_peer may be absent or formatted unexpectedly).
+            if not alt_id:
+                shell_sids = [str(k) for k, v in sl.items() if _is_shell_session(v)]
+                if len(shell_sids) == 1:
+                    alt_id = shell_sids[0]
+                elif len(shell_sids) > 1:
+                    # Prefer the highest-numbered (newest) session.
+                    numeric = [s for s in shell_sids if s.isdigit()]
+                    alt_id = (max(numeric, key=int) if numeric else shell_sids[-1])
         except Exception as e:
             print_colored(f"[PrivEsc] Alternative-session scan failed: {e}", Colors.WARNING)
 
         if alt_id:
             print_colored(
-                f"[PrivEsc] Original session {session_id} dead; using alternative "
-                f"session {alt_id} to {target_ip}.",
+                f"[PrivEsc] Original session {session_id} not matched; using "
+                f"alternative live session {alt_id} for {target_ip}.",
                 Colors.WARNING,
             )
-            session_id = alt_id  # update for the graph run below (flows into initial_state)
+            session_id = alt_id  # flows into initial_state below
         else:
+            # Defect #1: do NOT hard-abort. Enter the graph with a SESSION_DEAD
+            # context so the enumerator first tries to recover/re-open a session
+            # (list sessions, re-run the foothold exploit) before escalating.
+            # A hard return here burns every orchestrator retry with zero effort.
+            session_dead = True
+            session_id = ""  # no known-live session
             print_colored(
-                f"[PrivEsc] Session {session_id} is DEAD and no alternative session "
-                f"to {target_ip} exists — skipping privesc.",
+                f"[PrivEsc] No live session to {target_ip} found — entering graph in "
+                f"SESSION_DEAD recovery mode (enumerator will attempt to recover a "
+                f"session before escalating).",
                 Colors.WARNING,
-            )
-            return PrivEscFindings(
-                success=False,
-                technique="session_lost",
-                previous_level=access_level,
-                new_level=access_level,
-                summary=f"PrivEsc skipped — session {session_id} is no longer active.",
             )
 
-    initial_state = {
-        "messages": [HumanMessage(content=(
+    if session_dead:
+        creds_hint = ""
+        # Surface any objective-embedded credentials as a recovery hint.
+        if objective and ("password" in objective.lower() or "cred" in objective.lower()):
+            creds_hint = f"\nPossible credentials referenced in objective: {objective}"
+        init_message = (
+            f"Escalate privileges on {target_ip}.\n"
+            f"WARNING — SESSION_DEAD: there is currently NO live session to the "
+            f"target. Before any escalation you MUST first recover a foothold:\n"
+            f"  1. Call tool_metasploit_rpc('sessions') to list all live sessions.\n"
+            f"  2. If a session to {target_ip} exists, note its ID and use it for "
+            f"all subsequent tool_session_command calls.\n"
+            f"  3. If none exists, attempt to re-open one: re-run the original "
+            f"foothold exploit via tool_metasploit_rpc (e.g. the service exploit "
+            f"that gave initial access), or SSH in with any known credentials via "
+            f"tool_metasploit_rpc('use auxiliary/scanner/ssh/ssh_login ...').\n"
+            f"  4. Only once a live session exists, proceed with enumeration and "
+            f"escalation.\n"
+            f"If recovery is impossible after a few attempts, summarize that the "
+            f"session could not be recovered.{creds_hint}\n"
+            f"Session type (was): {session_type}\n"
+            f"Current access: {access_level}\n"
+            f"OS: {os_info}\n"
+            f"Objective: {objective}"
+        )
+    else:
+        init_message = (
             f"Escalate privileges on {target_ip}.\n"
             f"Session: {session_type} (ID: {session_id})\n"
             f"Current access: {access_level}\n"
             f"OS: {os_info}\n"
             f"Objective: {objective}"
-        ))],
+        )
+
+    initial_state = {
+        "messages": [HumanMessage(content=init_message)],
         "target_ip": target_ip,
         "session_id": session_id,
         "session_type": session_type,

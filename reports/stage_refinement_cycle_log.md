@@ -16,6 +16,27 @@ what actually exercise exploit/privesc/persistence/impact subagents.
 
 ---
 
+## Run-by-run outcomes — ALL stages
+Legend: ✅ success · ❌ fail · ⛔ hung · ⏱ timed out · — not reached · (D) no-LLM direct path · (S) stage subagent
+
+| Run (ver, graph) | recon | initial-access / exploit | privesc | persistence | impact |
+|---|---|---|---|---|---|
+| R0 v0 success | ⛔(S) recursion_limit ×3 | — | — | — | — |
+| R1 v1 success | ✅(S) 12 ports | ✅(D) ssh_login sess1 | ✅(D) sudo verify | ✅(D) ssh-key + cron | ✅(D) file_drop |
+| R1 v1 proftpd | ✅(S) 9 ports | ✅(D) modcopy sess2 | ✅(D) enum | n/a | ✅(D) file_drop |
+| R2 v2 success | ✅(S) | ✅(D) ssh_login sess3 | ✅(D) | ✅(D) ssh-key + cron | ✅(D) |
+| R2 v2 proftpd | ✅(S) | ✅(D) modcopy | ✅(D) | n/a | ✅(D) |
+| v2 goalonly | ✅(S) | ✅(S) UnrealIRCd sess5 | ❌(S) "session no longer active" ×3 | ⏱(S) | — |
+| R3 v3 flawed | ✅(S) | ✅(S, **fallback**) wrong-module→UnrealIRCd sess1 | (privesc dropped) | ⏱(S) | — |
+| R3 v3 goalonly | ✅(S) | ⛔(S) hung on proftpd_modcopy (unbounded MSF call) | — | — | — |
+
+Reading it: success/proftpd graphs only exercise recon as a subagent — the rest is
+the no-LLM direct path. The goalonly/flawed graphs are where exploit/privesc/
+persistence/impact run as subagents — and that's where the real defects show
+(unstable session in v2; the unbounded-MSF hang in v3 → fixed in v4).
+
+---
+
 ## v0 — baseline (R0)
 **Found:** recon never converged — planner↔executor↔critic looped to LangGraph
 `recursion_limit=50` on all 3 retries (full `-p-` nmap scans timing out). Pipeline

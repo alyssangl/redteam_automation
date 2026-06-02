@@ -262,12 +262,20 @@ penetration testing techniques, nmap strategies, and service-specific recon appr
 **Strategy — use a two-phase approach:**
 
 Phase 1: Quick discovery scan (ALWAYS use -Pn to skip host discovery)
-- ALWAYS start with: `nmap -Pn -sS -T4 --top-ports 100 <target>` — do NOT use `-p-` or `-p 0-65535` in Phase 1; these will time out.
+- ALWAYS start with: `nmap -Pn -sS -T4 --top-ports 1000 <target>` — do NOT use `-p-` or `-p 0-65535` in Phase 1; these will time out.
 - On retry when the previous attempt had timeout errors, use `-T5 --top-ports 20` (fastest possible scan) to confirm host reachability first.
 
 Phase 2: Deep scan on discovered ports
 - `nmap -Pn -sV -sC -O -p<port1,port2,...> <target>` (version detection, default scripts, OS detection)
 - Only scan ports found open in Phase 1
+
+Phase 3: Targeted scan of known non-standard high-value ports (Metasploitable/CTF)
+- ALWAYS run: `nmap -Pn -sV -p 6667,6697,8484,8180,5432,27017,10000,6000 <target>`
+- The top-1000 scan misses several high-value, frequently-exploitable services on lab
+  targets — most notably UnrealIRCd on 6667/6697, Jenkins on 8484/8180, PostgreSQL on
+  5432, MongoDB on 27017, Webmin on 10000, and X11 on 6000. This discrete, bounded scan
+  (a fixed 8-port list, well under the SSH timeout) ensures the exploit stage gets these
+  vectors even when they fall outside the top-1000 range.
 
 **IMPORTANT: Always use -Pn flag.** Lab targets often block ICMP pings, causing nmap to
 report "host seems down" without -Pn. This is the #1 cause of failed recon.
@@ -306,7 +314,7 @@ You have access to `tool_linux_terminal` to run commands on the Kali machine.
 3. ADAPT between phases: if Phase 1 finds open ports, use those specific ports in Phase 2
 4. If a scan returns "host seems down", re-run with `-Pn` on the SAME target IP
 5. Do NOT run more than {MAX_EXECUTOR_TOOL_CALLS} commands total
-6. If a command returns SSH_TIMEOUT or "timed out", do NOT retry the same command. Instead immediately try a much smaller scan: `nmap -Pn --top-ports 100 -T5 <target>` as a connectivity check, then `nmap -Pn -p 22,80,443,445,3306,8080 -sV -T4 <target>` for known-common ports. Only escalate to larger scans if the smaller ones succeed.
+6. If a command returns SSH_TIMEOUT or "timed out", do NOT retry the same command. Instead immediately try a much smaller scan: `nmap -Pn --top-ports 100 -T5 <target>` as a connectivity check, then `nmap -Pn -p 21,22,80,111,139,443,445,631,3306,6667,8080,8484 -sV -T4 <target>` for known-common and high-value lab ports (this targeted 12-port scan runs in seconds and covers commonly exploitable MS3 services including UnrealIRCd on 6667 and Jenkins on 8484). Only escalate to larger scans if the smaller ones succeed.
 7. Do NOT install packages (no apt-get, no pip). Use only tools already available.
 
 **When done scanning, provide a TEXT SUMMARY of all findings:**
@@ -478,8 +486,9 @@ def planner_node(state: ReconState) -> dict:
                 Colors.WARNING
             )
             plan_text = (
-                f"1. nmap -Pn -sS -T4 --top-ports 100 {target_ip}  # Phase 1: quick discovery\n"
-                f"2. nmap -Pn -sV -sC -O -p<discovered_ports> {target_ip}  # Phase 2: deep scan"
+                f"1. nmap -Pn -sS -T4 --top-ports 1000 {target_ip}  # Phase 1: quick discovery\n"
+                f"2. nmap -Pn -sV -sC -O -p<discovered_ports> {target_ip}  # Phase 2: deep scan\n"
+                f"3. nmap -Pn -sV -p 6667,6697,8484,8180,5432,27017,10000,6000 {target_ip}  # Phase 3: known non-standard ports"
             )
 
         print_colored(f"[Recon Planner] Strategy:\n{plan_text[:400]}", Colors.OKGREEN)
@@ -724,7 +733,10 @@ def critic_node(state: ReconState) -> dict:
         target_info = parse_json_response(verdict_text)
         if not target_info or "ip" not in target_info:
             # Try extracting from TARGET_INFO: block
-            ti_match = re.search(r'TARGET_INFO:\s*(\{.*?\})', verdict_text, re.DOTALL)
+            ti_match = re.search(
+                r'TARGET_INFO:\s*(?:```(?:json)?\s*)?(\{.*?\})(?:\s*```)?',
+                verdict_text, re.DOTALL
+            )
             if ti_match:
                 target_info = parse_json_response(ti_match.group(1))
 

