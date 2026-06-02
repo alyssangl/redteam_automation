@@ -937,7 +937,7 @@ def run_impact(
     access_level: str,
     prior_findings_summary: str = "",
     thread_id: str = None,
-    recursion_limit: int = 80,
+    recursion_limit: int = 150,
 ) -> ImpactFindings:
     import uuid
 

@@ -1281,7 +1281,7 @@ def run_persistence(
     access_level: str,
     objective: str = "",
     thread_id: str = None,
-    recursion_limit: int = 100,
+    recursion_limit: int = 250,
 ) -> PersistenceFindings:
     import uuid
 

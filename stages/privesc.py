@@ -583,72 +583,58 @@ def executor_node(state: PrivEscState) -> dict:
 
 
 def _make_pair_safe(msgs: List[BaseMessage]) -> List[BaseMessage]:
-    """Sanitize a message list so it never starts with a ToolMessage that has no
-    preceding assistant message with tool_calls.
+    """Sanitize a message list so the tool_calls/tool pairing is valid in BOTH
+    directions that OpenAI enforces:
 
-    OpenAI raises a 400 "messages with role 'tool' must be a response to a
-    preceding message with 'tool_calls'" when such an orphaned ToolMessage
-    appears.  This happens when a sliding-window slice or a prepend operation
-    cuts between a tool_calls AIMessage and its ToolMessage responses.
+      - a role:'tool' message MUST follow an assistant message with tool_calls, and
+      - an assistant message with tool_calls MUST be followed by a ToolMessage
+        responding to EVERY one of its tool_call_ids (this is the parallel /
+        multiple-tool-call case: a window slice can keep the AIMessage while
+        dropping some of its responses, leaving orphaned tool_call_ids).
 
-    Strategy:
-    1. Drop any leading ToolMessages (and any AIMessages that have tool_calls
-       but whose following ToolMessages were cut) until the window starts with a
-       non-tool-response message.
-    2. Walk the rest of the list and remove any ToolMessage that is not
-       immediately preceded (in the remaining list) by an AIMessage with
-       tool_calls, and conversely remove any AIMessage with tool_calls that has
-       no following ToolMessage.  Repeat until stable.
+    The previous version only checked that *at least one* ToolMessage followed a
+    tool_calls AIMessage, so a message with 2 parallel tool_calls but a single
+    response survived and triggered a 400. This rewrite is id-aware and atomic:
+    an AIMessage with tool_calls is kept only if EVERY tool_call_id has a matching
+    ToolMessage in the immediately-following run; otherwise the whole group is
+    dropped. ToolMessages not claimed by a kept AIMessage are dropped.
     """
     if not msgs:
         return msgs
 
-    # Pass 1: drop leading orphaned ToolMessages / tool_calls-only AIMessages.
-    # Keep stripping from the front until the head is clean.
-    result = list(msgs)
-    while result:
-        head = result[0]
-        if isinstance(head, ToolMessage):
-            # Orphaned ToolMessage at the front — drop it.
-            result.pop(0)
-        elif isinstance(head, AIMessage) and head.tool_calls and (
-            len(result) < 2 or not isinstance(result[1], ToolMessage)
-        ):
-            # tool_calls AIMessage with no following ToolMessage — drop it.
-            result.pop(0)
-        else:
-            break
-
-    # Pass 2: walk and enforce pair integrity throughout the list.
-    changed = True
-    while changed:
-        changed = False
-        clean = []
-        i = 0
-        while i < len(result):
-            msg = result[i]
-            if isinstance(msg, ToolMessage):
-                # Check that the previous message in `clean` is an AIMessage
-                # with tool_calls.
-                if clean and isinstance(clean[-1], AIMessage) and clean[-1].tool_calls:
-                    clean.append(msg)
-                else:
-                    changed = True  # drop orphaned ToolMessage
-            elif isinstance(msg, AIMessage) and msg.tool_calls:
-                # Look ahead: ensure at least one ToolMessage follows before
-                # any non-ToolMessage boundary.
-                j = i + 1
-                while j < len(result) and isinstance(result[j], ToolMessage):
-                    j += 1
-                if j == i + 1:
-                    # No ToolMessage follows — drop this dangling tool_calls message.
-                    changed = True
-                else:
-                    clean.append(msg)
-            else:
-                clean.append(msg)
+    result: List[BaseMessage] = []
+    i = 0
+    n = len(msgs)
+    while i < n:
+        msg = msgs[i]
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            required_ids = [
+                tc.get("id") for tc in msg.tool_calls
+                if isinstance(tc, dict) and tc.get("id")
+            ]
+            # Collect the contiguous run of ToolMessages right after this AIMessage,
+            # keyed by the tool_call_id they respond to.
+            j = i + 1
+            responses = {}
+            while j < n and isinstance(msgs[j], ToolMessage):
+                tcid = getattr(msgs[j], "tool_call_id", None)
+                if tcid is not None and tcid not in responses:
+                    responses[tcid] = msgs[j]
+                j += 1
+            if required_ids and all(rid in responses for rid in required_ids):
+                # Keep the AIMessage + exactly one ToolMessage per id, in call order.
+                result.append(msg)
+                for rid in required_ids:
+                    result.append(responses[rid])
+            # else: incomplete -> drop the AIMessage AND its partial responses.
+            i = j
+            continue
+        if isinstance(msg, ToolMessage):
+            # Orphaned ToolMessage not consumed by a kept AIMessage above -> drop.
             i += 1
-        result = clean
+            continue
+        result.append(msg)
+        i += 1
 
     return result
 
@@ -1058,7 +1044,7 @@ def run_privesc(
     os_info: str = "",
     objective: str = "",
     thread_id: str = None,
-    recursion_limit: int = 120,
+    recursion_limit: int = 200,
 ) -> PrivEscFindings:
     import uuid
 
