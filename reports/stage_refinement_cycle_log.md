@@ -97,5 +97,30 @@ Target: every MSF console/RPC/session command gets a wall-clock timeout and
 returns a failure string on timeout (never blocks); cap the number of
 exploit/technique attempts so a stage can't run for tens of minutes; keep v3
 failure-recovery. Goal: bounded, fast, non-hanging runs.
-## v5 — (pending)
+**Result (R4):** recon now finds port 6667 (top-1000 + non-standard ports);
+gain_access succeeded in BOUNDED time (no 18-min hang — the v4 SSH/MSF timeouts
+hold). BUT a **regression**: the privesc subagent now crashes every attempt with
+OpenAI 400 "messages with role 'tool' must be a response to a preceding message
+with 'tool_calls'" — v4's large privesc refactor (SESSION_DEAD mode + capping)
+broke the message-window ordering. It fails fast (~25s) and caps at 4 retries
+(bounding works) but cannot escalate. → v5 #1 fix.
+
+**Result (R4) — full verdict:** NO HANGS — recon 67s, gain_access 84s, the whole
+run completed (was a 12-min freeze in R3). Bounding works.
+- recon ✅ now finds 6667/irc (top-1000 + non-standard ports)
+- gain_access ✅ session 2 (UnrealIRCd), bounded 84s
+- escalate ❌ privesc message-window crash (400 tool/tool_calls) ×4 — REGRESSION from v4
+- persist ✅ "Persistence established via cron_job. Verified working."
+- impact ❌ "no session available" — session not propagated after escalate crashed
+- proftpd_modcopy_exec (replanner-inserted) ✅ via direct→subagent FALLBACK (session 3)
+- success regression ✅
+Wins: hangs gone; fallback works on replanner nodes; persistence subagent works.
+
+## v5 — fix v4 regression (privesc message-window) + session propagation  [in progress]
+Target: repair the privesc 'tool'/'tool_calls' message ordering crash; make all
+stages' message-window logic pair-safe; impact falls back to newest live session
+on target; keep all v4 bounding.
+
+## v6 — final (pending)
+
 ## v6 — final (pending)
