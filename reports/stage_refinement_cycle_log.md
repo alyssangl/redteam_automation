@@ -63,9 +63,18 @@ to improvise within scope before the walker/replanner. Added `flawed_graph` to t
 - **recon:** record failed/timed-out commands in anti-repeat memory; early-terminate on
   SSH errors; planner → gpt-4o.
 - **impact:** failure-path hardening.
-**Result (R3):** flawed graph validated the fallback (above). goalonly + success re-run
-in progress (runner hardened: survives per-graph timeout, 2400s cap).
+**Result (R3):** flawed graph validated the fallback (above). goalonly **HUNG** —
+the exploit subagent fired a Metasploit module (proftpd_modcopy_exec) and blocked
+indefinitely with no timeout; 12+ min of zero output before it was killed. The
+success regression never ran.
+**Found (critical):** stage MSF tool calls (console/RPC/session commands) are
+UNBOUNDED — one blocking module hangs the entire run. This is the main cause of
+the "why is it so slow" symptom: not thoroughness, an unbounded tool call.
 
-## v4 — (pending R3 goalonly findings)
+## v4 — bound every tool call (no hangs) + cap attempts  [in progress]
+Target: every MSF console/RPC/session command gets a wall-clock timeout and
+returns a failure string on timeout (never blocks); cap the number of
+exploit/technique attempts so a stage can't run for tens of minutes; keep v3
+failure-recovery. Goal: bounded, fast, non-hanging runs.
 ## v5 — (pending)
 ## v6 — final (pending)
