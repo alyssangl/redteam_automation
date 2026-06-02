@@ -106,6 +106,29 @@ def _setup_logger(graph_name: str) -> logging.Logger:
 # SUBAGENT DISPATCH — routes a node to the right stage runner
 # =============================================================================
 
+_SUBAGENT_TYPES = {"recon", "exploit", "persistence", "privesc", "impact", "discovery"}
+
+
+def _dispatch_subagent(agent_type, node, graph, preceding, explore, log=None):
+    """Route a node to its stage subagent (the LLM planner/executor/critic loop)."""
+    if agent_type == "recon":
+        return _dispatch_recon(node, graph, preceding, explore)
+    elif agent_type == "exploit":
+        return _dispatch_exploit(node, graph, preceding, explore)
+    elif agent_type == "persistence":
+        return _dispatch_persistence(node, graph, preceding, explore)
+    elif agent_type == "privesc":
+        return _dispatch_privesc(node, graph, preceding, explore)
+    elif agent_type == "impact":
+        return _dispatch_impact(node, graph, preceding, explore)
+    elif agent_type == "discovery":
+        return _dispatch_discovery(node, graph, preceding, explore)
+    else:
+        if log:
+            log.warning(f"  Unknown agent_type '{agent_type}' — skipping node.")
+        return {"success": False, "summary": f"Unknown agent_type: {agent_type}"}
+
+
 def dispatch_node(
     node: AttackNode,
     graph: AttackGraph,
@@ -156,26 +179,28 @@ def dispatch_node(
         findings = _execute_direct(node, graph, log)
         if findings.get("success"):
             return findings
-        # Direct execution failed — return failure, let the walker backtrack
         log.warning(f"  [{node.id}] Direct execution failed: {findings.get('summary', '?')}")
+        # FALLBACK (explore mode only): hand the failed node to its stage
+        # subagent so the LLM can improvise WITHIN this stage's scope before the
+        # walker backtracks / replanner restructures. In strict mode (explore=
+        # False) we honour _STRICT_PREFIX and just report the failure.
+        if explore and agent_type in _SUBAGENT_TYPES:
+            log.info(f"  [{node.id}] [fallback] direct failed — handing to '{agent_type}' subagent to improvise...")
+            sub = _dispatch_subagent(agent_type, node, graph, preceding, explore, log=log)
+            if sub.get("success"):
+                sub["recovered_via"] = "subagent_fallback"
+                log.info(f"  [{node.id}] [fallback] subagent recovered the node.")
+                return sub
+            # Subagent also failed — keep direct's failure classification if the
+            # subagent didn't provide one, and flag that both paths were tried.
+            sub.setdefault("failure_category", findings.get("failure_category", "generic"))
+            sub.setdefault("failure_cause", findings.get("failure_cause", ""))
+            sub["direct_attempt_failed"] = True
+            return sub
         return findings
 
-    # --- LLM STAGE RUNNERS (recon, or nodes without module/commands) ---
-    if agent_type == "recon":
-        return _dispatch_recon(node, graph, preceding, explore)
-    elif agent_type == "exploit":
-        return _dispatch_exploit(node, graph, preceding, explore)
-    elif agent_type == "persistence":
-        return _dispatch_persistence(node, graph, preceding, explore)
-    elif agent_type == "privesc":
-        return _dispatch_privesc(node, graph, preceding, explore)
-    elif agent_type == "impact":
-        return _dispatch_impact(node, graph, preceding, explore)
-    elif agent_type == "discovery":
-        return _dispatch_discovery(node, graph, preceding, explore)
-    else:
-        log.warning(f"  Unknown agent_type '{agent_type}' — skipping node.")
-        return {"success": False, "summary": f"Unknown agent_type: {agent_type}"}
+    # --- LLM STAGE RUNNERS (recon, or goal-only nodes without module/commands) ---
+    return _dispatch_subagent(agent_type, node, graph, preceding, explore, log=log)
 
 
 # =============================================================================
