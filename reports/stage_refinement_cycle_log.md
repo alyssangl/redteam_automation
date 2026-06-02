@@ -146,3 +146,28 @@ v0 recon crash-loops → v1 works end-to-end → v2 honest (grounded, no false s
 → v3 resilient (session recovery) + direct→subagent fallback → v4 bounded (no hangs)
 → v5 partial pair-safe → v6 id-aware pair-safe (crash gone) + recursion headroom.
 Open tuning item: time-box escalate so exhaustive privesc doesn't blow the clock.
+
+## v7 — escalate time-box (commit `7563ad4`) + escalate max_retries=1 (`acd66b6`)
+PRIVESC_WALLCLOCK_TIMEOUT=300s (soft — checks between stream steps, overshoots
+~450s). max_retries=1 on the goal-only escalate node (a deterministic timeout is
+not worth retrying — interim until category-aware retry, roadmap P1).
+
+## Generalization examples (v7) — full chain on real MS3 services
+Privesc node converted enum-only `privesc_lookup` → goal-only `escalate` (`d15a048`)
+so it invokes run_privesc. Edge gating note: file_drop ends up gated behind a live
+session, recovered by the replanner when escalate kills the session.
+
+| Graph | Result |
+|---|---|
+| **proftpd** (R-v9) | **EXECUTION COMPLETE 83%** — recon✓ proftpd_check✓ proftpd_rce✓ escalate✗(honest no-root) file_drop✓ via replanner-recovered session 22. Solid example. |
+| unrealircd | (examples batch) |
+| samba | (examples batch) |
+| continuum | (examples batch) |
+| drupal | (examples batch) |
+
+KEY FINDING (→ roadmap): on this box network RCEs land non-root (www-data/boba_fett)
+and there is no kernel-exploit in privesc's repertoire, so escalate honestly fails —
+expected. AND the slow escalate can KILL the command_shell session before impact,
+forcing a replanner re-exploit. Both point to: (a) privesc kernel local-exploits,
+(b) bound escalate tighter / don't let privesc destroy the session, (c) gate impact
+on "session exists" with a re-establish path.
