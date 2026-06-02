@@ -54,7 +54,7 @@ def build_init_fail_graph(target_ip: str, attacker_ip: str) -> AttackGraph:
         objective=f"Full port scan with OS detection and service versioning on {target_ip}.",
         target_ip=target_ip,
         tool_name="nmap",
-        commands_to_run=[f"nmap -O -A -p 0-65535 {target_ip}"],
+        commands_to_run=[f"nmap -O -A --top-ports 1000 {target_ip}"],
         tags=["nmap", "full_scan"],
     ))
 

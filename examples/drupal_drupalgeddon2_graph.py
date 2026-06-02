@@ -57,7 +57,7 @@ def build_drupal_drupalgeddon2_graph(target_ip: str, attacker_ip: str) -> Attack
         objective=f"Full port scan with service versioning on {target_ip}.",
         target_ip=target_ip,
         tool_name="nmap",
-        commands_to_run=[f"nmap -sV -p 0-65535 {target_ip}"],
+        commands_to_run=[f"nmap -sV --top-ports 1000 {target_ip}"],
         tags=["nmap", "full_scan"],
     ))
 
