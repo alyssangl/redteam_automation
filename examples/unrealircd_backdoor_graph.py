@@ -115,7 +115,7 @@ def build_unrealircd_backdoor_graph(target_ip: str, attacker_ip: str) -> AttackG
                   "capabilities, writable config, docker group) to obtain a root "
                   "shell. Verify success with id/whoami showing uid=0.",
         target_ip=target_ip,
-        max_retries=3,
+        max_retries=1,  # interim: deterministic timeout failure is not worth retrying (see roadmap P1)
         tags=["privesc", "escalation", "goal_only"],
     ))
 
