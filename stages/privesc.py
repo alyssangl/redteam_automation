@@ -280,6 +280,13 @@ def enumerator_node(state: PrivEscState) -> dict:
     # count is always 0 on retries and the cap never engages.
     enum_tool_count = 0
     for msg in reversed(messages):
+        # Stop at the prior enumerator's own final summary so a FAIL_ENUM retry
+        # starts a fresh count. Without this, the CRITIC FEEDBACK message (the
+        # only boundary on a retry) is skipped and the backward walk keeps
+        # counting ToolMessages from the PREVIOUS enum turn, tripping the cap on
+        # the first command of the retry.
+        if isinstance(msg, AIMessage) and "[PrivEsc Enumerator]" in (msg.content or ""):
+            break
         if isinstance(msg, HumanMessage) and "CRITIC FEEDBACK" not in msg.content:
             break
         if isinstance(msg, ToolMessage):
@@ -301,6 +308,17 @@ def enumerator_node(state: PrivEscState) -> dict:
     else:
         # Continuing ReAct — use recent messages
         enum_msgs = list(messages[-min(12, len(messages)):])
+        # On a FAIL_ENUM retry, the recent window may not contain the critic
+        # feedback, so the enumerator can't tell which vectors it missed and
+        # tends to re-run already-executed commands. Prepend the most recent
+        # CRITIC FEEDBACK message if it isn't already in the window.
+        feedback_msg = None
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage) and "CRITIC FEEDBACK" in (msg.content or ""):
+                feedback_msg = msg
+                break
+        if feedback_msg is not None and feedback_msg not in enum_msgs:
+            enum_msgs = [feedback_msg] + enum_msgs
 
     if enum_tool_count >= MAX_ENUM_TOOL_CALLS:
         print_colored(f"[PrivEsc Enumerator] Tool cap ({enum_tool_count}).", Colors.WARNING)
@@ -422,9 +440,22 @@ def executor_node(state: PrivEscState) -> dict:
 
     if executor_tool_count >= MAX_EXECUTOR_TOOL_CALLS:
         print_colored(f"[PrivEsc Executor] Tool cap ({executor_tool_count}).", Colors.WARNING)
+        # Force one direct ground-truth verification before summarizing, so the
+        # cap summary (and the critic) has a real whoami result rather than a
+        # context-window guess.
+        direct_verify = ""
+        try:
+            dv = tool_session_command.invoke(
+                {"session_id": state.get("session_id", ""), "command": "whoami"}
+            )
+            direct_verify = str(dv)[:500]
+        except Exception as e:
+            direct_verify = f"(verification call failed: {e})"
         response = call_llm(
             messages=executor_msgs + [HumanMessage(content=(
-                "Max tool calls reached. Report: did whoami return root? What happened?"
+                f"DIRECT VERIFICATION: whoami returned: {direct_verify}\n"
+                "Max tool calls reached. Based on this output, report whether "
+                "escalation succeeded (did whoami return root?) and what happened."
             ))],
             system_prompt=EXECUTOR_PROMPT
         )
@@ -436,12 +467,40 @@ def executor_node(state: PrivEscState) -> dict:
         )
 
     if response.content and not response.tool_calls:
+        # Ground the executor's prose summary with the actual raw ToolMessage
+        # outputs from the CURRENT executor turn. The critic otherwise only sees
+        # the executor LLM's self-reported summary, which can hallucinate a root
+        # confirmation. Append the last 3 raw tool outputs (each capped) so the
+        # critic evaluates real command responses.
+        grounded = _collect_grounded_tool_outputs(executor_msgs)
+        if grounded:
+            escalation_result = f"{response.content}\n\nGROUNDED TOOL OUTPUTS:\n{grounded}"
+        else:
+            escalation_result = response.content
         return {
             "messages": [response],
-            "escalation_result": response.content,
+            "escalation_result": escalation_result,
         }
 
     return {"messages": [response]}
+
+
+def _collect_grounded_tool_outputs(turn_msgs: List[BaseMessage], limit: int = 3) -> str:
+    """Collect the last `limit` raw ToolMessage contents (each capped at 500
+    chars) from the current executor turn, for use as grounded evidence."""
+    tool_outputs = []
+    for msg in reversed(turn_msgs):
+        if isinstance(msg, ToolMessage):
+            content = (msg.content or "")
+            if len(content) > 500:
+                content = content[:500] + "... [truncated]"
+            tool_outputs.append(content)
+            if len(tool_outputs) >= limit:
+                break
+    if not tool_outputs:
+        return ""
+    tool_outputs.reverse()
+    return "\n---\n".join(tool_outputs)
 
 
 def critic_node(state: PrivEscState) -> dict:
@@ -728,7 +787,16 @@ def run_privesc(
                 {"session_id": session_id, "command": "sudo -n whoami"}
             )
             quick_str = str(quick).lower()
-            if "root" in quick_str and "not allowed" not in quick_str \
+            # Require 'root' to appear as a standalone whoami result line, not
+            # merely as a substring (e.g. '/root/', 'superroot', or an error
+            # message that mentions root). This prevents a false-positive
+            # fast-path success on a session whose output contains 'root' in a
+            # path or error context.
+            root_confirmed = any(
+                re.fullmatch(r"root", l.strip(), re.IGNORECASE)
+                for l in str(quick).splitlines() if l.strip()
+            )
+            if root_confirmed and "not allowed" not in quick_str \
                     and "password is required" not in quick_str \
                     and "a password is required" not in quick_str:
                 print_colored(

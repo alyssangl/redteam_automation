@@ -43,6 +43,11 @@ MAX_RECON_RETRIES = 3
 MAX_EXECUTOR_TOOL_CALLS = 10
 MAX_PLANNER_TOOL_CALLS = 5
 
+# Per-command SSH exec timeout for recon scans. Lowered from 600 so that a
+# single timed-out nmap cannot block for 10 minutes; with the executor budget
+# this bounds worst-case wall-clock to a few minutes per cycle instead of hours.
+RECON_SSH_TIMEOUT = 120
+
 FORBIDDEN_COMMANDS = ["rm -rf /", ":(){ :|:& };:"]
 
 # =============================================================================
@@ -69,14 +74,20 @@ def print_colored(text: str, color: str):
 # SSH UTILITIES
 # =============================================================================
 
-def run_ssh_command(command: str) -> str:
-    """Execute command on remote Kali machine via SSH."""
+def run_ssh_command(command: str, timeout: int = RECON_SSH_TIMEOUT) -> str:
+    """Execute command on remote Kali machine via SSH.
+
+    Args:
+        command: Shell command to run on the Kali box.
+        timeout: Per-command exec timeout in seconds (defaults to
+            RECON_SSH_TIMEOUT so a stuck nmap cannot block for minutes).
+    """
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     try:
         ssh.connect(KALI_IP, username=KALI_USER, password=KALI_PASS, timeout=10)
-        stdin, stdout, stderr = ssh.exec_command(command, timeout=600)
+        stdin, stdout, stderr = ssh.exec_command(command, timeout=timeout)
 
         output_lines = []
         for line in iter(stdout.readline, ""):
@@ -128,7 +139,7 @@ def tool_linux_terminal(command: str):
     if any(bad in command for bad in FORBIDDEN_COMMANDS):
         return "Command blocked by safety guardrails."
     print_colored(f"\n[Terminal Tool] Executing: {command}", Colors.OKCYAN)
-    return run_ssh_command(command)
+    return run_ssh_command(command, timeout=RECON_SSH_TIMEOUT)
 
 
 RECON_TOOLS = [tool_linux_terminal]
@@ -426,9 +437,34 @@ def planner_node(state: ReconState) -> dict:
 
     # Tag the final text response with [Recon Planner] prefix if it's a text answer
     if response.content and not response.tool_calls:
-        print_colored(f"[Recon Planner] Strategy:\n{response.content[:400]}", Colors.OKGREEN)
+        plan_text = response.content
+
+        # Guard: the LLM sometimes ignores the Phase-1 "--top-ports" rule and emits
+        # a full-port scan (-p- or -p 0-65535), which reliably times out. Detect any
+        # forbidden full-range pattern on a line lacking --top-ports and replace the
+        # whole plan with a safe two-phase fallback so we never burn the budget.
+        forbidden = re.compile(r'-p-(?:\s|$)|-p\s*0-65535|-p\s*1-65535|-p\s*0\s*-\s*65535')
+        has_forbidden = False
+        for line in plan_text.splitlines():
+            if forbidden.search(line) and "--top-ports" not in line:
+                has_forbidden = True
+                break
+
+        if has_forbidden:
+            target_ip = _extract_target_ip(state.get("plan", ""), state.get("goal", ""))
+            print_colored(
+                "[Recon Planner] Guard: forbidden full-port scan detected — "
+                "substituting safe two-phase plan.",
+                Colors.WARNING
+            )
+            plan_text = (
+                f"1. nmap -Pn -sS -T4 --top-ports 100 {target_ip}  # Phase 1: quick discovery\n"
+                f"2. nmap -Pn -sV -sC -O -p<discovered_ports> {target_ip}  # Phase 2: deep scan"
+            )
+
+        print_colored(f"[Recon Planner] Strategy:\n{plan_text[:400]}", Colors.OKGREEN)
         return {
-            "messages": [AIMessage(content=f"[Recon Planner] {response.content}")]
+            "messages": [AIMessage(content=f"[Recon Planner] {plan_text}")]
         }
 
     return {"messages": [response]}
@@ -466,6 +502,73 @@ def executor_node(state: ReconState) -> dict:
 
     if not executor_msgs:
         executor_msgs = [messages[-1]]
+
+    # --- Cross-cycle institutional memory (Fix: executor loses prior-cycle context) ---
+    # Scan ALL ToolMessages across every cycle, not just the current window, so the
+    # executor knows which commands were already attempted (and which timed out) even
+    # after a planner retry resets the message window.
+    attempted = []          # (command, timed_out) preserving order, de-duplicated
+    seen_cmds = set()
+    cmd_re = re.compile(r"Executing:\s*(.+)")
+    cmd_re_quoted = re.compile(r"Command '([^']+)'")
+    for msg in messages:
+        if not isinstance(msg, ToolMessage) or not msg.content:
+            continue
+        content = msg.content
+        cmd = None
+        m = cmd_re.search(content)
+        if m:
+            cmd = m.group(1).strip()
+        else:
+            m2 = cmd_re_quoted.search(content)
+            if m2:
+                cmd = m2.group(1).strip()
+        if not cmd:
+            continue
+        timed_out = ("SSH_TIMEOUT" in content) or ("timed out" in content.lower())
+        if cmd not in seen_cmds:
+            seen_cmds.add(cmd)
+            attempted.append((cmd, timed_out))
+
+    if attempted:
+        summary_lines = []
+        for cmd, timed_out in attempted[-15:]:
+            status = "TIMED OUT (do NOT repeat)" if timed_out else "completed"
+            summary_lines.append(f"- {cmd}  [{status}]")
+        memory_msg = HumanMessage(content=(
+            "PREVIOUSLY ATTEMPTED COMMANDS (DO NOT REPEAT ANY THAT TIMED OUT; "
+            "for those, switch to a much smaller scan such as "
+            "`nmap -Pn --top-ports 100 -T5 <target>`):\n"
+            + "\n".join(summary_lines)
+        ))
+        executor_msgs = [memory_msg] + executor_msgs
+
+    # --- Early termination on repeated timeouts (Fix: avoid burning the whole budget) ---
+    # If the most recent tool outputs in THIS cycle are timeouts and we have already
+    # spent a couple of attempts, stop calling the LLM (which keeps reissuing the same
+    # command under pressure) and force the safety-valve text-summary path to the critic.
+    recent_tool_msgs = []
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and "[Recon Planner]" in (msg.content or ""):
+            break
+        if isinstance(msg, ToolMessage) and msg.content:
+            recent_tool_msgs.append(msg.content)
+        if len(recent_tool_msgs) >= 2:
+            break
+    if (
+        executor_tool_count >= 2
+        and len(recent_tool_msgs) >= 2
+        and all(
+            ("SSH_TIMEOUT" in c) or ("timed out" in c.lower())
+            for c in recent_tool_msgs
+        )
+    ):
+        print_colored(
+            f"[Recon Executor] Early-terminate: last {len(recent_tool_msgs)} commands "
+            f"timed out after {executor_tool_count} attempts — forcing summary path.",
+            Colors.WARNING
+        )
+        executor_tool_count = MAX_EXECUTOR_TOOL_CALLS
 
     # Safety valve: force text summary if too many tool calls
     if executor_tool_count >= MAX_EXECUTOR_TOOL_CALLS:
@@ -600,6 +703,21 @@ def critic_node(state: ReconState) -> dict:
             "loop_step": new_step,
             "critic_verdict": "FAIL"
         }
+
+
+def _extract_target_ip(*sources: str) -> str:
+    """Extract the intended target IP from plan/goal text, skipping our own IP.
+
+    Falls back to '<target>' (a literal placeholder) when nothing usable is found
+    so the substituted plan is still well-formed.
+    """
+    for text in sources:
+        if not text:
+            continue
+        for ip in re.findall(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', text):
+            if ip != KALI_IP and not ip.startswith("127."):
+                return ip
+    return "<target>"
 
 
 def _fallback_parse_target_info(scan_results: str) -> dict:
@@ -792,8 +910,14 @@ def _extract_recon_findings(state: dict) -> ReconFindings:
     # Promote to partial success when ports were found even without a critic PASS
     # (e.g. GraphRecursionError exit with critic_verdict == ""). This ensures the
     # orchestrator gets actionable findings rather than a hard failure.
-    if not success and ports:
-        success = True
+    #
+    # Guard against FALSE success: a single 'N/tcp open' line from a partial/first
+    # scan must NOT flip success=True. Require a real target IP AND either an
+    # explicit critic verdict or a non-trivial (>=3 distinct ports) result set so
+    # we don't report success on degenerate single-port partial data.
+    if not success and ports and target_ip not in ("", "unknown"):
+        if critic_verdict != "" or len(ports) >= 3:
+            success = True
 
     # Build summary
     if success and ports:

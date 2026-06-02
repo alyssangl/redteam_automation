@@ -500,6 +500,7 @@ def _classify_failure_from_messages(messages) -> tuple:
     Returns (failure_category, failure_cause). Scans most-recent-first so the
     latest failure dominates. Returns ("generic", "") when nothing matches.
     """
+    # First pass: scan raw tool outputs (most authoritative).
     for msg in reversed(messages):
         if not isinstance(msg, ToolMessage):
             continue
@@ -510,6 +511,28 @@ def _classify_failure_from_messages(messages) -> tuple:
             m = pattern.search(content)
             if m:
                 # Capture a short surrounding phrase for failure_cause
+                start = max(0, m.start() - 30)
+                end = min(len(content), m.end() + 30)
+                phrase = content[start:end].strip().replace("\n", " ")
+                cause = "" if category == "generic" else phrase
+                return (category, cause)
+
+    # Second pass: the executor's forced text assessment (AIMessage) or critic
+    # feedback may name the failure phrase when the raw ToolMessage was
+    # compressed/truncated or never produced (safety-valve path). Scan
+    # non-tool-call AIMessage contents for the same patterns so the orchestrator
+    # gets a distinguishing category instead of a blank ('generic', '').
+    for msg in reversed(messages):
+        if not isinstance(msg, AIMessage):
+            continue
+        if getattr(msg, "tool_calls", None):
+            continue
+        content = msg.content if msg.content else ""
+        if not content:
+            continue
+        for pattern, category in FAILURE_PATTERNS:
+            m = pattern.search(content)
+            if m:
                 start = max(0, m.start() - 30)
                 end = min(len(content), m.end() + 30)
                 phrase = content[start:end].strip().replace("\n", " ")
@@ -1194,9 +1217,20 @@ def critic_node(state: AgentState) -> dict:
 
     print_colored("\n[Critic] Evaluating execution...", Colors.HEADER)
 
-    # Get the executor's final text assessment
+    # Get the executor's final text assessment. Restrict the fallback scan to
+    # messages produced AFTER the most recent [Parameter Solver] marker so we do
+    # not pick up the Planner's strategy text or a Researcher summary from an
+    # earlier retry cycle (which would make the critic evaluate the plan as if it
+    # were execution evidence).
     if not execution_result:
-        for msg in reversed(messages):
+        ps_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            m = messages[i]
+            if isinstance(m, AIMessage) and "[Parameter Solver]" in (m.content or ""):
+                ps_idx = i
+                break
+        scan_window = messages[ps_idx + 1:] if ps_idx >= 0 else messages
+        for msg in reversed(scan_window):
             if isinstance(msg, AIMessage) and not msg.tool_calls and msg.content:
                 execution_result = msg.content
                 break
@@ -1399,22 +1433,21 @@ def _extract_findings(state: dict) -> ExploitationFindings:
     if "root" in result_lower or "uid=0" in result_lower:
         access_level = "root"
     elif session_id:
-        # Actually check via the MSF session — run whoami on the target
+        # Run `id` INSIDE the session via the RPC session API. The previous
+        # implementation used `sessions <id>` (no -i) on the MSF console, which
+        # only prints session info and leaves `whoami` running in the Kali
+        # console context — returning the attacker identity, not the target's.
         try:
-            from tools.metasploit_tools import msf_session as _msf
-            import time as _time
-            _msf.send_command(f"sessions {session_id}")
-            _time.sleep(2)
-            whoami_out = str(_msf.send_command("whoami")).strip().lower()
-            print_colored(f"[Access Check] whoami on session {session_id}: {whoami_out}", Colors.OKCYAN)
-            if "root" in whoami_out or "uid=0" in whoami_out:
+            id_out = str(
+                msf_session.run_session_command(session_id, "id")
+            ).strip().lower()
+            print_colored(f"[Access Check] id on session {session_id}: {id_out}", Colors.OKCYAN)
+            if "root" in id_out or "uid=0" in id_out:
                 access_level = "root"
             else:
                 access_level = "user"
-            # Background back to MSF console
-            _msf.send_command("background")
         except Exception as e:
-            print_colored(f"[Access Check] Failed to check whoami: {e}", Colors.WARNING)
+            print_colored(f"[Access Check] Failed to check id on session: {e}", Colors.WARNING)
             access_level = "user"  # Conservative default
 
     # --- summary ---
@@ -1434,6 +1467,24 @@ def _extract_findings(state: dict) -> ExploitationFindings:
 
     # --- failure classification + session identity (for replanner) ---
     session_user_info = _extract_session_user_info(messages)
+    # Raw command shells (ProFTPD mod_copy, Samba) often produce no `uid=` line
+    # in any ToolMessage — the executor never ran `id`. If we have a confirmed
+    # session but no identity, query it directly via the session API. Wrapped so
+    # it can never block the return of findings.
+    if success and session_id and not session_user_info:
+        try:
+            id_out = str(msf_session.run_session_command(session_id, "id"))
+            m = re.search(r'uid=(\d+)\((\w+)\)', id_out)
+            if m:
+                session_user_info = {
+                    "uid": m.group(1), "user": m.group(2), "raw": m.group(0),
+                }
+                print_colored(
+                    f"[Session Identity] Recovered {m.group(0)} from session {session_id}",
+                    Colors.OKCYAN,
+                )
+        except Exception as e:
+            print_colored(f"[Session Identity] Could not query session {session_id}: {e}", Colors.WARNING)
     if success:
         failure_category = ""
         failure_cause = ""

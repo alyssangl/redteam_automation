@@ -138,7 +138,13 @@ You may make up to {MAX_PLANNER_TOOL_CALLS} queries.
 For "get a shell" / "gain access" objectives:
 1. Run `whoami` and `id` on TARGET via tool_session_command — proof of access
 2. Read `/etc/shadow` (if root) via tool_session_command — proof of root
-3. Create any flag/proof file via tool_session_command (e.g., `echo "pwned" > /root/i_got_in.txt`)
+3. Create any flag/proof file via tool_session_command in a WORLD-WRITABLE path
+   (e.g., `echo "pwned" > /tmp/pwned_by_redteam.txt`).
+   **Proof-file path rule:** If access_level is `user` (not root), write to `/tmp/`
+   or the user home directory (`~/.pwned.txt`), NOT `/root/` — a redirect into
+   /root/ fails with permission denied and `echo` still exits 0, so the write
+   silently fails and leaves no proof. Only if access_level is `root` may you
+   also write to `/root/`. Always `cat` the file back to verify it was created.
 4. Gather system info via tool_session_command: `hostname`, `ip addr`, `cat /etc/os-release`
 
 For "exfiltrate data" objectives:
@@ -237,7 +243,10 @@ You evaluate whether the impact stage achieved the operator's objective with con
 - **PASS** if: objective is substantially met with concrete evidence
 - **FAIL** if: no concrete evidence, OR objective clearly not achieved
 
-**Be lenient on the final attempt** — partial proof counts if the session is active.
+**Apply the same strict standard on every attempt** — do NOT relax the criterion
+just because it is the final loop step. Partial proof (e.g. only `whoami` output
+when the objective required writing a proof file or exfiltrating data) is a FAIL.
+The orchestrator handles the last-attempt exit on its own; you only judge evidence.
 
 **Output format:**
 
@@ -318,6 +327,10 @@ def planner_node(state: ImpactState) -> dict:
             "messages": [AIMessage(content=f"[Impact Planner] {response.content}")],
             "impact_plan": response.content,
             "actions_taken": actions,
+            # Reset the read-back guard at the start of each fresh plan so the
+            # write-verification check is active for every new executor cycle
+            # (the flag persists across operator.add accumulation otherwise).
+            "_verify_prompted": False,
         }
 
     return {"messages": [response]}
@@ -369,6 +382,34 @@ def executor_node(state: ImpactState) -> dict:
         )
 
     if response.content and not response.tool_calls:
+        # --- Defect (executor): refuse to grade a no-execution summary ---
+        # Count real commands run on the target/Kali in THIS cycle. If the LLM
+        # produced planning prose without ever calling a non-planner tool, we
+        # must NOT set impact_result (the critic would grade planning text as
+        # evidence). Inject a correction and route back through the tools once.
+        real_tool_count = 0
+        for m in executor_msgs:
+            if isinstance(m, ToolMessage) and getattr(m, "name", "") in (
+                "tool_session_command", "tool_linux_terminal", "tool_metasploit_rpc"
+            ):
+                real_tool_count += 1
+        if real_tool_count == 0 and not state.get("_verify_prompted", False):
+            print_colored(
+                "[Impact Executor] No commands executed yet — forcing command run.",
+                Colors.WARNING,
+            )
+            correction = HumanMessage(content=(
+                "You have not run any commands on the target yet. "
+                f"Call tool_session_command(\"{state.get('session_id', '?')}\", \"whoami\") "
+                "now to begin collecting evidence."
+            ))
+            forced = call_llm(
+                messages=executor_msgs + [response, correction],
+                system_prompt=executor_prompt,
+                tools=EXECUTOR_TOOLS,
+            )
+            return {"messages": [correction, forced]}
+
         # --- Defect 3: verification read-back enforcement ---
         # If the executor wrote a file (echo ... > /path  or  tee /path) but
         # never read it back (cat /path / ls of that path), force one more pass
@@ -471,7 +512,10 @@ def critic_node(state: ImpactState) -> dict:
 
     new_step = current_step + 1
     upper = verdict_text.upper()
-    if "VERDICT: PASS" in upper or ("PASS" in upper and "FAIL" not in upper):
+    # Strict parse: only "VERDICT: PASS" counts. The LLM is instructed to emit
+    # exactly that token. The old loose fallback ("PASS" anywhere with no "FAIL")
+    # matched the word PASS inside FEEDBACK/ASSESSMENT text and caused false PASS.
+    if "VERDICT: PASS" in upper:
         verdict = "PASS"
     else:
         verdict = "FAIL"
