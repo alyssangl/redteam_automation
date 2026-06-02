@@ -1795,6 +1795,29 @@ def _find_next(graph: AttackGraph, node_id: str, tried: set, log: logging.Logger
     return None
 
 
+def _is_retryable_failure(findings: dict) -> bool:
+    """Whether retrying the SAME node could plausibly help.
+
+    A retry is only meaningful if the failure was transient/state-dependent or if
+    the retry changes an input. For *deterministic, exhausted* failures, retrying
+    the identical node is pure waste — the walker should backtrack/replan to a
+    different vector instead. This is the conservative seed of the roadmap's
+    category-aware retry policy: it returns False ONLY for unambiguously
+    deterministic signals, leaving param-fixable failures (incompatible_payload,
+    wrong_targeturi) to the judge's 'adapt' path.
+    """
+    tech = str(findings.get("technique") or "").lower()
+    cat = str(findings.get("failure_category") or "").lower()
+    summary = str(findings.get("summary") or "").lower()
+    # privesc/escalate time-box: "no vector found within the budget" — deterministic
+    if tech == "timeout" or "time-boxed" in summary:
+        return False
+    # initial_access exhausted every distinct vector it could devise
+    if "fail_exhausted" in summary or cat == "exhausted":
+        return False
+    return True
+
+
 def _execute_node(
     node_id: str, graph: AttackGraph, log: logging.Logger,
     explore: bool, checkpoint_path: str, use_judge: bool = True,
@@ -1845,6 +1868,17 @@ def _execute_node(
             else:
                 reason = summary or "No success flag in findings"
                 node.mark_failed(reason)
+                # Category-aware retry (roadmap P1, conservative seed): for a
+                # deterministic/exhausted failure, retrying the identical node
+                # cannot help — short-circuit to let the walker backtrack/replan
+                # to a DIFFERENT vector instead of burning identical retries
+                # (and a judge LLM call).
+                if not _is_retryable_failure(findings):
+                    log.info(
+                        f"  [{node_id}] STATUS → failed (non-retryable / "
+                        f"deterministic): {reason}"
+                    )
+                    return False, "retries_exhausted"
                 if not node.can_retry:
                     log.error(f"  [{node_id}] STATUS → failed: {reason}")
                     return False, "retries_exhausted"
