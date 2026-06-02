@@ -34,7 +34,11 @@ from tools.rag import query_knowledge_base
 
 dotenv.load_dotenv()
 
-MODEL_NAME = "gpt-4o-mini"
+# Upgraded from gpt-4o-mini: the planner makes the most consequential decision
+# in this stage (scan strategy / service-specific approach) and mini frequently
+# violated the no-full-port-scan rule and mis-chose strategies despite critic
+# feedback. Match the reasoning-heavy components (orchestrator replanner/judge).
+MODEL_NAME = "gpt-4o"
 KALI_IP = "192.168.34.6"
 KALI_USER = "kali"
 KALI_PASS = "kali"
@@ -111,7 +115,10 @@ def run_ssh_command(command: str, timeout: int = RECON_SSH_TIMEOUT) -> str:
     except Exception as e:
         if "timed out" in str(e).lower():
             return f"SSH_TIMEOUT: command exceeded time limit — {command}"
-        return f"SSH Connection/Execution Error: {str(e)}"
+        # Embed the attempted command inside the error string so cross-cycle
+        # memory and the early-terminate guard can always recover it (auth
+        # failures / port-refused don't contain 'timed out').
+        return f"SSH_ERROR [{command}]: {str(e)}"
     finally:
         ssh.close()
 
@@ -443,12 +450,25 @@ def planner_node(state: ReconState) -> dict:
         # a full-port scan (-p- or -p 0-65535), which reliably times out. Detect any
         # forbidden full-range pattern on a line lacking --top-ports and replace the
         # whole plan with a safe two-phase fallback so we never burn the budget.
-        forbidden = re.compile(r'-p-(?:\s|$)|-p\s*0-65535|-p\s*1-65535|-p\s*0\s*-\s*65535')
+        # Catch `-p-` (all ports) plus ANY explicit numeric range wider than
+        # ~2000 ports (e.g. -p 0-65535, -p 1-65534, -p 1-10000). A narrow
+        # whitelist of exact strings let near-full ranges slip through and time
+        # out, so we compute the span and flag anything too wide.
+        full_dash = re.compile(r'-p-(?:\s|$)')
+        range_re = re.compile(r'-p\s*(\d+)\s*-\s*(\d+)')
         has_forbidden = False
         for line in plan_text.splitlines():
-            if forbidden.search(line) and "--top-ports" not in line:
+            if "--top-ports" in line:
+                continue
+            if full_dash.search(line):
                 has_forbidden = True
                 break
+            rng = range_re.search(line)
+            if rng:
+                lo, hi = int(rng.group(1)), int(rng.group(2))
+                if hi - lo > 2000:
+                    has_forbidden = True
+                    break
 
         if has_forbidden:
             target_ip = _extract_target_ip(state.get("plan", ""), state.get("goal", ""))
@@ -511,6 +531,11 @@ def executor_node(state: ReconState) -> dict:
     seen_cmds = set()
     cmd_re = re.compile(r"Executing:\s*(.+)")
     cmd_re_quoted = re.compile(r"Command '([^']+)'")
+    # Recover the exact command from the two SSH error formats too, otherwise
+    # timed-out / errored commands are silently dropped and the executor repeats
+    # them (the whole point of this memory is to say "do NOT repeat these").
+    cmd_re_timeout = re.compile(r"SSH_TIMEOUT:.*?—\s*(.+)")
+    cmd_re_ssh_err = re.compile(r"SSH_ERROR \[([^\]]+)\]")
     for msg in messages:
         if not isinstance(msg, ToolMessage) or not msg.content:
             continue
@@ -523,9 +548,22 @@ def executor_node(state: ReconState) -> dict:
             m2 = cmd_re_quoted.search(content)
             if m2:
                 cmd = m2.group(1).strip()
+            else:
+                m3 = cmd_re_timeout.search(content)
+                if m3:
+                    cmd = m3.group(1).strip()
+                else:
+                    m4 = cmd_re_ssh_err.search(content)
+                    if m4:
+                        cmd = m4.group(1).strip()
         if not cmd:
             continue
-        timed_out = ("SSH_TIMEOUT" in content) or ("timed out" in content.lower())
+        timed_out = (
+            ("SSH_TIMEOUT" in content)
+            or ("timed out" in content.lower())
+            or ("SSH Connection/Execution Error" in content)
+            or ("SSH_ERROR [" in content)
+        )
         if cmd not in seen_cmds:
             seen_cmds.add(cmd)
             attempted.append((cmd, timed_out))
@@ -533,7 +571,7 @@ def executor_node(state: ReconState) -> dict:
     if attempted:
         summary_lines = []
         for cmd, timed_out in attempted[-15:]:
-            status = "TIMED OUT (do NOT repeat)" if timed_out else "completed"
+            status = "FAILED/TIMED OUT (do NOT repeat)" if timed_out else "completed"
             summary_lines.append(f"- {cmd}  [{status}]")
         memory_msg = HumanMessage(content=(
             "PREVIOUSLY ATTEMPTED COMMANDS (DO NOT REPEAT ANY THAT TIMED OUT; "
@@ -559,7 +597,10 @@ def executor_node(state: ReconState) -> dict:
         executor_tool_count >= 2
         and len(recent_tool_msgs) >= 2
         and all(
-            ("SSH_TIMEOUT" in c) or ("timed out" in c.lower())
+            ("SSH_TIMEOUT" in c)
+            or ("timed out" in c.lower())
+            or ("SSH Connection/Execution Error" in c)
+            or ("SSH_ERROR [" in c)
             for c in recent_tool_msgs
         )
     ):

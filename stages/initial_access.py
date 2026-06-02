@@ -348,20 +348,30 @@ You have access to the Metasploit console and a Linux terminal. Execute the atta
 3. If you see "session X opened" — that is SUCCESS. Report it immediately.
 4. If you see "no session was created", "Exploit failed", or "Connection refused" — that is FAILURE
 5. Do NOT blindly run the full sequence — adapt based on output
-6. After obtaining a session, run 'exit' to background it
-7. When done (success or failure), provide a text assessment of what happened
+6. **MANDATORY IDENTITY STEP**: After a session opens, and BEFORE you run 'exit'
+   to background it, you MUST run 'id' inside that session to capture the
+   target identity. For MSF, do this with one command via tool_metasploit_rpc:
+   'sessions -i <id> id' (or interact with 'sessions -i <id>', run 'id', then
+   background). For a command_shell you can also use a single
+   run_session_command of 'id'. Quote the resulting 'uid=...' line in your text
+   assessment. Skipping this loses the access-level / identity evidence.
+7. After obtaining a session AND running 'id', run 'exit' to background it
+8. When done (success or failure), provide a text assessment of what happened
 
 **Error Recovery:**
-8. When you see a [SYSTEM HINT] in tool output, follow its instructions immediately — do NOT skip it
-9. If you hit the same error twice (even with different payloads), STOP and provide a text assessment.
-   Module/environment errors (e.g., "directory not writable", "Exploit aborted") cannot be fixed by
-   switching payloads — report the failure and let the critic route to a different exploit
-10. General best practice: after `use <module>`, run `show payloads` EARLY to discover compatible payloads
+9. When you see a [SYSTEM HINT] in tool output, follow its instructions immediately — do NOT skip it
+10. If a [SYSTEM HINT] tells you to try a different TARGETURI, do NOT give up — set a
+    new TARGETURI value (e.g. /var/www/html, /var/www, /login, /app) and re-run the
+    SAME module before abandoning it. Only stop once several TARGETURI values have failed.
+11. If you hit the same module-level error twice with the SAME options, STOP and provide a text assessment.
+    Module/environment errors (e.g., "directory not writable", "Exploit aborted") cannot be fixed by
+    switching payloads — report the failure and let the critic route to a different exploit
+12. General best practice: after `use <module>`, run `show payloads` EARLY to discover compatible payloads
 
 **Manual Attack Rules:**
-11. Do NOT install packages (no apt-get, no pip, no gem). Use only tools already available on Kali.
-12. If the attack plan specifies a MANUAL approach (not MSF), use `tool_linux_terminal` for all commands instead of `tool_metasploit_rpc`.
-13. For listener setup in manual mode, use backgrounded commands (e.g., `nohup nc -lvnp 4444 > /tmp/shell_output.txt 2>&1 &`) to avoid blocking the terminal.
+13. Do NOT install packages (no apt-get, no pip, no gem). Use only tools already available on Kali.
+14. If the attack plan specifies a MANUAL approach (not MSF), use `tool_linux_terminal` for all commands instead of `tool_metasploit_rpc`.
+15. For listener setup in manual mode, use backgrounded commands (e.g., `nohup nc -lvnp 4444 > /tmp/shell_output.txt 2>&1 &`) to avoid blocking the terminal.
 
 **Success indicators:** "Command shell session X opened", "Meterpreter session X opened"
 **Failure indicators:** "Exploit completed, but no session", "Connection refused", "Unknown command"
@@ -1075,12 +1085,33 @@ def executor_node(state: AgentState) -> dict:
     print_colored("\n[Executor] Running attack sequence...", Colors.HEADER)
 
     # --- ANTI-REPEAT PRE-CHECK ---
-    # If the same module has already been `use`d 2+ times in this executor cycle,
-    # the LLM is looping. Force the safety-valve assessment path regardless of
-    # the tool-call count so the critic can route to a different exploit.
+    # If the same module has been `use`d 2+ times in this cycle WITH THE SAME
+    # TARGETURI, the LLM is genuinely looping. Force the safety-valve assessment
+    # path so the critic can route to a different exploit. We key on
+    # (module, TARGETURI) so that re-running the same module with a NEW TARGETURI
+    # (a legitimate URI-sweep retry) does NOT trip the valve prematurely.
     prior_cmds = _collect_executor_commands(messages)
     module_use_counts = _count_module_uses(prior_cmds)
-    repeated_module = next((mod for mod, n in module_use_counts.items() if n >= 2), None)
+    pair_counts = {}
+    _cur_uri = None
+    for _c in prior_cmds:
+        _u = _extract_targeturi(_c)
+        if _u is not None:
+            _cur_uri = _u
+        _mm = re.search(r'\buse\s+(\S+)', _c)
+        if _mm:
+            _key = (_mm.group(1).strip(), _cur_uri)
+            pair_counts[_key] = pair_counts.get(_key, 0) + 1
+            _cur_uri = None
+    repeated_pair = next((k for k, n in pair_counts.items() if n >= 2), None)
+    repeated_module = repeated_pair[0] if repeated_pair else None
+    # Hard cap: even across DIFFERENT TARGETURIs, do not let one module run more
+    # than 4 times this cycle (URI sweep is finite). This preserves the loop
+    # protection while allowing a handful of distinct-URI retries.
+    if not repeated_module:
+        repeated_module = next(
+            (mod for mod, n in module_use_counts.items() if n >= 4), None
+        )
 
     # Count how many tool calls the executor has made in this cycle
     executor_tool_count = 0
@@ -1135,20 +1166,56 @@ def executor_node(state: AgentState) -> dict:
     return {"messages": [response]}
 
 
+def _extract_targeturi(cmd: str):
+    """Extract the TARGETURI value from a command string, or None if absent."""
+    m = re.search(r'set\s+TARGETURI\s+(\S+)', cmd, re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
+
+def _collect_module_targeturi_pairs(messages) -> set:
+    """Build the set of (module, targeturi) fingerprints already attempted.
+
+    A module run is keyed by the module name AND the TARGETURI most recently
+    `set` before that module's `use` in the command stream. TARGETURI of None
+    (module that takes no URI / none was set) is its own distinct fingerprint.
+    This lets the executor retry the SAME module with a DIFFERENT TARGETURI
+    (e.g. /var/www, /login) without tripping the anti-repeat guard.
+    """
+    cmds = _collect_executor_commands(messages)
+    pairs = set()
+    current_uri = None
+    for c in cmds:
+        uri = _extract_targeturi(c)
+        if uri is not None:
+            current_uri = uri
+        mm = re.search(r'\buse\s+(\S+)', c)
+        if mm:
+            mod = mm.group(1).strip()
+            pairs.add((mod, current_uri))
+            current_uri = None  # reset for the next module's options
+    return pairs
+
+
 def executor_tools_node(state: AgentState) -> dict:
     """Execute MSF/SSH tool calls with LLM-based error recovery hints."""
-    # Snapshot the `use <module>` commands already issued BEFORE this batch so we
-    # can detect when the executor re-runs a module it has already tried.
-    prior_modules = set(_count_module_uses(_collect_executor_commands(state["messages"])).keys())
+    # Snapshot (module, TARGETURI) fingerprints already issued BEFORE this batch
+    # so we can detect when the executor re-runs the SAME module with the SAME
+    # TARGETURI — while still allowing it to retry the same module with a
+    # DIFFERENT TARGETURI value.
+    prior_pairs = _collect_module_targeturi_pairs(state["messages"])
 
     # The current AIMessage's tool calls are the about-to-run batch; capture the
-    # module(s) it is invoking so we can flag a repeat.
+    # module(s) and TARGETURI it is invoking so we can flag an exact repeat.
     current_module = None
+    current_uri = None
     last = state["messages"][-1] if state["messages"] else None
     if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
         for tc in last.tool_calls:
             args = tc.get("args", {}) if isinstance(tc, dict) else {}
             cmd = str(args.get("command", ""))
+            uri = _extract_targeturi(cmd)
+            if uri is not None:
+                current_uri = uri
             mm = re.search(r'\buse\s+(\S+)', cmd)
             if mm:
                 current_module = mm.group(1).strip()
@@ -1156,18 +1223,25 @@ def executor_tools_node(state: AgentState) -> dict:
     tool_node = ToolNode(EXECUTOR_TOOLS)
     result = tool_node.invoke(state)
 
-    repeat_detected = bool(current_module and current_module in prior_modules)
+    # Only a repeat when the SAME module AND the SAME TARGETURI were already
+    # tried. A new TARGETURI for the same module is a legitimate retry.
+    repeat_detected = bool(
+        current_module and (current_module, current_uri) in prior_pairs
+    )
 
     if "messages" in result:
         for msg in result["messages"]:
             if isinstance(msg, ToolMessage) and msg.content:
-                # --- ANTI-REPEAT: same module already tried this cycle ---
+                # --- ANTI-REPEAT: same module + same TARGETURI already tried ---
                 if repeat_detected:
                     msg.content += (
                         "\n\n[SYSTEM HINT: You have already tried this exact module "
-                        f"('{current_module}') with these options. STOP making more tool "
-                        "calls and provide a failure text assessment immediately. The "
-                        "critic will route to a different exploit.]"
+                        f"('{current_module}') with the same TARGETURI — try a "
+                        "different TARGETURI value (/var/www/html, /var/www, /login) "
+                        "before giving up. If you have already tried several "
+                        "TARGETURI values, STOP making tool calls and provide a "
+                        "failure text assessment; the critic will route to a "
+                        "different exploit.]"
                     )
                 # --- SESSION DETECTION: tell executor to STOP ---
                 if re.search(r'session \d+ opened', msg.content, re.IGNORECASE):
@@ -1380,11 +1454,23 @@ def _extract_findings(state: dict) -> ExploitationFindings:
     critic_verdict = state.get("critic_verdict", "")
     messages = state.get("messages", [])
 
-    # --- session_id and session_type from message history ---
+    # --- Restrict session/exploit scans to the CURRENT (last) executor cycle ---
+    # Find the index of the last [Parameter Solver] marker. The critic uses the
+    # same window; scanning earlier messages lets a session-opened string from a
+    # PRIOR iteration leak into the findings of a later (failed) attempt
+    # (defect: stale session_id="3" on success=false runs).
+    ps_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if isinstance(m, AIMessage) and "[Parameter Solver]" in (m.content or ""):
+            ps_idx = i
+            break
+    cycle_msgs = messages[ps_idx + 1:] if ps_idx >= 0 else messages
+
+    # --- session_id and session_type from CURRENT-cycle tool outputs only ---
     session_id = ""
     session_type = ""
-    # Scan all messages (tool outputs) for session-opened indicators
-    for msg in reversed(messages):
+    for msg in reversed(cycle_msgs):
         content = msg.content if hasattr(msg, "content") and msg.content else ""
         match = re.search(
             r"(Command shell|Meterpreter) session (\d+) opened", content
@@ -1399,6 +1485,39 @@ def _extract_findings(state: dict) -> ExploitationFindings:
     # session (should no longer happen now that FAIL_EXHAUSTED exists, but
     # defend anyway) must NOT be reported as success.
     success = (critic_verdict == "PASS") and bool(session_id)
+
+    # --- LIVENESS CHECK: a session that died before handoff is a phantom PASS ---
+    # The next stage (escalate) immediately fails with "session N is no longer
+    # active" when an unstable command_shell dies. Verify the session is still
+    # live before declaring success; if not, downgrade to an honest FAIL so the
+    # orchestrator can retry instead of handing off a dead session.
+    if success and session_id:
+        alive = False
+        try:
+            probe = str(msf_session.run_session_command(session_id, "echo __alive__"))
+            if "__alive__" in probe:
+                alive = True
+            else:
+                # Some shells echo nothing useful; fall back to a type query.
+                try:
+                    stype = msf_session.get_session_type(session_id)
+                    alive = bool(stype)
+                except Exception:
+                    alive = False
+        except Exception as e:
+            print_colored(
+                f"[Liveness Check] session {session_id} probe failed: {e}",
+                Colors.WARNING,
+            )
+            alive = False
+        if not alive:
+            print_colored(
+                f"[Liveness Check] session {session_id} opened but is no longer "
+                f"active — downgrading phantom PASS to FAIL.",
+                Colors.WARNING,
+            )
+            success = False
+            critic_verdict = "FAIL_DEAD_SESSION"  # local-only; not routed
 
     # --- target_ip ---
     target_ip = target_info.get("ip", "unknown")
@@ -1415,9 +1534,23 @@ def _extract_findings(state: dict) -> ExploitationFindings:
         target_port = str(ports[0].get("port", ""))
 
     # --- exploit_used ---
+    # Prefer the LAST module the executor actually ran (`use <module>` in a tool
+    # call) over the planner's tool_candidate, which is overwritten each retry and
+    # may name a module that was never executed on the failing attempt.
     approach = tool_candidate.get("approach", "msf")
     module = tool_candidate.get("module")
-    if approach == "manual":
+    last_used_module = None
+    for c in reversed(_collect_executor_commands(messages)):
+        mm = re.search(r'\buse\s+(\S+)', c)
+        if mm:
+            candidate = mm.group(1).strip()
+            # Only trust module-looking paths, not bare words.
+            if "/" in candidate:
+                last_used_module = candidate
+                break
+    if last_used_module:
+        exploit_used = last_used_module
+    elif approach == "manual":
         desc = tool_candidate.get("description", "manual exploitation")
         exploit_used = f"manual:{desc}"
     elif module:
@@ -1466,7 +1599,11 @@ def _extract_findings(state: dict) -> ExploitationFindings:
         summary = f"Attack failed on {target_ip}. {fail_summary}".strip()
 
     # --- failure classification + session identity (for replanner) ---
-    session_user_info = _extract_session_user_info(messages)
+    # Scan the current cycle first (so a prior iteration's uid= line cannot leak
+    # in), falling back to the full history only if nothing is found this cycle.
+    session_user_info = _extract_session_user_info(cycle_msgs)
+    if not session_user_info:
+        session_user_info = _extract_session_user_info(messages)
     # Raw command shells (ProFTPD mod_copy, Samba) often produce no `uid=` line
     # in any ToolMessage — the executor never ran `id`. If we have a confirmed
     # session but no identity, query it directly via the session API. Wrapped so
@@ -1488,8 +1625,21 @@ def _extract_findings(state: dict) -> ExploitationFindings:
     if success:
         failure_category = ""
         failure_cause = ""
+    elif critic_verdict == "FAIL_DEAD_SESSION":
+        # Phantom-PASS downgrade: a session opened but died before handoff.
+        failure_category = "generic"
+        failure_cause = "session opened but died before handoff"
     else:
         failure_category, failure_cause = _classify_failure_from_messages(messages)
+
+    # --- DEFECT GUARD: a failed run must NEVER expose a (possibly stale) session ---
+    # If this is not a confirmed success, blank out session identity fields so a
+    # leftover session-opened string from a prior iteration cannot leak into the
+    # findings the orchestrator consumes.
+    if not success:
+        session_id = ""
+        session_type = ""
+        session_user_info = {}
 
     return ExploitationFindings(
         success=success,

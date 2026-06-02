@@ -65,6 +65,7 @@ class ImpactState(TypedDict):
     loop_step: int
     critic_verdict: str        # "PASS" | "FAIL"
     _verify_prompted: bool     # guard: read-back reminder already injected
+    _session_dead_prompted: bool  # guard: dead-session recovery reminder injected
 
 # =============================================================================
 # TOOL DEFINITIONS
@@ -109,6 +110,30 @@ def tool_metasploit_rpc(command: str):
 # Tool sets
 PLANNER_TOOLS = [query_knowledge_base]
 EXECUTOR_TOOLS = [tool_linux_terminal, tool_metasploit_rpc, tool_session_command]
+
+# Patterns that indicate a session is dead / unreachable / returned nothing.
+_DEAD_SESSION_PATTERNS = re.compile(
+    r'(session\s*(?:id\s*)?\d*\s*(?:is\s*)?(?:no\s*longer\s*)?(?:not\s*)?(?:active|alive|valid)'
+    r'|no\s+session|session\s+\d+\s+(?:closed|not\s+found|does\s+not\s+exist|died)'
+    r'|invalid\s+session|unknown\s+session|failed\s+to\s+(?:read|interact))',
+    re.IGNORECASE,
+)
+
+
+def _result_is_dead_or_empty(content: str) -> bool:
+    """True if a tool result looks like a dead session or yielded no usable output."""
+    if content is None:
+        return True
+    text = str(content).strip()
+    if not text:
+        return True
+    # Common silent-shell / no-output markers.
+    low = text.lower()
+    if low in ("(no output)", "no output", "none", "null"):
+        return True
+    if _DEAD_SESSION_PATTERNS.search(text):
+        return True
+    return False
 
 # =============================================================================
 # SYSTEM PROMPTS
@@ -158,6 +183,23 @@ For "demonstrate full control" objectives:
 3. Read SSH keys, application configs, database creds via tool_session_command
 4. Create proof bundle: system info + credentials + network info
 
+**SESSION HEALTH — plan for an unstable session:**
+The shell you inherited may be dead, silent, or non-interactive. Before
+committing to a long impact plan, account for recovery:
+1. If session commands return empty output or a "session not active / no
+   session" error, the plan must FIRST call `tool_metasploit_rpc("sessions")`
+   to list active sessions.
+2. If a DIFFERENT session ID is alive, switch to it — use that ID for all
+   subsequent `tool_session_command` calls.
+3. If the inherited shell is a non-interactive `command_shell` returning no
+   output, try `tool_metasploit_rpc("sessions -u <id>")` to upgrade it to a
+   meterpreter session, then re-list sessions to get the new ID.
+4. If no session is alive and access_level was `root` or the shell came from a
+   noisy/unstable exploit (e.g. an IRC/UnrealIRCd backdoor, mod_copy ProFTPD
+   shell), consider re-exploiting via `tool_metasploit_rpc` to regain a shell.
+5. Only fall back to reporting failure if no session can be recovered after one
+   recovery attempt.
+
 **Output format (final answer — no more tool calls):**
 
 IMPACT PLAN:
@@ -201,6 +243,18 @@ Do NOT use `tool_linux_terminal` for target commands — that runs on Kali, not 
    → Output: "COMPROMISED by Red Team" (verifies file creation)
 
 **Your job:** Execute the impact plan and collect concrete proof ON THE TARGET.
+
+**STEP 0 (shell stability check):**
+If your first `whoami` call returns empty / "(no output)", the shell may be
+non-interactive or dead. Confirm with `tool_session_command("{session_id}", "echo ALIVE")`.
+- If that ALSO returns empty, call `tool_metasploit_rpc("sessions")` to see what
+  is alive. If a different session ID is live, use it for all further commands.
+- If only this silent shell exists, call
+  `tool_metasploit_rpc("sessions -u {session_id}")` to upgrade it to meterpreter,
+  then call `tool_metasploit_rpc("sessions")` to read the NEW session ID and use
+  that ID going forward.
+- If the upgrade fails and no live session remains, state clearly in your summary
+  that the shell is unstable/dead and report failure — do NOT fabricate output.
 
 **Rules:**
 1. Execute commands ONE AT A TIME via tools
@@ -333,7 +387,11 @@ def planner_node(state: ImpactState) -> dict:
             "_verify_prompted": False,
         }
 
-    return {"messages": [response]}
+    # RAG-in-flight path (planner emitted tool_calls). Always reset the
+    # write-verification guard here too: _verify_prompted accumulates via
+    # operator.add, so without resetting on EVERY planner return it stays True
+    # forever once tripped, permanently disabling the executor's read-back check.
+    return {"messages": [response], "_verify_prompted": False}
 
 
 def executor_node(state: ImpactState) -> dict:
@@ -388,11 +446,53 @@ def executor_node(state: ImpactState) -> dict:
         # must NOT set impact_result (the critic would grade planning text as
         # evidence). Inject a correction and route back through the tools once.
         real_tool_count = 0
+        executor_results = []
         for m in executor_msgs:
             if isinstance(m, ToolMessage) and getattr(m, "name", "") in (
                 "tool_session_command", "tool_linux_terminal", "tool_metasploit_rpc"
             ):
                 real_tool_count += 1
+                executor_results.append(m)
+
+        # --- Defect (executor): dead-session / empty-output detection ---
+        # The session can die mid-cycle: the first command returns real output,
+        # then every later tool_session_command returns "" or a dead-session
+        # token. With real_tool_count > 0 the no-execution guard above does not
+        # fire, so the LLM would summarize fabricated results from empty
+        # evidence. Detect when the MAJORITY of this cycle's results are dead or
+        # empty and force a session re-discovery + switch (once, guarded).
+        if real_tool_count > 0 and not state.get("_session_dead_prompted", False):
+            dead_count = sum(
+                1 for m in executor_results if _result_is_dead_or_empty(m.content)
+            )
+            if dead_count * 2 >= real_tool_count:  # majority (>=50%) dead/empty
+                print_colored(
+                    f"[Impact Executor] {dead_count}/{real_tool_count} results dead/empty "
+                    "— forcing session recovery.",
+                    Colors.WARNING,
+                )
+                recover = HumanMessage(content=(
+                    "The session appears to be dead or silent (commands returned no "
+                    "usable output). Do NOT summarize from empty evidence. First call "
+                    "tool_metasploit_rpc(\"sessions\") to list live sessions. If a "
+                    "different session ID is alive, switch to it for subsequent "
+                    "tool_session_command calls and re-gather evidence. If the current "
+                    "shell is a non-interactive command_shell, try "
+                    f"tool_metasploit_rpc(\"sessions -u {state.get('session_id', '?')}\") "
+                    "to upgrade it to meterpreter, then re-list sessions for the new ID. "
+                    "If no session can be recovered after one attempt, report failure "
+                    "with an explanation in your summary."
+                ))
+                recovered = call_llm(
+                    messages=executor_msgs + [response, recover],
+                    system_prompt=executor_prompt,
+                    tools=EXECUTOR_TOOLS,
+                )
+                return {
+                    "messages": [recover, recovered],
+                    "_session_dead_prompted": True,
+                }
+
         if real_tool_count == 0 and not state.get("_verify_prompted", False):
             print_colored(
                 "[Impact Executor] No commands executed yet — forcing command run.",
@@ -434,6 +534,22 @@ def executor_node(state: ImpactState) -> dict:
                     rm = re.search(r'\b(?:cat|ls|head|tail|stat)\b[^\n]*?(/\S+)', cmd)
                     if rm:
                         verified_paths.add(rm.group(1))
+            # Also scan ToolMessage CONTENT: writes done via tool_metasploit_rpc
+            # (session -c 'echo x > /p') or tool_linux_terminal (scp) never put a
+            # "> /path" pattern into the session_command args, so the tool_calls
+            # scan above misses them. Catch redirects echoed back in the output.
+            for m in executor_msgs:
+                if not isinstance(m, ToolMessage):
+                    continue
+                if getattr(m, "name", "") not in (
+                    "tool_session_command", "tool_metasploit_rpc", "tool_linux_terminal"
+                ):
+                    continue
+                cmd_content = m.content or ""
+                for wm in re.finditer(r'>>?\s*(/\S+)', cmd_content):
+                    written_paths.append(wm.group(1))
+                for tm in re.finditer(r'tee\s+(?:-a\s+)?(/\S+)', cmd_content):
+                    written_paths.append(tm.group(1))
             unverified = [p for p in written_paths if p not in verified_paths]
             if unverified:
                 print_colored(
@@ -716,6 +832,7 @@ def run_impact(
         "loop_step": 0,
         "critic_verdict": "",
         "_verify_prompted": False,
+        "_session_dead_prompted": False,
     }
 
     print_colored(f"\n{'='*60}", Colors.HEADER)
@@ -731,7 +848,10 @@ def run_impact(
     try:
         session_check = msf_session.send_command(f"sessions")
         session_check_str = str(session_check)
-        if session_id not in session_check_str:
+        # Line-anchored match: MSF `sessions` lists the ID as a standalone token
+        # at the start of a line ("3  shell ..."). A bare substring check would
+        # false-positive when session_id='3' but only sessions 13/30 are alive.
+        if not re.search(r'(?m)^\s*' + re.escape(str(session_id)) + r'\s', session_check_str):
             print_colored(f"[Impact] Session {session_id} NOT found in active sessions — skipping impact.", Colors.WARNING)
             print_colored(f"[Impact] Active sessions output: {session_check_str[:300]}", Colors.WARNING)
             return ImpactFindings(

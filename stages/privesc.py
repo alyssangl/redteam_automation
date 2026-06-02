@@ -213,6 +213,12 @@ Only use `tool_linux_terminal` for Kali-side tasks (hosting exploits, starting l
 
 **Your job:** Execute the escalation plan step by step ON THE TARGET.
 
+**Session recovery:** If `tool_session_command` returns "Error: Session X not found", the session died mid-execution. Immediately:
+1. Call `tool_metasploit_rpc('sessions')` to list all active sessions.
+2. If a session to the target exists, switch to that session_id for all subsequent commands.
+3. If no session exists, stop and report 'SESSION LOST — escalation aborted mid-execution' so the critic can classify it correctly.
+Do NOT continue executing plan steps against a dead session.
+
 **Rules:**
 1. Execute commands ONE AT A TIME
 2. READ each output carefully
@@ -832,6 +838,75 @@ def run_privesc(
         "recursion_limit": recursion_limit,
     }
 
+    # --- Session health check: verify session is still alive ---
+    # Use a DIRECT RPC call (session.list) — instantaneous and authoritative.
+    # The old `msf_session.send_command("sessions -l")` routed through the MSF
+    # console, which blocks up to the 60s console timeout and returns empty
+    # output when the console is busy (e.g. still finishing the exploit that
+    # just created this session), causing a FALSE dead-session detection.
+    #
+    # Runs BEFORE initial_state is built so that if we swap to an alternative
+    # session, the new session_id propagates into the graph state.
+    def _decode(v):
+        if isinstance(v, bytes):
+            return v.decode("utf-8", errors="ignore")
+        return v if v is not None else ""
+
+    def _session_conn_str(sdata: dict) -> str:
+        """Build a best-effort connection/identity string for a session dict so
+        we can match it against the target IP. Handles both bytes and str keys
+        (msgpack decoding varies)."""
+        parts = []
+        for k in (b"tunnel_peer", "tunnel_peer", b"session_host", "session_host",
+                  b"target_host", "target_host", b"tunnel_local", "tunnel_local"):
+            if isinstance(sdata, dict) and k in sdata:
+                parts.append(_decode(sdata.get(k)))
+        return " ".join(str(p) for p in parts)
+
+    sl = {}
+    alive = True  # optimistic default if the check itself errors
+    try:
+        sl = msf_session.client.call("session.list") or {}
+        alive = any(str(k) == str(session_id) for k in sl)
+    except Exception as e:
+        print_colored(f"[PrivEsc] Session list check failed: {e}", Colors.WARNING)
+        alive = True  # optimistic: proceed and let the graph discover the truth
+
+    if not alive:
+        # Defect #2: before a hard abort, scan for ANY live session to the same
+        # target (a newer session may have been created by a different exploit
+        # attempt). Swap to it and continue into the graph rather than giving up.
+        alt_id = None
+        try:
+            for sid_key, sdata in sl.items():
+                conn = _session_conn_str(sdata)
+                if target_ip and target_ip in conn:
+                    alt_id = str(sid_key)
+                    break
+        except Exception as e:
+            print_colored(f"[PrivEsc] Alternative-session scan failed: {e}", Colors.WARNING)
+
+        if alt_id:
+            print_colored(
+                f"[PrivEsc] Original session {session_id} dead; using alternative "
+                f"session {alt_id} to {target_ip}.",
+                Colors.WARNING,
+            )
+            session_id = alt_id  # update for the graph run below (flows into initial_state)
+        else:
+            print_colored(
+                f"[PrivEsc] Session {session_id} is DEAD and no alternative session "
+                f"to {target_ip} exists — skipping privesc.",
+                Colors.WARNING,
+            )
+            return PrivEscFindings(
+                success=False,
+                technique="session_lost",
+                previous_level=access_level,
+                new_level=access_level,
+                summary=f"PrivEsc skipped — session {session_id} is no longer active.",
+            )
+
     initial_state = {
         "messages": [HumanMessage(content=(
             f"Escalate privileges on {target_ip}.\n"
@@ -861,27 +936,6 @@ def run_privesc(
     print_colored(f"  OS: {os_info}", Colors.HEADER)
     print_colored(f"  Thread: {thread_id}", Colors.HEADER)
     print_colored(f"{'='*60}\n", Colors.HEADER)
-
-    # --- Session health check: verify session is still alive ---
-    # Use a plain `sessions` list (NEVER `-i`, which switches the console INTO
-    # the session and blocks until Ctrl-C) and scan for the session_id.
-    try:
-        session_check = msf_session.send_command("sessions -l")
-        session_check_str = str(session_check).lower()
-        sid = str(session_id).strip().lower()
-        alive = bool(re.search(rf"(^|\s){re.escape(sid)}(\s)", session_check_str))
-        no_sessions = "no active sessions" in session_check_str
-        if no_sessions or (sid and not alive):
-            print_colored(f"[PrivEsc] Session {session_id} is DEAD — skipping privesc.", Colors.WARNING)
-            return PrivEscFindings(
-                success=False,
-                technique="session_lost",
-                previous_level=access_level,
-                new_level=access_level,
-                summary=f"PrivEsc skipped — session {session_id} is no longer active.",
-            )
-    except Exception as e:
-        print_colored(f"[PrivEsc] Session health check failed: {e}", Colors.WARNING)
 
     try:
         for event in app.stream(initial_state, config=config):
