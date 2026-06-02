@@ -50,6 +50,12 @@ MAX_PRIVESC_RETRIES = 8
 MAX_ENUM_TOOL_CALLS = 8
 MAX_PLANNER_TOOL_CALLS = 5
 MAX_EXECUTOR_TOOL_CALLS = 12
+# v7: hard wall-clock cap on the WHOLE escalate attempt. With the crash fixed,
+# privesc honestly exhausts vectors against a non-root user, which can run for
+# tens of minutes and blow the orchestrator's per-node budget. When this cap is
+# hit we stop streaming and return best-effort findings (clean "couldn't
+# escalate"), so the graph still reaches EXECUTION COMPLETE.
+PRIVESC_WALLCLOCK_TIMEOUT = 300  # seconds
 
 # =============================================================================
 # STATE
@@ -1294,8 +1300,17 @@ def run_privesc(
     print_colored(f"  Thread: {thread_id}", Colors.HEADER)
     print_colored(f"{'='*60}\n", Colors.HEADER)
 
+    _start = time.time()
+    _timed_out = False
     try:
         for event in app.stream(initial_state, config=config):
+            if time.time() - _start > PRIVESC_WALLCLOCK_TIMEOUT:
+                print_colored(
+                    f"\n[PrivEsc] TIME-BOX hit ({PRIVESC_WALLCLOCK_TIMEOUT}s) — "
+                    f"stopping escalation, returning best-effort findings.",
+                    Colors.WARNING)
+                _timed_out = True
+                break
             for key, value in event.items():
                 if not value or "messages" not in value:
                     continue
@@ -1345,6 +1360,12 @@ def run_privesc(
     final_state = final_snapshot.values
 
     findings = _extract_privesc_findings(final_state)
+    if _timed_out and not findings.get("success"):
+        findings["technique"] = findings.get("technique") or "timeout"
+        findings["summary"] = (
+            f"Escalation time-boxed at {PRIVESC_WALLCLOCK_TIMEOUT}s without "
+            f"reaching root. " + findings.get("summary", "")
+        )
 
     print_colored(f"\n{'='*60}", Colors.HEADER)
     print_colored(
