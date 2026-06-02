@@ -138,6 +138,7 @@ Do NOT use `tool_metasploit_rpc` for target commands — use it only for MSF con
 4. **Cron jobs**: `cat /etc/crontab`
 5. **Kernel version**: `uname -r` (for kernel exploit matching)
 6. **Running processes**: `ps aux | head -30`
+7. **Capabilities**: `getcap -r / 2>/dev/null` (cap_setuid/cap_net_raw etc.)
 
 **Rules:**
 1. Execute commands ONE AT A TIME
@@ -154,6 +155,7 @@ ENUMERATION RESULTS:
 - Sudo rights: <what sudo -l returned>
 - SUID binaries: <notable ones>
 - Cron jobs: <any writable or interesting>
+- Capabilities: <any cap_setuid/cap_net_raw etc.>
 - Other vectors: <anything else found>
 - RECOMMENDED VECTORS: <top 2-3 most promising escalation paths>
 """
@@ -272,12 +274,13 @@ def enumerator_node(state: PrivEscState) -> dict:
     messages = state["messages"]
     print_colored("\n[PrivEsc Enumerator] Scanning for escalation vectors...", Colors.HEADER)
 
-    # Count enum tool calls
+    # Count enum tool calls in the CURRENT enum turn only.
+    # Stop at a HumanMessage that is NOT a CRITIC FEEDBACK message (the turn
+    # boundary). A CRITIC FEEDBACK message must NOT stop the scan, otherwise the
+    # count is always 0 on retries and the cap never engages.
     enum_tool_count = 0
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage) and "CRITIC FEEDBACK" not in msg.content:
-            break
-        if isinstance(msg, HumanMessage) and "CRITIC FEEDBACK" in msg.content:
             break
         if isinstance(msg, ToolMessage):
             enum_tool_count += 1
@@ -328,9 +331,13 @@ def planner_node(state: PrivEscState) -> dict:
     messages = state["messages"]
     print_colored("\n[PrivEsc Planner] Selecting technique...", Colors.HEADER)
 
+    # Count RAG calls in the CURRENT planning turn only. Stop at the most recent
+    # enumerator handoff OR a CRITIC FEEDBACK message (whichever is later), so
+    # prior planner passes don't accumulate and prematurely trip the cap.
     planner_tool_count = 0
     for msg in reversed(messages):
-        if isinstance(msg, AIMessage) and "[PrivEsc Enumerator]" in (msg.content or ""):
+        if (isinstance(msg, AIMessage) and "[PrivEsc Enumerator]" in (msg.content or "")) or \
+           (isinstance(msg, HumanMessage) and "CRITIC FEEDBACK" in msg.content):
             break
         if isinstance(msg, ToolMessage):
             planner_tool_count += 1
@@ -349,10 +356,13 @@ def planner_node(state: PrivEscState) -> dict:
                 break
         planner_msgs = [HumanMessage(content=context)]
     else:
-        # Continuing ReAct
+        # Continuing ReAct — start from the current planning turn boundary
+        # (most recent enumerator handoff or CRITIC FEEDBACK message).
         start = 0
         for i in range(len(messages) - 1, -1, -1):
-            if isinstance(messages[i], AIMessage) and "[PrivEsc Enumerator]" in (messages[i].content or ""):
+            mi = messages[i]
+            if (isinstance(mi, AIMessage) and "[PrivEsc Enumerator]" in (mi.content or "")) or \
+               (isinstance(mi, HumanMessage) and "CRITIC FEEDBACK" in (mi.content or "")):
                 start = i
                 break
         planner_msgs = list(messages[start:])
@@ -385,21 +395,29 @@ def executor_node(state: PrivEscState) -> dict:
     messages = state["messages"]
     print_colored("\n[PrivEsc Executor] Running escalation...", Colors.HEADER)
 
+    # Count tool calls in the CURRENT executor turn only. Stop at the most recent
+    # planner handoff OR CRITIC FEEDBACK message (whichever is later) so prior
+    # executor turns don't accumulate and prematurely trip the cap on retries.
     executor_tool_count = 0
     for msg in reversed(messages):
-        if isinstance(msg, AIMessage) and "[PrivEsc Planner]" in (msg.content or ""):
+        if (isinstance(msg, AIMessage) and "[PrivEsc Planner]" in (msg.content or "")) or \
+           (isinstance(msg, HumanMessage) and "CRITIC FEEDBACK" in msg.content):
             break
         if isinstance(msg, ToolMessage):
             executor_tool_count += 1
 
-    executor_msgs = []
-    capturing = False
-    for msg in messages:
-        if isinstance(msg, AIMessage) and "[PrivEsc Planner]" in (msg.content or ""):
-            capturing = True
-        if capturing:
-            executor_msgs.append(msg)
-    if not executor_msgs:
+    # Build the executor context starting at the current turn boundary: the LAST
+    # planner handoff or CRITIC FEEDBACK message, whichever appears later.
+    start = None
+    for i in range(len(messages) - 1, -1, -1):
+        mi = messages[i]
+        if (isinstance(mi, AIMessage) and "[PrivEsc Planner]" in (mi.content or "")) or \
+           (isinstance(mi, HumanMessage) and "CRITIC FEEDBACK" in (mi.content or "")):
+            start = i
+            break
+    if start is not None:
+        executor_msgs = list(messages[start:])
+    else:
         executor_msgs = [messages[-1]]
 
     if executor_tool_count >= MAX_EXECUTOR_TOOL_CALLS:
@@ -450,7 +468,10 @@ def critic_node(state: PrivEscState) -> dict:
 
     # Extract verdict
     upper = verdict_text.upper()
-    if "VERDICT: PASS" in upper or ("PASS" in upper and "FAIL" not in upper):
+    # Require the exact verdict prefix the prompt instructs the LLM to emit.
+    # The loose "PASS not FAIL" fallback caused false positives (e.g. "PASS the
+    # escalation to planner") and is intentionally dropped.
+    if "VERDICT: PASS" in upper:
         verdict = "PASS"
     elif "FAIL_ENUM" in upper:
         verdict = "FAIL_ENUM"
@@ -518,7 +539,8 @@ def route_after_planner(state: PrivEscState) -> Literal["planner_tools", "execut
     if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
         tool_count = 0
         for m in reversed(state["messages"]):
-            if isinstance(m, AIMessage) and "[PrivEsc Enumerator]" in (m.content or ""):
+            if (isinstance(m, AIMessage) and "[PrivEsc Enumerator]" in (m.content or "")) or \
+               (isinstance(m, HumanMessage) and "CRITIC FEEDBACK" in (m.content or "")):
                 break
             if isinstance(m, ToolMessage):
                 tool_count += 1
@@ -533,7 +555,8 @@ def route_after_executor(state: PrivEscState) -> Literal["executor_tools", "crit
     if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
         tool_count = 0
         for m in reversed(state["messages"]):
-            if isinstance(m, AIMessage) and "[PrivEsc Planner]" in (m.content or ""):
+            if (isinstance(m, AIMessage) and "[PrivEsc Planner]" in (m.content or "")) or \
+               (isinstance(m, HumanMessage) and "CRITIC FEEDBACK" in (m.content or "")):
                 break
             if isinstance(m, ToolMessage):
                 tool_count += 1
@@ -624,9 +647,12 @@ def _extract_privesc_findings(state: dict) -> PrivEscFindings:
 
     success = critic_verdict == "PASS"
 
-    # Extract technique from plan
+    # Extract technique from plan. Fall back to the execution result text when
+    # the plan is empty (e.g. enum results fed directly to the executor).
     technique = "unknown"
-    plan_lower = escalation_plan.lower()
+    plan_lower = (escalation_plan or "").lower()
+    if not plan_lower.strip():
+        plan_lower = (escalation_result or "").lower()
     if "sudo" in plan_lower:
         technique = "sudo_miscfg"
     elif "suid" in plan_lower:
@@ -639,6 +665,10 @@ def _extract_privesc_findings(state: dict) -> PrivEscFindings:
         technique = "capabilities"
     elif "path" in plan_lower and "writable" in plan_lower:
         technique = "writable_path"
+    elif any(k in plan_lower for k in (
+        "post/", "local_exploit_suggester", "metasploit", "meterpreter", "msf"
+    )):
+        technique = "msf_post"
 
     previous_level = access_level
     new_level = "root" if success else access_level
@@ -683,6 +713,45 @@ def run_privesc(
             summary="Already had root access. No escalation needed.",
         )
 
+    # Fast-path: passwordless sudo. If the orchestrator already determined the
+    # session has sudo rights, try a non-interactive `sudo -n whoami` on the
+    # target first. If it returns root we're done — no need to run the full
+    # enumeration/planning graph (which otherwise burns retries on a trivially
+    # escalatable session).
+    if access_level in ("user_with_sudo", "sudo"):
+        print_colored(
+            f"[PrivEsc] access_level={access_level} — attempting passwordless sudo fast-path.",
+            Colors.OKCYAN,
+        )
+        try:
+            quick = tool_session_command.invoke(
+                {"session_id": session_id, "command": "sudo -n whoami"}
+            )
+            quick_str = str(quick).lower()
+            if "root" in quick_str and "not allowed" not in quick_str \
+                    and "password is required" not in quick_str \
+                    and "a password is required" not in quick_str:
+                print_colored(
+                    "[PrivEsc] Passwordless sudo confirmed (NOPASSWD) — escalated to root.",
+                    Colors.OKGREEN,
+                )
+                return PrivEscFindings(
+                    success=True,
+                    technique="sudo_nopasswd",
+                    previous_level=access_level,
+                    new_level="root",
+                    summary="Escalated via passwordless sudo (NOPASSWD).",
+                )
+            print_colored(
+                "[PrivEsc] Fast-path sudo check did not confirm root — falling through to graph.",
+                Colors.WARNING,
+            )
+        except Exception as e:
+            print_colored(
+                f"[PrivEsc] Fast-path sudo check failed ({e}) — falling through to graph.",
+                Colors.WARNING,
+            )
+
     if thread_id is None:
         thread_id = f"privesc_{uuid.uuid4().hex[:8]}"
 
@@ -726,10 +795,15 @@ def run_privesc(
     print_colored(f"{'='*60}\n", Colors.HEADER)
 
     # --- Session health check: verify session is still alive ---
+    # Use a plain `sessions` list (NEVER `-i`, which switches the console INTO
+    # the session and blocks until Ctrl-C) and scan for the session_id.
     try:
-        session_check = msf_session.send_command(f"sessions -c 'echo alive' -i {session_id}")
+        session_check = msf_session.send_command("sessions -l")
         session_check_str = str(session_check).lower()
-        if "invalid session" in session_check_str or "no active sessions" in session_check_str:
+        sid = str(session_id).strip().lower()
+        alive = bool(re.search(rf"(^|\s){re.escape(sid)}(\s)", session_check_str))
+        no_sessions = "no active sessions" in session_check_str
+        if no_sessions or (sid and not alive):
             print_colored(f"[PrivEsc] Session {session_id} is DEAD — skipping privesc.", Colors.WARNING)
             return PrivEscFindings(
                 success=False,

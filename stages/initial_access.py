@@ -132,6 +132,9 @@ class ExploitationFindings(TypedDict):
     exploit_used: str          # MSF module path or "manual:<desc>"
     access_level: str          # "user" | "root" | "unknown"
     summary: str               # Brief text of what happened
+    failure_category: str      # "generic"|"wrong_targeturi"|"incompatible_payload"|"module_aborted"|""
+    failure_cause: str         # Specific error phrase that classified the failure
+    session_user_info: dict    # {"uid": "...", "user": "...", "raw": "..."} or {}
 
 # =============================================================================
 # TOOLS
@@ -372,17 +375,24 @@ You receive the execution_result, session detection flag, and recent tool output
 
 **Classify the outcome as EXACTLY ONE of:**
 
-1. **PASS** — SESSION_DETECTED is True, OR the error is unfixable (target down, port closed, service not vulnerable after exhausting alternatives).
+1. **PASS** — SESSION_DETECTED is True. Use this ONLY when a session was actually opened. Never use PASS for a giving-up / unfixable case.
 
-2. **FAIL_PARAM** — The module is correct but parameters were misconfigured on the LAST attempt (missing LHOST, wrong RHOST, bad TARGETURI). Do NOT use this if the executor tried multiple payloads and got the same module-level error each time — that is FAIL_EXPLOIT.
+2. **FAIL_PARAM** — The module is correct but parameters were misconfigured on the LAST attempt.
+   FAIL_PARAM is ONLY for: missing LHOST, wrong RHOST/RPORT, or unset required options.
+   Do NOT use FAIL_PARAM for:
+     (a) 'bad-config: No cookie found' / TARGETURI errors when multiple TARGETURI values have already been tried — classify as FAIL_EXPLOIT instead.
+     (b) incompatible payload errors ("not a compatible payload") — classify as FAIL_EXPLOIT.
+     (c) the same module failing repeatedly with the same module-level error after payload swaps — that is FAIL_EXPLOIT.
 
-3. **FAIL_EXPLOIT** — The exploit module itself is wrong for this target. Includes: version mismatch, OS mismatch, AND the same module failing repeatedly with a non-parameter error (e.g., "directory not writable", "Exploit aborted") even after payload swaps.
+3. **FAIL_EXPLOIT** — The exploit module itself is wrong for this target. Includes: version mismatch, OS mismatch, AND the same module failing repeatedly with a non-parameter error (e.g., "directory not writable", "Exploit aborted") even after payload swaps. FAIL_EXPLOIT ALSO includes: the module hard-aborts with bad-config (no cookie) regardless of TARGETURI tried, OR the payload is not compatible with the module after trying 2+ payloads.
 
 4. **FAIL_CONTEXT** — The message history is bloated and the agent is clearly confused or looping.
 
+5. **FAIL_EXHAUSTED** — No session was opened AND the error is genuinely unfixable after exhausting all reasonable alternatives (target down, port closed, service confirmed not vulnerable, all viable modules tried). This is the giving-up verdict — it is a FAILURE, not a success. Use this instead of PASS when there is no session and nothing more to try.
+
 **Output format (ALL fields required):**
 
-CLASSIFICATION: <PASS|FAIL_PARAM|FAIL_EXPLOIT|FAIL_CONTEXT>
+CLASSIFICATION: <PASS|FAIL_PARAM|FAIL_EXPLOIT|FAIL_CONTEXT|FAIL_EXHAUSTED>
 
 WHAT_FAILED: <module path and specific error messages from the execution>
 
@@ -465,16 +475,71 @@ MSF_ERROR_INDICATORS = [
     "Exploit failed",
     "Unknown datastore option",
     "is not valid",
+    "not a compatible payload",
     "payload has not been selected",
     "OptionValidateError",
     "Handler failed to bind",
 ]
+
+# Ordered list of (regex, failure_category) — first match wins. More specific
+# patterns come first so generic catch-alls do not shadow them.
+FAILURE_PATTERNS = [
+    (re.compile(r'not a compatible payload', re.IGNORECASE), "incompatible_payload"),
+    (re.compile(r'incompatible payload', re.IGNORECASE), "incompatible_payload"),
+    (re.compile(r'(cookie not found.*targeturi|no cookie found|bad-config:\s*no cookie)', re.IGNORECASE), "wrong_targeturi"),
+    (re.compile(r'targeturi', re.IGNORECASE), "wrong_targeturi"),
+    (re.compile(r'exploit aborted', re.IGNORECASE), "module_aborted"),
+    (re.compile(r'no session was created', re.IGNORECASE), "generic"),
+    (re.compile(r'exploit completed, but no session', re.IGNORECASE), "generic"),
+]
+
+
+def _classify_failure_from_messages(messages) -> tuple:
+    """Scan ToolMessage contents for known MSF failure patterns.
+
+    Returns (failure_category, failure_cause). Scans most-recent-first so the
+    latest failure dominates. Returns ("generic", "") when nothing matches.
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, ToolMessage):
+            continue
+        content = msg.content if msg.content else ""
+        if not content:
+            continue
+        for pattern, category in FAILURE_PATTERNS:
+            m = pattern.search(content)
+            if m:
+                # Capture a short surrounding phrase for failure_cause
+                start = max(0, m.start() - 30)
+                end = min(len(content), m.end() + 30)
+                phrase = content[start:end].strip().replace("\n", " ")
+                cause = "" if category == "generic" else phrase
+                return (category, cause)
+    return ("generic", "")
+
+
+def _extract_session_user_info(messages) -> dict:
+    """Scan ToolMessage contents for uid=...(user) patterns to capture identity.
+
+    Returns {"uid": "0", "user": "root", "raw": "uid=0(root)"} or {}.
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, ToolMessage):
+            continue
+        content = msg.content if msg.content else ""
+        if not content:
+            continue
+        m = re.search(r'uid=(\d+)\((\w+)\)', content)
+        if m:
+            return {"uid": m.group(1), "user": m.group(2), "raw": m.group(0)}
+    return {}
 
 ERROR_ANALYZER_PROMPT = """You are a Metasploit error analyst. Analyze this tool output and provide a ONE-SENTENCE recovery hint.
 
 Rules:
 - If LHOST/LPORT is an "Unknown datastore option" → select a payload first with 'set payload <name>'
 - If a payload "is not valid" → run 'show payloads' to see compatible ones
+- If "not a compatible payload" appears → this payload is incompatible with this module. Run 'show payloads' immediately to discover which payloads ARE compatible, then select one from the list. Do NOT guess another payload from memory.
 - If the exploit ABORTED (e.g., "directory not writable", config error) → this is a MODULE-level failure, switching payloads will NOT help. Tell the user to STOP and report failure.
 - If the exploit completed but no session was created (and did NOT abort) → the payload didn't connect back, suggest a different payload type
 - If a handler failed to bind → the port is already in use, suggest changing LPORT
@@ -891,7 +956,35 @@ def parameter_solver_node(state: AgentState) -> dict:
 
     approach = tool_candidate.get("approach", "msf")
 
-    context = (
+    # --- Surface the critic's NEXT_ACTION + a structured failure-category hint ---
+    # so the LLM cannot bury/ignore the concrete remediation inside the prose.
+    mandate = ""
+    structured_hint = ""
+    if feedback:
+        na = re.search(r'NEXT_ACTION:\s*(.+?)(?:\n|$)', feedback, re.IGNORECASE)
+        if na and na.group(1).strip():
+            mandate = (
+                "MANDATORY INSTRUCTION FROM PREVIOUS FAILURE:\n"
+                f"{na.group(1).strip()}\n"
+                "You MUST follow this instruction exactly.\n\n"
+            )
+        fb_lower = feedback.lower()
+        if ("wrong_targeturi" in fb_lower or "targeturi" in fb_lower
+                or "cookie not found" in fb_lower or "no cookie" in fb_lower):
+            structured_hint = (
+                "STRUCTURED HINT: failure_category=wrong_targeturi. The previous "
+                "TARGETURI was wrong. Try /login, /app, or /rails first. "
+                "Do NOT use / again.\n\n"
+            )
+        elif "not a compatible payload" in fb_lower or "incompatible_payload" in fb_lower:
+            structured_hint = (
+                "STRUCTURED HINT: failure_category=incompatible_payload. Run "
+                "'show payloads' first and select a payload from the listed "
+                "compatible ones — do NOT use cmd/unix/reverse_python with this "
+                "module unless it appears in the compatible list.\n\n"
+            )
+
+    context = mandate + structured_hint + (
         f"ATTACK PLAN:\n{current_plan}\n\n"
         f"TOOL CANDIDATE:\n{json.dumps(tool_candidate, indent=2)}\n\n"
         f"TARGET INFO:\n{json.dumps(target_info, indent=2)}\n\n"
@@ -917,11 +1010,54 @@ def parameter_solver_node(state: AgentState) -> dict:
     }
 
 
+def _collect_executor_commands(messages) -> list:
+    """Collect tool-call command strings issued since the last [Parameter Solver].
+
+    Returns the list of command strings (the `command` arg of tool_metasploit_rpc /
+    tool_linux_terminal calls) in chronological order for the current executor cycle.
+    """
+    # Find the index of the last [Parameter Solver] marker.
+    start_idx = 0
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if isinstance(m, AIMessage) and "[Parameter Solver]" in (m.content or ""):
+            start_idx = i
+            break
+    cmds = []
+    for m in messages[start_idx:]:
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            for tc in m.tool_calls:
+                args = tc.get("args", {}) if isinstance(tc, dict) else {}
+                cmd = args.get("command")
+                if cmd:
+                    cmds.append(str(cmd))
+    return cmds
+
+
+def _count_module_uses(cmds) -> dict:
+    """Count `use <module>` occurrences across the given command strings."""
+    counts = {}
+    for c in cmds:
+        m = re.search(r'\buse\s+(\S+)', c)
+        if m:
+            mod = m.group(1).strip()
+            counts[mod] = counts.get(mod, 0) + 1
+    return counts
+
+
 def executor_node(state: AgentState) -> dict:
     """Execute MSF commands one at a time via tool calls. ReAct loop with safety valve."""
     messages = state['messages']
 
     print_colored("\n[Executor] Running attack sequence...", Colors.HEADER)
+
+    # --- ANTI-REPEAT PRE-CHECK ---
+    # If the same module has already been `use`d 2+ times in this executor cycle,
+    # the LLM is looping. Force the safety-valve assessment path regardless of
+    # the tool-call count so the critic can route to a different exploit.
+    prior_cmds = _collect_executor_commands(messages)
+    module_use_counts = _count_module_uses(prior_cmds)
+    repeated_module = next((mod for mod, n in module_use_counts.items() if n >= 2), None)
 
     # Count how many tool calls the executor has made in this cycle
     executor_tool_count = 0
@@ -944,11 +1080,26 @@ def executor_node(state: AgentState) -> dict:
     if not executor_msgs:
         executor_msgs = [messages[-1]]
 
-    # Safety valve: force text response if too many tool calls
-    if executor_tool_count >= MAX_EXECUTOR_TOOL_CALLS:
-        print_colored(f"[Executor] Safety valve: {executor_tool_count} tool calls reached, forcing assessment.", Colors.WARNING)
+    # Safety valve: force text response if too many tool calls OR a module is looping
+    if executor_tool_count >= MAX_EXECUTOR_TOOL_CALLS or repeated_module:
+        if repeated_module:
+            print_colored(
+                f"[Executor] Anti-repeat valve: module '{repeated_module}' already tried "
+                f"{module_use_counts[repeated_module]}x this cycle — forcing assessment.",
+                Colors.WARNING,
+            )
+            force_text = (
+                f"STOP. You have already run 'use {repeated_module}' "
+                f"{module_use_counts[repeated_module]} times this cycle with the same "
+                "result. Do NOT make any more tool calls. Provide a text assessment "
+                "now: did any session open? What was the exact error? The critic will "
+                "route to a DIFFERENT exploit module."
+            )
+        else:
+            print_colored(f"[Executor] Safety valve: {executor_tool_count} tool calls reached, forcing assessment.", Colors.WARNING)
+            force_text = "You have used your maximum tool calls. Provide a text assessment of what happened so far. Did any session open? What errors occurred?"
         response = call_llm(
-            messages=executor_msgs + [HumanMessage(content="You have used your maximum tool calls. Provide a text assessment of what happened so far. Did any session open? What errors occurred?")],
+            messages=executor_msgs + [HumanMessage(content=force_text)],
             system_prompt=EXECUTOR_PROMPT
         )
     else:
@@ -963,12 +1114,38 @@ def executor_node(state: AgentState) -> dict:
 
 def executor_tools_node(state: AgentState) -> dict:
     """Execute MSF/SSH tool calls with LLM-based error recovery hints."""
+    # Snapshot the `use <module>` commands already issued BEFORE this batch so we
+    # can detect when the executor re-runs a module it has already tried.
+    prior_modules = set(_count_module_uses(_collect_executor_commands(state["messages"])).keys())
+
+    # The current AIMessage's tool calls are the about-to-run batch; capture the
+    # module(s) it is invoking so we can flag a repeat.
+    current_module = None
+    last = state["messages"][-1] if state["messages"] else None
+    if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
+        for tc in last.tool_calls:
+            args = tc.get("args", {}) if isinstance(tc, dict) else {}
+            cmd = str(args.get("command", ""))
+            mm = re.search(r'\buse\s+(\S+)', cmd)
+            if mm:
+                current_module = mm.group(1).strip()
+
     tool_node = ToolNode(EXECUTOR_TOOLS)
     result = tool_node.invoke(state)
+
+    repeat_detected = bool(current_module and current_module in prior_modules)
 
     if "messages" in result:
         for msg in result["messages"]:
             if isinstance(msg, ToolMessage) and msg.content:
+                # --- ANTI-REPEAT: same module already tried this cycle ---
+                if repeat_detected:
+                    msg.content += (
+                        "\n\n[SYSTEM HINT: You have already tried this exact module "
+                        f"('{current_module}') with these options. STOP making more tool "
+                        "calls and provide a failure text assessment immediately. The "
+                        "critic will route to a different exploit.]"
+                    )
                 # --- SESSION DETECTION: tell executor to STOP ---
                 if re.search(r'session \d+ opened', msg.content, re.IGNORECASE):
                     msg.content += (
@@ -995,11 +1172,12 @@ def extract_verdict(text: str) -> str:
     """Extract structured verdict from critic LLM response."""
     upper = text.upper()
     # Check for explicit CLASSIFICATION: prefix first (prompt's requested format)
-    for verdict in ("FAIL_PARAM", "FAIL_EXPLOIT", "FAIL_CONTEXT", "PASS"):
+    # FAIL_EXHAUSTED before FAIL_EXPLOIT so the longer/more-specific name wins.
+    for verdict in ("FAIL_EXHAUSTED", "FAIL_PARAM", "FAIL_EXPLOIT", "FAIL_CONTEXT", "PASS"):
         if f"CLASSIFICATION: {verdict}" in upper:
             return verdict
     # Fallback: bare keyword anywhere in text
-    for verdict in ("FAIL_PARAM", "FAIL_EXPLOIT", "FAIL_CONTEXT"):
+    for verdict in ("FAIL_EXHAUSTED", "FAIL_PARAM", "FAIL_EXPLOIT", "FAIL_CONTEXT"):
         if verdict in upper:
             return verdict
     if "PASS" in upper and "FAIL" not in upper:
@@ -1168,8 +1346,6 @@ def _extract_findings(state: dict) -> ExploitationFindings:
     critic_verdict = state.get("critic_verdict", "")
     messages = state.get("messages", [])
 
-    success = critic_verdict == "PASS"
-
     # --- session_id and session_type from message history ---
     session_id = ""
     session_type = ""
@@ -1184,6 +1360,11 @@ def _extract_findings(state: dict) -> ExploitationFindings:
             session_id = match.group(2)
             session_type = "meterpreter" if "Meterpreter" in raw_type else "command_shell"
             break
+
+    # Success requires BOTH a PASS verdict AND a real session. A PASS with no
+    # session (should no longer happen now that FAIL_EXHAUSTED exists, but
+    # defend anyway) must NOT be reported as success.
+    success = (critic_verdict == "PASS") and bool(session_id)
 
     # --- target_ip ---
     target_ip = target_info.get("ip", "unknown")
@@ -1251,6 +1432,14 @@ def _extract_findings(state: dict) -> ExploitationFindings:
                 break
         summary = f"Attack failed on {target_ip}. {fail_summary}".strip()
 
+    # --- failure classification + session identity (for replanner) ---
+    session_user_info = _extract_session_user_info(messages)
+    if success:
+        failure_category = ""
+        failure_cause = ""
+    else:
+        failure_category, failure_cause = _classify_failure_from_messages(messages)
+
     return ExploitationFindings(
         success=success,
         session_id=session_id,
@@ -1260,6 +1449,9 @@ def _extract_findings(state: dict) -> ExploitationFindings:
         exploit_used=exploit_used,
         access_level=access_level,
         summary=summary,
+        failure_category=failure_category,
+        failure_cause=failure_cause,
+        session_user_info=session_user_info,
     )
 
 
@@ -1369,6 +1561,11 @@ def route_after_critic(state: AgentState) -> Literal["parameter_solver", "resear
 
     if verdict == "PASS":
         return "success_logger"
+    elif verdict == "FAIL_EXHAUSTED":
+        # Gave up after exhausting alternatives — no session. Exit with failure
+        # findings (same as max-retries exit). Do NOT mark the node successful.
+        print_colored("--- CRITIC: FAIL_EXHAUSTED (unfixable, no session) — ending ---", Colors.FAIL)
+        return END
     elif verdict == "FAIL_PARAM":
         return "parameter_solver"
     elif verdict == "FAIL_EXPLOIT":

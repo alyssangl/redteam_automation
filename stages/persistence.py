@@ -338,7 +338,10 @@ def _get_recommended_techniques(access_level: str, session_type: str, session_id
     """
     techniques = []
 
-    if access_level == "root":
+    # 'unknown' and sudo-capable users are root-equivalent for technique selection.
+    # Falling into the user branch would deny them root-appropriate techniques
+    # (e.g. writing to /root/.ssh or /etc/init.d) even when they could use them.
+    if access_level in ("root", "unknown", "user_with_sudo"):
         techniques.append({
             "name": "Cron job backdoor",
             "reliability": "HIGH",
@@ -462,14 +465,28 @@ def planner_node(state: PersistenceState) -> dict:
             f"OBJECTIVE: {state.get('objective', '')}\n"
         )
 
+        # If access level is unknown, the planner must discover it before committing
+        # to a technique that depends on root vs user write paths.
+        if access_level == "unknown":
+            context += (
+                "\nACCESS LEVEL: unknown — first step: run tool_session_command to "
+                "check whoami/sudo -l before choosing technique.\n"
+            )
+
         # Inject deterministic technique recommendations
         context += _get_recommended_techniques(access_level, session_type, session_id)
 
-        # Include critic feedback if retrying
-        for msg in reversed(messages):
-            if isinstance(msg, HumanMessage) and "CRITIC FEEDBACK" in msg.content:
-                context += f"\nPREVIOUS FAILURE:\n{msg.content}\n"
-                break
+        # Include ALL prior critic feedback so the planner never repeats a failed
+        # technique. Each retry appends a new CRITIC FEEDBACK HumanMessage; scanning
+        # only the most recent one would let the planner cycle the same technique.
+        failed_attempts = [
+            msg.content for msg in messages
+            if isinstance(msg, HumanMessage) and "CRITIC FEEDBACK" in (msg.content or "")
+        ]
+        if failed_attempts:
+            context += "\nPREVIOUS ATTEMPTS (DO NOT REPEAT):\n"
+            for n, fb in enumerate(failed_attempts, 1):
+                context += f"{n}. {fb}\n"
         planner_msgs = [HumanMessage(content=context)]
     else:
         # Continuing ReAct loop — include from last HumanMessage, sanitized
@@ -531,6 +548,20 @@ def executor_node(state: PersistenceState) -> dict:
         executor_msgs = [messages[-1]]
     executor_msgs = _sanitize_message_window(executor_msgs)
 
+    # Anti-repeat guard: on the first call of this executor cycle, surface what
+    # was already attempted in prior loops so the model does not blindly re-run
+    # the same module/commands after a critic FAIL.
+    if executor_tool_count == 0:
+        prior_attempts = [
+            msg.content for msg in messages
+            if isinstance(msg, AIMessage) and "[Persistence Executor]" in (msg.content or "")
+        ]
+        if prior_attempts:
+            recap = "PREVIOUSLY ATTEMPTED (DO NOT REPEAT — try a different approach):\n"
+            for n, att in enumerate(prior_attempts, 1):
+                recap += f"{n}. {att[:400]}\n"
+            executor_msgs = [HumanMessage(content=recap)] + executor_msgs
+
     # Safety valve
     if executor_tool_count >= MAX_EXECUTOR_TOOL_CALLS:
         print_colored(f"[Persistence Executor] Tool cap ({executor_tool_count}). Forcing summary.", Colors.WARNING)
@@ -540,17 +571,25 @@ def executor_node(state: PersistenceState) -> dict:
             ))],
             system_prompt=EXECUTOR_PROMPT
         )
-    else:
-        response = call_llm(
-            messages=executor_msgs,
-            system_prompt=EXECUTOR_PROMPT,
-            tools=EXECUTOR_TOOLS
-        )
+        # At the cap we MUST hand the verifier a summary even if the model
+        # disobeyed and emitted tool_calls. Strip any tool_calls and capture text.
+        install_text = response.content or "(executor hit tool cap — no summary produced)"
+        return {
+            "messages": [AIMessage(content=f"[Persistence Executor] {install_text}")],
+            "install_result": install_text,
+        }
 
-    # Capture text summary into install_result
+    response = call_llm(
+        messages=executor_msgs,
+        system_prompt=EXECUTOR_PROMPT,
+        tools=EXECUTOR_TOOLS
+    )
+
+    # Capture text summary into install_result. Tag the message with a stable
+    # prefix so the verifier's cycle-boundary scan can find it reliably.
     if response.content and not response.tool_calls:
         return {
-            "messages": [response],
+            "messages": [AIMessage(content=f"[Persistence Executor] {response.content}")],
             "install_result": response.content,
         }
 
@@ -569,8 +608,10 @@ def verifier_node(state: PersistenceState) -> dict:
     verifier_tool_count = 0
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and not msg.tool_calls and msg.content:
-            # Hit executor's summary = start of verifier cycle
-            if "[Persistence Executor]" in msg.content or msg.content == install_result:
+            # Hit executor's tagged summary = start of verifier cycle.
+            # Rely solely on the explicit tag (executor now always tags its
+            # summary); full-string equality on install_result was brittle.
+            if "[Persistence Executor]" in msg.content:
                 break
         if isinstance(msg, ToolMessage):
             verifier_tool_count += 1
@@ -638,12 +679,17 @@ def critic_node(state: PersistenceState) -> dict:
         system_prompt=CRITIC_PROMPT
     )
 
-    verdict_text = response.content.strip()
+    verdict_text = (response.content or "").strip()
     print_colored(f"[Persistence Critic] {verdict_text[:300]}", Colors.OKCYAN)
 
     new_step = current_step + 1
     upper = verdict_text.upper()
-    if "VERDICT: PASS" in upper or ("PASS" in upper and "FAIL" not in upper):
+    # Strict: only the mandated "VERDICT: PASS" line counts. The old loose
+    # fallback false-PASSed when FEEDBACK merely mentioned PASS (e.g.
+    # "PASS is reachable once you fix the cron entry"). Empty verdict -> FAIL.
+    if not verdict_text:
+        verdict = "FAIL"
+    elif "VERDICT: PASS" in upper:
         verdict = "PASS"
     else:
         verdict = "FAIL"
@@ -799,28 +845,44 @@ def _extract_persistence_findings(state: dict) -> PersistenceFindings:
 
     success = critic_verdict == "PASS"
 
-    # Extract method from plan text
-    method = "unknown"
-    plan_lower = persistence_plan.lower()
-    if "ssh" in plan_lower and "key" in plan_lower:
-        method = "ssh_key"
-    elif "cron" in plan_lower:
-        method = "cron_job"
-    elif "systemd" in plan_lower or "service" in plan_lower:
-        method = "systemd_service"
-    elif "user" in plan_lower and ("account" in plan_lower or "useradd" in plan_lower):
-        method = "user_account"
-    elif "bashrc" in plan_lower or "profile" in plan_lower:
-        method = "shell_profile"
+    def _classify(text: str) -> str:
+        t = (text or "").lower()
+        if "ssh" in t and "key" in t:
+            return "ssh_key"
+        if "cron" in t:
+            return "cron_job"
+        if "systemd" in t or "service" in t:
+            return "systemd_service"
+        if "user" in t and ("account" in t or "useradd" in t):
+            return "user_account"
+        if "bashrc" in t or "profile" in t:
+            return "shell_profile"
+        return "unknown"
+
+    # Extract method from plan text first.
+    method = _classify(persistence_plan)
+
+    # Fall back to install/verification text when the plan is empty or
+    # inconclusive (e.g. executor/verifier crashed before capturing a plan).
+    if method == "unknown":
+        for text in (install_result, verification_result):
+            method = _classify(text)
+            if method != "unknown":
+                break
 
     # Build details
     details = f"Plan: {persistence_plan[:200]}\nInstall: {install_result[:200]}\nVerify: {verification_result[:200]}"
 
-    # Build summary
+    # Build summary — always include a non-empty reason so the orchestrator has
+    # actionable failure context even when nothing was captured.
     if success:
         summary = f"Persistence established via {method}. Verified working."
     else:
-        summary = f"Persistence failed. Attempted: {method}. {verification_result[:100]}"
+        last_output = (verification_result or install_result or "No output captured").strip()
+        summary = (
+            f"Persistence failed after {state.get('loop_step', 0)} attempt(s). "
+            f"Last method tried: {method}. {last_output[:150]}"
+        )
 
     return PersistenceFindings(
         success=success,

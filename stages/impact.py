@@ -64,6 +64,7 @@ class ImpactState(TypedDict):
     actions_taken: list        # List of action descriptions
     loop_step: int
     critic_verdict: str        # "PASS" | "FAIL"
+    _verify_prompted: bool     # guard: read-back reminder already injected
 
 # =============================================================================
 # TOOL DEFINITIONS
@@ -259,11 +260,14 @@ def planner_node(state: ImpactState) -> dict:
     messages = state["messages"]
     print_colored("\n[Impact Planner] Planning impact actions...", Colors.HEADER)
 
+    # Count ONLY this planner cycle's RAG calls. Filter by tool name so stale
+    # executor ToolMessages (tool_session_command, etc.) accumulated from prior
+    # retry loops via operator.add don't prematurely trip the RAG cap.
     planner_tool_count = 0
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
             break
-        if isinstance(msg, ToolMessage):
+        if isinstance(msg, ToolMessage) and getattr(msg, "name", "") == "query_knowledge_base":
             planner_tool_count += 1
 
     if planner_tool_count == 0:
@@ -331,13 +335,14 @@ def executor_node(state: ImpactState) -> dict:
         if isinstance(msg, ToolMessage):
             executor_tool_count += 1
 
+    # Walk backward and stop at the MOST RECENT planner message so the executor
+    # only sees the current retry cycle's context (messages accumulate via
+    # operator.add across all loops).
     executor_msgs = []
-    capturing = False
-    for msg in messages:
+    for msg in reversed(messages):
+        executor_msgs.insert(0, msg)
         if isinstance(msg, AIMessage) and "[Impact Planner]" in (msg.content or ""):
-            capturing = True
-        if capturing:
-            executor_msgs.append(msg)
+            break
     if not executor_msgs:
         executor_msgs = [messages[-1]]
 
@@ -364,12 +369,68 @@ def executor_node(state: ImpactState) -> dict:
         )
 
     if response.content and not response.tool_calls:
-        # Collect action summaries from executor
-        actions = state.get("actions_taken", [])
+        # --- Defect 3: verification read-back enforcement ---
+        # If the executor wrote a file (echo ... > /path  or  tee /path) but
+        # never read it back (cat /path / ls of that path), force one more pass
+        # so a falsely-claimed write (echo exits 0 even on permission error)
+        # cannot reach the critic unverified. Guard with a state flag so we
+        # only ever inject the reminder once and never hang.
+        if not state.get("_verify_prompted", False):
+            written_paths = []
+            verified_paths = set()
+            # Scan AIMessage tool_calls in this cycle for write vs read commands.
+            for m in executor_msgs:
+                tcs = getattr(m, "tool_calls", None)
+                if not tcs:
+                    continue
+                for tc in tcs:
+                    cmd = str(tc.get("args", {}).get("command", ""))
+                    for wm in re.finditer(r'>>?\s*(/\S+)', cmd):
+                        written_paths.append(wm.group(1))
+                    if "tee " in cmd:
+                        for tm in re.finditer(r'tee\s+(?:-a\s+)?(/\S+)', cmd):
+                            written_paths.append(tm.group(1))
+                    rm = re.search(r'\b(?:cat|ls|head|tail|stat)\b[^\n]*?(/\S+)', cmd)
+                    if rm:
+                        verified_paths.add(rm.group(1))
+            unverified = [p for p in written_paths if p not in verified_paths]
+            if unverified:
+                print_colored(
+                    f"[Impact Executor] Unverified write(s): {unverified[:3]} — forcing read-back.",
+                    Colors.WARNING,
+                )
+                reminder = HumanMessage(content=(
+                    f"You wrote to {unverified[:3]} but did not verify it. "
+                    f"Call tool_session_command to `cat` (or `ls -la`) each written "
+                    f"file and confirm it exists before summarizing."
+                ))
+                verify_response = call_llm(
+                    messages=executor_msgs + [response, reminder],
+                    system_prompt=executor_prompt,
+                    tools=EXECUTOR_TOOLS,
+                )
+                # If the LLM now wants to verify, route back through tools.
+                if getattr(verify_response, "tool_calls", None):
+                    return {
+                        "messages": [reminder, verify_response],
+                        "_verify_prompted": True,
+                    }
+                # Otherwise it re-summarized; fall through using the new content.
+                response = verify_response if verify_response.content else response
+
+        # --- Defect 1: build actions_taken from REAL outputs, not plan text ---
+        actions = list(state.get("actions_taken", []))
+        new_actions = [
+            l.strip()
+            for l in (response.content or "").split("\n")
+            if l.strip() and (re.match(r'^[\d\-\*]', l.strip()) or "->" in l)
+        ]
+        actions.extend(new_actions[:20])
         return {
             "messages": [response],
             "impact_result": response.content,
             "actions_taken": actions,
+            "_verify_prompted": True,
         }
 
     return {"messages": [response]}
@@ -379,6 +440,18 @@ def critic_node(state: ImpactState) -> dict:
     """Evaluate whether objective was met with concrete proof."""
     current_step = state.get("loop_step", 0)
     print_colored("\n[Impact Critic] Evaluating evidence...", Colors.HEADER)
+
+    # --- Defect 5: never let the LLM grade an empty execution result ---
+    if not state.get("impact_result", "").strip():
+        print_colored("[Impact Critic] Empty execution result — forcing re-execution.", Colors.WARNING)
+        return {
+            "messages": [HumanMessage(content=(
+                "CRITIC FEEDBACK: No execution result was produced. "
+                "Executor must run commands on the target and collect concrete evidence."
+            ))],
+            "loop_step": current_step + 1,
+            "critic_verdict": "FAIL",
+        }
 
     evidence = (
         f"OBJECTIVE: {state.get('objective', '')}\n\n"
@@ -443,7 +516,7 @@ def route_after_planner(state: ImpactState) -> Literal["planner_tools", "executo
         for m in reversed(state["messages"]):
             if isinstance(m, HumanMessage):
                 break
-            if isinstance(m, ToolMessage):
+            if isinstance(m, ToolMessage) and getattr(m, "name", "") == "query_knowledge_base":
                 tool_count += 1
         if tool_count >= MAX_PLANNER_TOOL_CALLS:
             return "executor"
@@ -471,10 +544,10 @@ def route_after_critic(state: ImpactState) -> Literal["planner", "__end__"]:
     current_step = state.get("loop_step", 0)
     if current_step >= MAX_IMPACT_RETRIES:
         print_colored("--- MAX IMPACT RETRIES REACHED ---", Colors.FAIL)
-        return END
+        return "__end__"
     verdict = state.get("critic_verdict", "FAIL")
     if verdict == "PASS":
-        return END
+        return "__end__"
     return "planner"
 
 # =============================================================================
@@ -541,7 +614,7 @@ def _extract_impact_findings(state: dict) -> ImpactFindings:
     if success:
         summary = f"Impact complete. Objective '{objective[:50]}' achieved. {len(actions)} actions taken."
     else:
-        summary = f"Impact incomplete. Objective '{objective[:50]}' not fully proven. {impact_result[:100] if impact_result else ''}"
+        summary = f"Impact incomplete. Objective '{objective[:50]}' not fully proven. {impact_result[:500] if impact_result else ''}"
 
     return ImpactFindings(
         success=success,
@@ -598,6 +671,7 @@ def run_impact(
         "actions_taken": [],
         "loop_step": 0,
         "critic_verdict": "",
+        "_verify_prompted": False,
     }
 
     print_colored(f"\n{'='*60}", Colors.HEADER)
