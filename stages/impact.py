@@ -196,6 +196,57 @@ def _result_is_dead_or_empty(content: str) -> bool:
         return True
     return False
 
+
+def _parse_session_for_target(sessions_output: str, target_ip: str):
+    """Parse MSF `sessions` output and return (session_id, session_type) for the
+    most recent (highest-numbered) live session whose line references target_ip.
+
+    MSF lists sessions one per line, e.g.:
+        3   shell x86/linux  user @ host  10.0.0.1:4444 -> 192.168.34.7:55012
+    We anchor the ID to the start of the line and require the target_ip to appear
+    somewhere on that line. Returns (None, None) when no match is found."""
+    if not sessions_output or not target_ip:
+        return None, None
+    matches = []
+    esc_ip = re.escape(str(target_ip))
+    for line in str(sessions_output).splitlines():
+        m = re.match(r'^\s*(\d+)\s+(\S+)', line)
+        if not m:
+            continue
+        if re.search(esc_ip, line):
+            sid = m.group(1)
+            stype_tok = m.group(2).lower()
+            if "meterpreter" in stype_tok:
+                stype = "meterpreter"
+            elif "shell" in stype_tok:
+                stype = "command_shell"
+            else:
+                stype = stype_tok
+            matches.append((int(sid), sid, stype))
+    if not matches:
+        return None, None
+    # Highest-numbered = most recently opened session for the target.
+    matches.sort(key=lambda t: t[0])
+    _, best_sid, best_type = matches[-1]
+    return best_sid, best_type
+
+
+def _find_live_session_id(messages, target_ip: str):
+    """Scan recent ToolMessages for MSF `sessions` output and return the live
+    session_id for target_ip, or None. Used to propagate a recovered session ID
+    discovered during the executor's dead-session recovery branch."""
+    if not target_ip:
+        return None
+    for m in reversed(messages):
+        if not isinstance(m, ToolMessage):
+            continue
+        if getattr(m, "name", "") != "tool_metasploit_rpc":
+            continue
+        sid, _ = _parse_session_for_target(m.content or "", target_ip)
+        if sid:
+            return sid
+    return None
+
 # =============================================================================
 # SYSTEM PROMPTS
 # =============================================================================
@@ -446,13 +497,23 @@ def planner_node(state: ImpactState) -> dict:
             # write-verification check is active for every new executor cycle
             # (the flag persists across operator.add accumulation otherwise).
             "_verify_prompted": False,
+            # Re-arm dead-session recovery on every new planner cycle. Like
+            # _verify_prompted, this flag accumulates via operator.add and would
+            # otherwise stay True forever once tripped — permanently disabling
+            # the executor's dead-session recovery on retry cycles 2+.
+            "_session_dead_prompted": False,
         }
 
-    # RAG-in-flight path (planner emitted tool_calls). Always reset the
-    # write-verification guard here too: _verify_prompted accumulates via
-    # operator.add, so without resetting on EVERY planner return it stays True
-    # forever once tripped, permanently disabling the executor's read-back check.
-    return {"messages": [response], "_verify_prompted": False}
+    # RAG-in-flight path (planner emitted tool_calls). Always reset BOTH guards
+    # here too: _verify_prompted and _session_dead_prompted accumulate via
+    # operator.add, so without resetting on EVERY planner return they stay True
+    # forever once tripped, permanently disabling the executor's read-back and
+    # dead-session recovery checks.
+    return {
+        "messages": [response],
+        "_verify_prompted": False,
+        "_session_dead_prompted": False,
+    }
 
 
 def executor_node(state: ImpactState) -> dict:
@@ -549,10 +610,31 @@ def executor_node(state: ImpactState) -> dict:
                     system_prompt=executor_prompt,
                     tools=EXECUTOR_TOOLS,
                 )
-                return {
+                recovery_update = {
                     "messages": [recover, recovered],
-                    "_session_dead_prompted": True,
                 }
+                # --- Defect 4: propagate a recovered session_id + keep recovery
+                # armed while recovery is still in flight. ---
+                # If the recovery response carries tool_calls, recovery is NOT
+                # done yet (the ToolNode will run `sessions`/`sessions -u` and
+                # re-enter the executor). Leave the guard OFF so the NEXT executor
+                # cycle can re-detect dead results from those tool calls instead
+                # of summarizing fabricated proof from a still-down session/RPC.
+                if getattr(recovered, "tool_calls", None):
+                    recovery_update["_session_dead_prompted"] = False
+                else:
+                    recovery_update["_session_dead_prompted"] = True
+                # Try to extract a live session_id for target_ip from any MSF
+                # `sessions` output already present in this cycle's ToolMessages,
+                # so all subsequent tool_session_command calls use the right ID.
+                new_sid = _find_live_session_id(executor_msgs, state.get("target_ip", ""))
+                if new_sid and new_sid != str(state.get("session_id", "")):
+                    print_colored(
+                        f"[Impact Executor] Switching to recovered session #{new_sid}.",
+                        Colors.OKGREEN,
+                    )
+                    recovery_update["session_id"] = new_sid
+                return recovery_update
 
         if real_tool_count == 0 and not state.get("_verify_prompted", False):
             print_colored(
@@ -862,6 +944,47 @@ def run_impact(
     if thread_id is None:
         thread_id = f"impact_{uuid.uuid4().hex[:8]}"
 
+    # --- Defect 1: live-session fallback when no session_id was passed in ---
+    # The orchestrator returns early on an empty session_id, but run_impact must
+    # also defend itself: if called with an empty/blank session_id, do a live MSF
+    # lookup and adopt any session that exists for this target before building
+    # state. This produces an HONEST, distinct failure ("no live session found")
+    # vs. the orchestrator's "no session passed" when nothing can be recovered.
+    if not session_id or not str(session_id).strip():
+        print_colored(
+            "[Impact] No session_id provided — attempting live session lookup...",
+            Colors.WARNING,
+        )
+        live_out = _run_with_timeout(
+            msf_session.send_command,
+            args=("sessions",),
+            kwargs={"timeout": _MSF_SEND_TIMEOUT},
+            timeout=_MSF_WALLCLOCK_TIMEOUT,
+            on_timeout="(sessions list timed out)",
+        )
+        live_str = str(live_out)
+        found_sid, found_type = _parse_session_for_target(live_str, target_ip)
+        if found_sid:
+            session_id = found_sid
+            if found_type:
+                session_type = found_type
+            print_colored(
+                f"[Impact] Live lookup found session #{session_id} "
+                f"({session_type}) for {target_ip} — proceeding.",
+                Colors.OKGREEN,
+            )
+        else:
+            print_colored(
+                f"[Impact] No live session for {target_ip} found "
+                f"(lookup: {live_str[:120]}) — skipping impact.",
+                Colors.WARNING,
+            )
+            return ImpactFindings(
+                success=False,
+                actions=[],
+                summary="Impact skipped — no live session found for target after live lookup.",
+            )
+
     workflow = build_graph()
     checkpointer = MemorySaver()
     app = workflow.compile(checkpointer=checkpointer)
@@ -923,6 +1046,23 @@ def run_impact(
         if session_check_str.strip() in ("(sessions list timed out)",) \
                 or session_check_str.startswith("(call failed:"):
             print_colored(f"[Impact] Session health check inconclusive ({session_check_str[:80]}) — proceeding.", Colors.WARNING)
+        # Defect 3: explicit empty-session_id guard. re.escape('') is '' so the
+        # line-anchored pattern below collapses to r'(?m)^\s*\s' which matches
+        # ANY whitespace-containing line — trivially passing for empty IDs and
+        # baking session_id='' into state + every prompt. The Defect-1 fallback
+        # above normally resolves a real ID first; this guards the path where
+        # run_impact is called directly (e.g. a test harness) with no live
+        # session, so we never enter the graph with a broken session_id.
+        elif not str(session_id).strip():
+            print_colored(
+                "[Impact] Empty session_id and no live session found — skipping.",
+                Colors.WARNING,
+            )
+            return ImpactFindings(
+                success=False,
+                actions=[],
+                summary="Impact skipped — empty session_id and no live session found.",
+            )
         # Line-anchored match: MSF `sessions` lists the ID as a standalone token
         # at the start of a line ("3  shell ..."). A bare substring check would
         # false-positive when session_id='3' but only sessions 13/30 are alive.

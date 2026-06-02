@@ -314,8 +314,9 @@ You have access to `tool_linux_terminal` to run commands on the Kali machine.
 3. ADAPT between phases: if Phase 1 finds open ports, use those specific ports in Phase 2
 4. If a scan returns "host seems down", re-run with `-Pn` on the SAME target IP
 5. Do NOT run more than {MAX_EXECUTOR_TOOL_CALLS} commands total
-6. If a command returns SSH_TIMEOUT or "timed out", do NOT retry the same command. Instead immediately try a much smaller scan: `nmap -Pn --top-ports 100 -T5 <target>` as a connectivity check, then `nmap -Pn -p 21,22,80,111,139,443,445,631,3306,6667,8080,8484 -sV -T4 <target>` for known-common and high-value lab ports (this targeted 12-port scan runs in seconds and covers commonly exploitable MS3 services including UnrealIRCd on 6667 and Jenkins on 8484). Only escalate to larger scans if the smaller ones succeed.
-7. Do NOT install packages (no apt-get, no pip). Use only tools already available.
+6. **MANDATORY — DO NOT SKIP PHASE 3:** After completing Phase 1 (discovery) and Phase 2 (deep scan on discovered ports), you MUST ALWAYS run the Phase 3 known-non-standard-ports scan exactly once: `nmap -Pn -sV -p 6667,6697,8484,8180,5432,27017,10000,6000 <target>`. Do NOT skip this step even if Phase 2 already found many ports — the top-1000 range MISSES high-value services such as UnrealIRCd (6667/6697), Jenkins (8484/8180), PostgreSQL (5432), MongoDB (27017), Webmin (10000) and X11 (6000), all of which the exploit stage depends on. This is a fixed 8-port scan that runs in seconds and is well under the SSH timeout. Only provide your final TEXT SUMMARY AFTER this Phase 3 scan has completed. (Exception: if you are already out of tool-call budget per rule 5, or every recent scan is timing out, summarize with whatever you have.)
+7. If a command returns SSH_TIMEOUT or "timed out", do NOT retry the same command. Instead immediately try a much smaller scan: `nmap -Pn --top-ports 100 -T5 <target>` as a connectivity check, then `nmap -Pn -p 21,22,80,111,139,443,445,631,3306,6667,8080,8484 -sV -T4 <target>` for known-common and high-value lab ports (this targeted 12-port scan runs in seconds and covers commonly exploitable MS3 services including UnrealIRCd on 6667 and Jenkins on 8484). Only escalate to larger scans if the smaller ones succeed.
+8. Do NOT install packages (no apt-get, no pip). Use only tools already available.
 
 **When done scanning, provide a TEXT SUMMARY of all findings:**
 - List all open ports with service names and versions
@@ -513,21 +514,31 @@ def executor_node(state: ReconState) -> dict:
         if isinstance(msg, ToolMessage):
             executor_tool_count += 1
 
-    # Build executor message window: from planner output onwards
-    # Truncate individual tool outputs to prevent context bloat
+    # Build executor message window: from the CURRENT-CYCLE planner output onwards.
+    # On a retry (critic FAIL -> planner reran), there are multiple "[Recon Planner]"
+    # AIMessages in history. Capturing from the FIRST one would drag the previous
+    # cycle's tool outputs, the critic verdict, and the critic-feedback HumanMessage
+    # into this cycle's window — bloating context and confusing the LLM about which
+    # plan to follow. Scan in REVERSE to anchor on the most recent planner message so
+    # the executor only sees the current plan and its own tool outputs.
+    # Truncate individual tool outputs to prevent context bloat.
+    planner_idx = next(
+        (
+            i for i in range(len(messages) - 1, -1, -1)
+            if isinstance(messages[i], AIMessage)
+            and "[Recon Planner]" in (messages[i].content or "")
+        ),
+        0,
+    )
     executor_msgs = []
-    capturing = False
-    for msg in messages:
-        if isinstance(msg, AIMessage) and "[Recon Planner]" in (msg.content or ""):
-            capturing = True
-        if capturing:
-            if isinstance(msg, ToolMessage) and msg.content and len(msg.content) > 4000:
-                from copy import copy
-                truncated = copy(msg)
-                truncated.content = msg.content[:4000] + "\n... [output truncated for context]"
-                executor_msgs.append(truncated)
-            else:
-                executor_msgs.append(msg)
+    for msg in messages[planner_idx:]:
+        if isinstance(msg, ToolMessage) and msg.content and len(msg.content) > 4000:
+            from copy import copy
+            truncated = copy(msg)
+            truncated.content = msg.content[:4000] + "\n... [output truncated for context]"
+            executor_msgs.append(truncated)
+        else:
+            executor_msgs.append(msg)
 
     if not executor_msgs:
         executor_msgs = [messages[-1]]
@@ -964,12 +975,16 @@ def _extract_recon_findings(state: dict) -> ReconFindings:
     # (e.g. GraphRecursionError exit with critic_verdict == ""). This ensures the
     # orchestrator gets actionable findings rather than a hard failure.
     #
-    # Guard against FALSE success: a single 'N/tcp open' line from a partial/first
-    # scan must NOT flip success=True. Require a real target IP AND either an
-    # explicit critic verdict or a non-trivial (>=3 distinct ports) result set so
-    # we don't report success on degenerate single-port partial data.
-    if not success and ports and target_ip not in ("", "unknown"):
-        if critic_verdict != "" or len(ports) >= 3:
+    # Guard against FALSE success: only promote in the EARLY-EXIT case where the
+    # critic never ran (critic_verdict == "", e.g. GraphRecursionError). An
+    # explicit FAIL verdict must NOT be flipped to success — the critic judged the
+    # scan inadequate, and masking that would feed the exploit stage findings the
+    # critic rejected. A PASS verdict is already handled above (success = ...
+    # == "PASS"). We also require a real target IP AND a non-trivial (>=3 distinct
+    # ports) result set so a single 'N/tcp open' line from a partial first scan
+    # cannot flip success=True.
+    if not success and critic_verdict == "" and ports and target_ip not in ("", "unknown"):
+        if len(ports) >= 3:
             success = True
 
     # Build summary

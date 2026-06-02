@@ -1148,6 +1148,68 @@ def _collect_executor_commands(messages) -> list:
     return cmds
 
 
+def _extract_rport_from_messages(cycle_msgs) -> "int | None":
+    """Scan the current-cycle messages for the RPORT the executor actually set.
+
+    Returns the last RPORT value (as int) found in any AIMessage/ToolMessage
+    content via `set RPORT <N>` or `RPORT => <N>` patterns, or None if no RPORT
+    evidence exists. This is authoritative for target_port because the executor
+    may switch to a different module than the plan described (e.g. an IRC
+    backdoor on 6667 instead of the planned FTP module on 21), and the plan-text
+    service-name match would then report the wrong port.
+    """
+    rport = None
+    for msg in cycle_msgs:
+        if not isinstance(msg, (AIMessage, ToolMessage)):
+            continue
+        content = msg.content if hasattr(msg, "content") and msg.content else ""
+        if not content:
+            continue
+        # ToolMessage / AIMessage text: 'RPORT => 6667' or 'set RPORT 6667'
+        for m in re.finditer(r'RPORT\s*=>\s*(\d+)', content):
+            rport = int(m.group(1))
+        for m in re.finditer(r'set\s+RPORT\s+(\d+)', content, re.IGNORECASE):
+            rport = int(m.group(1))
+        # Also catch tool-call args where the command sets RPORT.
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            for tc in msg.tool_calls:
+                args = tc.get("args", {}) if isinstance(tc, dict) else {}
+                cmd = str(args.get("command", "") or "")
+                for m in re.finditer(r'set\s+RPORT\s+(\d+)', cmd, re.IGNORECASE):
+                    rport = int(m.group(1))
+    return rport
+
+
+# Known service markers in module paths → default port, used as a hint when the
+# actual RPORT cannot be recovered from messages.
+_MODULE_PATH_PORT_HINTS = [
+    ("/irc/", 6667),
+    ("/smtp/", 25),
+    ("/ftp/", 21),
+    ("/ssh/", 22),
+    ("/telnet/", 23),
+    ("/http/", 80),
+    ("/smb/", 445),
+    ("/samba/", 445),
+    ("/mysql/", 3306),
+    ("/postgres", 5432),
+    ("/vnc/", 5900),
+    ("/rdp/", 3389),
+    ("/snmp/", 161),
+]
+
+
+def _port_hint_from_module(module_path: str) -> "int | None":
+    """Derive a likely target port from known service markers in a module path."""
+    if not module_path:
+        return None
+    low = module_path.lower()
+    for marker, port in _MODULE_PATH_PORT_HINTS:
+        if marker in low:
+            return port
+    return None
+
+
 def _count_module_uses(cmds) -> dict:
     """Count `use <module>` occurrences across the given command strings."""
     counts = {}
@@ -1194,9 +1256,12 @@ def executor_node(state: AgentState) -> dict:
             (mod for mod, n in module_use_counts.items() if n >= 4), None
         )
 
-    # Count how many tool calls the executor has made in this cycle
+    # Count how many tool calls the executor has made in this cycle.
+    # The count is bounded by the last [Parameter Solver] marker, so it resets
+    # correctly on every retry cycle (each retry re-runs parameter_solver, which
+    # emits a fresh marker). This keeps the safety valve scoped to the current
+    # executor invocation without needing a separate scope flag.
     executor_tool_count = 0
-    in_executor = False
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and "[Parameter Solver]" in (msg.content or ""):
             break
@@ -1572,10 +1637,27 @@ def _extract_findings(state: dict) -> ExploitationFindings:
     # active" when an unstable command_shell dies. Verify the session is still
     # live before declaring success; if not, downgrade to an honest FAIL so the
     # orchestrator can retry instead of handing off a dead session.
+    # The liveness probes below already shell into the session; their output
+    # frequently contains the uid= identity line. Capture it here so the probes
+    # double as identity probes and session_user_info is not left empty after a
+    # successful run (defect: session_user_info={} despite access_level set).
+    probed_user_info = {}
+
+    def _capture_uid(text):
+        nonlocal probed_user_info
+        if probed_user_info or not text:
+            return
+        m = re.search(r'uid=(\d+)\((\w+)\)', str(text))
+        if m:
+            probed_user_info = {"uid": m.group(1), "user": m.group(2), "raw": m.group(0)}
+
     if success and session_id:
         alive = False
         try:
             probe = str(msf_session.run_session_command(session_id, "echo __alive__", timeout=5))
+            # Some shell types echo the id string in response to any command;
+            # opportunistically harvest identity from the first probe too.
+            _capture_uid(probe)
             if "__alive__" in probe:
                 alive = True
             else:
@@ -1596,6 +1678,10 @@ def _extract_findings(state: dict) -> ExploitationFindings:
                     probe2 = str(
                         msf_session.run_session_command(session_id, "id", timeout=5)
                     )
+                    # The second probe runs `id` — its uid= output is the
+                    # authoritative session identity. Capture it here so it is
+                    # not discarded after the liveness check.
+                    _capture_uid(probe2)
                     if not probe2.strip():
                         alive = False
                         print_colored(
@@ -1628,16 +1714,22 @@ def _extract_findings(state: dict) -> ExploitationFindings:
     # --- target_ip ---
     target_ip = target_info.get("ip", "unknown")
 
-    # --- target_port: match service name from plan against target_info ports ---
+    # --- target_port ---
+    # Authoritative source: the RPORT the executor actually SET this cycle. The
+    # executor may switch to a different module than the plan described (e.g. an
+    # IRC backdoor on 6667 instead of the planned FTP module on 21), so deriving
+    # the port from the plan text or from ports[0] can report the wrong port.
+    # Order of preference:
+    #   1. RPORT explicitly set/echoed in this cycle's messages (most reliable)
+    #   2. port hint from the actual module path (filled in after exploit_used)
+    #   3. service-name match between plan text and scanned ports (legacy)
+    #   4. first scanned port (last-resort fallback)
     ports = target_info.get("ports", [])
     target_port = ""
-    for p in ports:
-        svc = p.get("service", "")
-        if svc and svc.lower() in current_plan.lower():
-            target_port = str(p.get("port", ""))
-            break
-    if not target_port and ports:
-        target_port = str(ports[0].get("port", ""))
+    rport_used = _extract_rport_from_messages(cycle_msgs)
+    if rport_used:
+        target_port = str(rport_used)
+    # (module-path hint applied after exploit_used is computed below)
 
     # --- exploit_used ---
     # Prefer the LAST module the executor actually ran (`use <module>` in a tool
@@ -1664,12 +1756,41 @@ def _extract_findings(state: dict) -> ExploitationFindings:
     else:
         exploit_used = "unknown"
 
-    # --- access_level: determine by actually running whoami on the session ---
-    access_level = "unknown"
-    result_lower = (execution_result or "").lower()
+    # --- target_port (continued): now that exploit_used is known, fill in the
+    # remaining preference tiers if no RPORT was recovered above.
+    if not target_port:
+        # 2. derive from the actual module path's service marker, mapping that
+        #    service to a scanned port if present, else the marker's default.
+        hint_port = _port_hint_from_module(exploit_used)
+        if hint_port:
+            scanned = next(
+                (p for p in ports if str(p.get("port", "")) == str(hint_port)),
+                None,
+            )
+            target_port = str(hint_port) if (scanned or not ports) else str(hint_port)
+    if not target_port:
+        # 3. legacy: match a scanned service name against the plan text.
+        for p in ports:
+            svc = p.get("service", "")
+            if svc and svc.lower() in current_plan.lower():
+                target_port = str(p.get("port", ""))
+                break
+    if not target_port and ports:
+        # 4. last-resort fallback.
+        target_port = str(ports[0].get("port", ""))
 
-    # Check execution output for root evidence first
-    if "root" in result_lower or "uid=0" in result_lower:
+    # --- access_level: determine by actually running whoami on the session ---
+    # Use explicit uid= pattern matching rather than a bare 'root' substring,
+    # which can match paths (/root/...), error text ('root cause'), or any
+    # incidental occurrence of the word and produce a false 'root' claim.
+    access_level = "unknown"
+
+    # Check execution output for root evidence first — but require a real uid=
+    # line so non-id text cannot trip the match.
+    uid_match = re.search(r'uid=(\d+)\((\w+)\)', execution_result or "")
+    if uid_match:
+        access_level = "root" if (uid_match.group(1) == "0" or uid_match.group(2) == "root") else "user"
+    elif "uid=0" in (execution_result or "").lower():
         access_level = "root"
     elif session_id:
         # Run `id` INSIDE the session via the RPC session API. The previous
@@ -1679,9 +1800,13 @@ def _extract_findings(state: dict) -> ExploitationFindings:
         try:
             id_out = str(
                 msf_session.run_session_command(session_id, "id", timeout=5)
-            ).strip().lower()
+            ).strip()
             print_colored(f"[Access Check] id on session {session_id}: {id_out}", Colors.OKCYAN)
-            if "root" in id_out or "uid=0" in id_out:
+            _capture_uid(id_out)
+            id_uid = re.search(r'uid=(\d+)\((\w+)\)', id_out)
+            if id_uid:
+                access_level = "root" if (id_uid.group(1) == "0" or id_uid.group(2) == "root") else "user"
+            elif "uid=0" in id_out.lower():
                 access_level = "root"
             else:
                 access_level = "user"
@@ -1710,6 +1835,15 @@ def _extract_findings(state: dict) -> ExploitationFindings:
     session_user_info = _extract_session_user_info(cycle_msgs)
     if not session_user_info:
         session_user_info = _extract_session_user_info(messages)
+    # The liveness/access probes above already ran `id` (or harvested a uid= line
+    # from `echo`) inside the session; reuse that captured identity before paying
+    # for another session round-trip.
+    if not session_user_info and probed_user_info:
+        session_user_info = probed_user_info
+        print_colored(
+            f"[Session Identity] Reused {probed_user_info.get('raw', '')} from liveness probe",
+            Colors.OKCYAN,
+        )
     # Raw command shells (ProFTPD mod_copy, Samba) often produce no `uid=` line
     # in any ToolMessage — the executor never ran `id`. If we have a confirmed
     # session but no identity, query it directly via the session API. Wrapped so
@@ -1768,38 +1902,14 @@ def summarizer_node(state: AgentState) -> dict:
 
     print_colored("\n[Summarizer] Compressing context...", Colors.HEADER)
 
-    # Keep original user message
-    original_msg = messages[0]
-
-    # Keep last 2 turns (approximate: last 6 messages)
-    tail_count = min(6, len(messages) - 1)
-    tail = messages[-tail_count:] if tail_count > 0 else []
-
-    # Summarize everything in between
-    middle = messages[1:-tail_count] if tail_count > 0 else messages[1:]
-
-    if middle:
-        summary = summarize_history(middle)
-        summary_msg = HumanMessage(content=f"[COMPRESSED HISTORY]\n{summary}")
-        new_messages = [original_msg, summary_msg] + tail
-    else:
-        new_messages = [original_msg] + tail
-
-    # Also compress any individually large messages in the tail
-    final_messages = []
-    for msg in new_messages:
-        if msg.content and len(msg.content) > HEAVY_MESSAGE_THRESHOLD:
-            final_messages.append(compress_large_message(msg))
-        else:
-            final_messages.append(msg)
-
-    print_colored(f"[Summarizer] Compressed {len(messages)} messages → {len(final_messages)} messages", Colors.OKGREEN)
-
-    # We need to REPLACE the entire message list, not append.
-    # LangGraph uses operator.add for messages, so we clear by returning the diff.
-    # Workaround: return the summarized content as a single new message since we can't
-    # replace the full list via operator.add. The summarizer injects compressed context.
+    # We REPLACE the entire message list with a single compressed message rather
+    # than append. LangGraph uses operator.add for messages, so we inject one
+    # compressed HumanMessage that stands in for all prior attempts. A single
+    # summarize_history pass over messages[1:] is sufficient — the previous code
+    # called the summarizer twice (once over `middle`, once here) and threw the
+    # first result away, doubling LLM cost per compression cycle for no benefit.
     summary_text = summarize_history(messages[1:])
+    print_colored(f"[Summarizer] Compressed {len(messages)} messages → 1 message", Colors.OKGREEN)
     return {
         "messages": [HumanMessage(content=f"[COMPRESSED HISTORY — Previous attempts summarized]\n{summary_text}\n\nRetry with a completely different approach.")]
     }

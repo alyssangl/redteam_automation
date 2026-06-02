@@ -361,7 +361,17 @@ def enumerator_node(state: PrivEscState) -> dict:
         # only boundary on a retry) is skipped and the backward walk keeps
         # counting ToolMessages from the PREVIOUS enum turn, tripping the cap on
         # the first command of the retry.
-        if isinstance(msg, AIMessage) and "[PrivEsc Enumerator]" in (msg.content or ""):
+        # Stop at ANY PrivEsc stage marker AIMessage — not just the enumerator's.
+        # On a FAIL_EXEC retry the most recent non-CRITIC-FEEDBACK HumanMessage is
+        # the original init message (far back). Without stopping at the Planner /
+        # Executor / Critic markers, the backward walk scans past executor
+        # ToolMessages and counts them, prematurely tripping the enum cap and
+        # forcing an immediate summarize call before any enumeration is issued.
+        if isinstance(msg, AIMessage) and any(
+            tag in (msg.content or "")
+            for tag in ("[PrivEsc Enumerator]", "[PrivEsc Planner]",
+                        "[PrivEsc Executor]", "[PrivEsc Critic]")
+        ):
             break
         if isinstance(msg, HumanMessage) and "CRITIC FEEDBACK" not in msg.content:
             break
@@ -395,6 +405,9 @@ def enumerator_node(state: PrivEscState) -> dict:
                 break
         if feedback_msg is not None and feedback_msg not in enum_msgs:
             enum_msgs = [feedback_msg] + enum_msgs
+        # Enforce pair safety: a sliding window or a prepend can place an
+        # orphaned ToolMessage at the front, causing an OpenAI 400 error.
+        enum_msgs = _make_pair_safe(enum_msgs)
 
     if enum_tool_count >= MAX_ENUM_TOOL_CALLS:
         print_colored(f"[PrivEsc Enumerator] Tool cap ({enum_tool_count}).", Colors.WARNING)
@@ -459,7 +472,7 @@ def planner_node(state: PrivEscState) -> dict:
                (isinstance(mi, HumanMessage) and "CRITIC FEEDBACK" in (mi.content or "")):
                 start = i
                 break
-        planner_msgs = list(messages[start:])
+        planner_msgs = _make_pair_safe(list(messages[start:]))
 
     if planner_tool_count >= MAX_PLANNER_TOOL_CALLS:
         print_colored(f"[PrivEsc Planner] RAG cap reached.", Colors.WARNING)
@@ -510,9 +523,16 @@ def executor_node(state: PrivEscState) -> dict:
             start = i
             break
     if start is not None:
-        executor_msgs = list(messages[start:])
+        executor_msgs = _make_pair_safe(list(messages[start:]))
     else:
-        executor_msgs = [messages[-1]]
+        # No clean boundary found. Build a minimal safe context from state
+        # rather than handing a bare ToolMessage to the LLM.
+        fallback_content = (
+            f"Execute escalation on {state.get('target_ip', 'target')}.\n"
+            f"Session: {state.get('session_type', '')} (ID: {state.get('session_id', '')})\n"
+            f"Plan:\n{state.get('escalation_plan', '(no plan available)')}"
+        )
+        executor_msgs = [HumanMessage(content=fallback_content)]
 
     if executor_tool_count >= MAX_EXECUTOR_TOOL_CALLS:
         print_colored(f"[PrivEsc Executor] Tool cap ({executor_tool_count}).", Colors.WARNING)
@@ -562,6 +582,77 @@ def executor_node(state: PrivEscState) -> dict:
     return {"messages": [response]}
 
 
+def _make_pair_safe(msgs: List[BaseMessage]) -> List[BaseMessage]:
+    """Sanitize a message list so it never starts with a ToolMessage that has no
+    preceding assistant message with tool_calls.
+
+    OpenAI raises a 400 "messages with role 'tool' must be a response to a
+    preceding message with 'tool_calls'" when such an orphaned ToolMessage
+    appears.  This happens when a sliding-window slice or a prepend operation
+    cuts between a tool_calls AIMessage and its ToolMessage responses.
+
+    Strategy:
+    1. Drop any leading ToolMessages (and any AIMessages that have tool_calls
+       but whose following ToolMessages were cut) until the window starts with a
+       non-tool-response message.
+    2. Walk the rest of the list and remove any ToolMessage that is not
+       immediately preceded (in the remaining list) by an AIMessage with
+       tool_calls, and conversely remove any AIMessage with tool_calls that has
+       no following ToolMessage.  Repeat until stable.
+    """
+    if not msgs:
+        return msgs
+
+    # Pass 1: drop leading orphaned ToolMessages / tool_calls-only AIMessages.
+    # Keep stripping from the front until the head is clean.
+    result = list(msgs)
+    while result:
+        head = result[0]
+        if isinstance(head, ToolMessage):
+            # Orphaned ToolMessage at the front — drop it.
+            result.pop(0)
+        elif isinstance(head, AIMessage) and head.tool_calls and (
+            len(result) < 2 or not isinstance(result[1], ToolMessage)
+        ):
+            # tool_calls AIMessage with no following ToolMessage — drop it.
+            result.pop(0)
+        else:
+            break
+
+    # Pass 2: walk and enforce pair integrity throughout the list.
+    changed = True
+    while changed:
+        changed = False
+        clean = []
+        i = 0
+        while i < len(result):
+            msg = result[i]
+            if isinstance(msg, ToolMessage):
+                # Check that the previous message in `clean` is an AIMessage
+                # with tool_calls.
+                if clean and isinstance(clean[-1], AIMessage) and clean[-1].tool_calls:
+                    clean.append(msg)
+                else:
+                    changed = True  # drop orphaned ToolMessage
+            elif isinstance(msg, AIMessage) and msg.tool_calls:
+                # Look ahead: ensure at least one ToolMessage follows before
+                # any non-ToolMessage boundary.
+                j = i + 1
+                while j < len(result) and isinstance(result[j], ToolMessage):
+                    j += 1
+                if j == i + 1:
+                    # No ToolMessage follows — drop this dangling tool_calls message.
+                    changed = True
+                else:
+                    clean.append(msg)
+            else:
+                clean.append(msg)
+            i += 1
+        result = clean
+
+    return result
+
+
 def _collect_grounded_tool_outputs(turn_msgs: List[BaseMessage], limit: int = 3) -> str:
     """Collect the last `limit` raw ToolMessage contents (each capped at 500
     chars) from the current executor turn, for use as grounded evidence."""
@@ -580,6 +671,87 @@ def _collect_grounded_tool_outputs(turn_msgs: List[BaseMessage], limit: int = 3)
     return "\n---\n".join(tool_outputs)
 
 
+def _resolve_live_session_id(state: PrivEscState) -> str:
+    """Resolve the session id the critic should run its ground-truth `id` check
+    against. The `session_id` in state can be stale or empty (e.g. SESSION_DEAD
+    recovery entered the graph with session_id=''), while the enumerator/executor
+    may have discovered/recovered a different live session. Resolution order:
+
+    1. state['session_id'] if non-empty (the normal case).
+    2. The session_id last passed to tool_session_command by an executor/
+       enumerator AIMessage tool call (the session actually being driven).
+    3. A live session matching the target IP via session.list (reuse the same
+       matching logic as run_privesc), else a lone live shell session.
+    """
+    sid = str(state.get("session_id", "") or "")
+    if sid:
+        return sid
+
+    # 2. Last tool_session_command session_id from the message history.
+    for msg in reversed(state.get("messages", [])):
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            for tc in msg.tool_calls:
+                if tc.get("name") == "tool_session_command":
+                    args = tc.get("args", {}) or {}
+                    cand = str(args.get("session_id", "") or "")
+                    if cand:
+                        return cand
+
+    # 3. Live session.list match against the target IP.
+    target_ip = str(state.get("target_ip", "") or "")
+    try:
+        sl = msf_session.client.call("session.list") or {}
+    except Exception:
+        sl = {}
+    if not isinstance(sl, dict) or not sl:
+        return ""
+    bare_ip = target_ip.split(":")[0] if target_ip else ""
+    try:
+        for sid_key, sdata in sl.items():
+            conn = _session_conn_str(sdata)
+            conn_bare = conn.split(":")[0] if conn else conn
+            if bare_ip and (bare_ip in conn or bare_ip == conn_bare):
+                return str(sid_key)
+        # No IP match — accept a lone live shell session.
+        shell_sids = [str(k) for k, v in sl.items() if _is_shell_session(v)]
+        if len(shell_sids) == 1:
+            return shell_sids[0]
+        if len(shell_sids) > 1:
+            numeric = [s for s in shell_sids if s.isdigit()]
+            return max(numeric, key=int) if numeric else shell_sids[-1]
+    except Exception:
+        return ""
+    return ""
+
+
+# Module-level helpers reused by _resolve_live_session_id (defined here so the
+# critic's session resolution does not depend on the closures inside run_privesc).
+def _decode_session_val(v):
+    if isinstance(v, bytes):
+        return v.decode("utf-8", errors="ignore")
+    return v if v is not None else ""
+
+
+def _session_conn_str(sdata: dict) -> str:
+    parts = []
+    for k in (b"tunnel_peer", "tunnel_peer", b"session_host", "session_host",
+              b"target_host", "target_host", b"tunnel_local", "tunnel_local"):
+        if isinstance(sdata, dict) and k in sdata:
+            parts.append(_decode_session_val(sdata.get(k)))
+    return " ".join(str(p) for p in parts)
+
+
+def _is_shell_session(sdata: dict) -> bool:
+    if not isinstance(sdata, dict):
+        return False
+    for k in (b"type", "type"):
+        if k in sdata:
+            t = _decode_session_val(sdata.get(k)).lower()
+            if "shell" in t or "meterpreter" in t:
+                return True
+    return not any(k in sdata for k in (b"type", "type"))
+
+
 def critic_node(state: PrivEscState) -> dict:
     """3-way evaluation of privesc attempt."""
     current_step = state.get("loop_step", 0)
@@ -590,8 +762,13 @@ def critic_node(state: PrivEscState) -> dict:
     # root' while the real output is 'vagrant' or an error). Run `id` directly
     # on the target under a hard wall-clock cap and feed the RAW output to the
     # critic LLM as authoritative evidence.
+    #
+    # Use the LIVE session the executor actually drove, not the (possibly stale
+    # or empty) session_id from state. When SESSION_DEAD recovery ran, state's
+    # session_id is '' and the direct check would be meaningless; resolving the
+    # recovered session lets the critic's ground-truth `id` reach the real shell.
     direct_id = ""
-    sid = state.get("session_id", "")
+    sid = _resolve_live_session_id(state)
     if sid:
         direct_id = _session_command_capped(sid, "id", timeout=15)
         # Retry once if the command shell returned nothing / only preamble —
