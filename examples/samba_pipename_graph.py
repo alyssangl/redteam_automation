@@ -11,10 +11,10 @@ Chain:
   recon            — nmap full scan
   smb_enum         — enumerate SMB shares to confirm a writable share
   samba_rce        — exploit/linux/samba/is_known_pipename -> command shell
-  privesc_lookup   — id / sudo -l / find SUID enumeration on the new shell
+  escalate   — id / sudo -l / find SUID enumeration on the new shell
   file_drop        — write proof-of-compromise file and read it back
 
-Expected: clean run lands a shell via the writable share. privesc_lookup
+Expected: clean run lands a shell via the writable share. escalate
 should honestly report whatever escalation surface exists from the shell,
 which the replanner can use to decide whether to escalate or wrap up with
 file_drop.
@@ -108,26 +108,20 @@ def build_samba_pipename_graph(target_ip: str, attacker_ip: str) -> AttackGraph:
     ))
 
     graph.add_node(AttackNode(
-        id="privesc_lookup",
-        label="Enumerate Privesc Vectors from Shell",
+        id="escalate",
+        label="Escalate Privileges to Root",
         tactic=Tactic.PRIVILEGE_ESCALATION.value,
-        technique_id="T1082",
-        technique_name="System Information Discovery",
+        technique_id="T1068",
+        technique_name="Exploitation for Privilege Escalation",
         agent_type="privesc",
-        goal="Identify whether the smbd shell can reach root",
-        objective="Enumerate id, sudo, SUID binaries, and writable system paths "
-                  "from the newly opened session.",
+        goal="Escalate the compromised session to root",
+        objective="From the existing session, enumerate AND exploit any viable "
+                  "privilege-escalation vector (sudo, SUID, kernel exploit, cron, "
+                  "capabilities, writable config, docker group) to obtain a root "
+                  "shell. Verify success with id/whoami showing uid=0.",
         target_ip=target_ip,
-        tool_name="session",
-        commands_to_run=[
-            "id",
-            "whoami",
-            "uname -a",
-            "sudo -n -l",
-            "find / -perm -4000 -type f 2>/dev/null | head -20",
-        ],
-        max_retries=1,
-        tags=["privesc", "enum", "suid"],
+        max_retries=3,
+        tags=["privesc", "escalation", "goal_only"],
     ))
 
     graph.add_node(AttackNode(
@@ -189,7 +183,7 @@ def build_samba_pipename_graph(target_ip: str, attacker_ip: str) -> AttackGraph:
     )
 
     graph.connect(
-        "samba_rce", "privesc_lookup",
+        "samba_rce", "escalate",
         checks=[
             EdgeCheck(
                 field="session_id", operator="exists",
@@ -201,7 +195,7 @@ def build_samba_pipename_graph(target_ip: str, attacker_ip: str) -> AttackGraph:
     )
 
     graph.connect(
-        "privesc_lookup", "file_drop",
+        "escalate", "file_drop",
         checks=[
             EdgeCheck(
                 field="success", operator="equals", expected="True",

