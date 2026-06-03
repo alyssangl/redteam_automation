@@ -196,13 +196,28 @@ Do NOT use `tool_metasploit_rpc` for target commands — use it only for MSF con
 **Enumeration checklist — run these in order of priority (via tool_session_command):**
 
 1. **Basic info**: `whoami`, `id`, `uname -a` (via tool_session_command)
-2. **Auto-suggester (do this early)**: `tool_metasploit_rpc("run post/multi/recon/local_exploit_suggester SESSION=<session_id>")` — auto-enumerates kernel and local exploit candidates. This is fast and high-yield; run it before the slow manual scans below. (Only works for meterpreter sessions; if it errors on a command_shell, skip it and continue manually.)
-3. **Sudo check**: `sudo -l` (most common privesc vector)
-4. **SUID binaries**: `find / -perm -4000 -type f 2>/dev/null`
-5. **Cron jobs**: `cat /etc/crontab`
-6. **Kernel version**: `uname -r` (for kernel exploit matching)
-7. **Running processes**: `ps aux | head -30`
-8. **Capabilities**: `getcap -r / 2>/dev/null` (cap_setuid/cap_net_raw etc.)
+2. **Upgrade to meterpreter if the session is a command_shell (DO THIS BEFORE the suggester).**
+   `local_exploit_suggester` and every MSF local kernel-exploit require a
+   METERPRETER session. The SESSION you were handed is almost always a
+   command_shell on legacy targets. So FIRST upgrade it:
+   `tool_metasploit_rpc("sessions -u <session_id>")`. Watch the output for
+   `Meterpreter session N opened` — that N is your NEW meterpreter session id.
+   Use N for the suggester in step 3, and REPORT it in your summary
+   (`Meterpreter session:` field) so the planner/executor reuse it. If the
+   session is already meterpreter, skip this step. If the upgrade fails, note it
+   and continue manually — the manual vectors below don't need meterpreter.
+3. **Auto-suggester (do this right after the upgrade)**:
+   `tool_metasploit_rpc("run post/multi/recon/local_exploit_suggester SESSION=<meterpreter_session_id>")`
+   — auto-enumerates kernel and local exploit candidates. Fast and high-yield; run
+   it before the slow manual scans below. Record EVERY module it marks
+   "appears to be vulnerable" / "the target appears to be vulnerable" — these are
+   the kernel path and are reported under `Suggested local exploits:`.
+4. **Sudo check**: `sudo -l` (most common privesc vector)
+5. **SUID binaries**: `find / -perm -4000 -type f 2>/dev/null`
+6. **Cron jobs**: `cat /etc/crontab`
+7. **Kernel version**: `uname -r` (for kernel exploit matching)
+8. **Running processes**: `ps aux | head -30`
+9. **Capabilities**: `getcap -r / 2>/dev/null` (cap_setuid/cap_net_raw etc.)
 
 **Rules:**
 1. Execute commands ONE AT A TIME
@@ -216,6 +231,8 @@ ENUMERATION RESULTS:
 - OS: <version>
 - Kernel: <version>
 - Current user: <username>
+- Meterpreter session: <new meterpreter session id from the step-2 upgrade, or 'n/a' if already meterpreter / upgrade failed>
+- Suggested local exploits: <modules local_exploit_suggester flagged vulnerable, or 'none/suggester unavailable'>
 - Sudo rights: <what sudo -l returned>
 - SUID binaries: <notable ones>
 - Cron jobs: <any writable or interesting>
