@@ -36,6 +36,13 @@ class PrivEscFindings(TypedDict):
     previous_level: str   # "user" | "root"
     new_level: str        # "root"
     summary: str
+    # The session privesc actually lands on. When the kernel path upgrades a
+    # command_shell to meterpreter (or a local-exploit opens a new root session),
+    # this is the NEW session — not the original command_shell the stage was
+    # handed. The orchestrator's _find_session routes impact to it so a rooted
+    # session isn't orphaned. Empty when no usable session could be resolved.
+    session_id: str
+    session_type: str     # "command_shell" | "meterpreter"
 
 
 class ImpactFindings(TypedDict):

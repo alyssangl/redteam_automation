@@ -786,18 +786,34 @@ def _parse_msf_output(output: str, node: AttackNode, target_ip: str, log: loggin
 # HELPERS — extract session/recon info from preceding findings
 # =============================================================================
 
+_ACCESS_RANK = {"root": 3, "user_with_sudo": 2, "sudo": 2, "user": 1}
+
+
 def _find_session(preceding: dict) -> tuple[str, str, str]:
-    """Find session_id, session_type, access_level from preceding findings."""
+    """Find session_id, session_type, access_level from preceding findings.
+
+    When more than one predecessor carries a successful session (e.g. both the
+    initial-access node AND a privesc node that upgraded to a root meterpreter),
+    prefer the MOST-ESCALATED one so impact runs as root rather than re-using the
+    original user shell. privesc reports its post-escalation session via
+    `new_level` + `session_id`; ties break toward the later finding (privesc runs
+    after initial access). Single-predecessor behaviour is unchanged."""
+    best = None  # (rank, sid, stype, level)
     for pred_id, pf in preceding.items():
-        if "session_id" in pf and pf.get("success"):
-            sid = str(pf["session_id"])
-            stype = pf.get("session_type", "shell")
-            level = pf.get("access_level", "unknown")
-            # Check if a later node escalated
-            if "new_level" in pf and pf.get("success"):
-                level = pf["new_level"]
-            return sid, stype, level
-    return "", "", "unknown"
+        if not pf.get("success"):
+            continue
+        sid = str(pf.get("session_id") or "")
+        if not sid:
+            continue
+        stype = pf.get("session_type", "shell")
+        # privesc exposes the escalated level via new_level; others via access_level.
+        level = pf.get("new_level") or pf.get("access_level", "unknown")
+        rank = _ACCESS_RANK.get(str(level).lower(), 0)
+        if best is None or rank >= best[0]:
+            best = (rank, sid, stype, level)
+    if best is None:
+        return "", "", "unknown"
+    return best[1], best[2], best[3]
 
 
 def _find_recon(preceding: dict) -> tuple[dict, str, str]:

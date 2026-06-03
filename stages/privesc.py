@@ -778,6 +778,67 @@ def _is_shell_session(sdata: dict) -> bool:
     return not any(k in sdata for k in (b"type", "type"))
 
 
+# A session "opened" line printed by MSF when an upgrade (sessions -u /
+# shell_to_meterpreter) or a local kernel-exploit lands a NEW session.
+_OPENED_SESSION_RE = re.compile(
+    r"(meterpreter|command shell)\s+session\s+(\d+)\s+opened", re.IGNORECASE)
+
+
+def _scan_opened_sessions(messages: List[BaseMessage]) -> List[tuple]:
+    """Return [(session_id, session_type), ...] for every 'X session N opened'
+    line in the privesc message history, NEWEST FIRST. These are sessions created
+    DURING privesc — a command_shell->meterpreter upgrade or a kernel-exploit
+    session — i.e. the ones a successful escalation actually lands on. The
+    ORIGINAL session id lives in state['session_id'] (prose in the init message),
+    never in a ToolMessage, so it is never matched here."""
+    found = []
+    for msg in messages:
+        content = getattr(msg, "content", "") or ""
+        if not content:
+            continue
+        for m in _OPENED_SESSION_RE.finditer(content):
+            stype = "meterpreter" if "meterpreter" in m.group(1).lower() else "command_shell"
+            found.append((m.group(2), stype))
+    found.reverse()  # newest first
+    return found
+
+
+def _live_session_ids():
+    """Set of live session id strings from session.list, or None if the RPC is
+    unavailable (so callers can fall back rather than treat 'unknown' as 'dead')."""
+    try:
+        sl = msf_session.client.call("session.list") or {}
+    except Exception:
+        return None
+    if not isinstance(sl, dict):
+        return None
+    return {str(k) for k in sl.keys()}
+
+
+def _resolve_final_session(state: PrivEscState) -> tuple:
+    """Resolve the (session_id, session_type) a privesc result actually lands on.
+
+    Prefers the NEWEST live session opened during privesc (a meterpreter upgrade
+    or a kernel-exploit session) over the original command_shell in state, because
+    the kernel path roots a NEW session while state['session_id'] still points at
+    the pre-upgrade shell. Falls back to the original session when no upgrade
+    happened (the common case → behaviour unchanged)."""
+    messages = state.get("messages", []) or []
+    opened = _scan_opened_sessions(messages)
+    if opened:
+        live = _live_session_ids()
+        for sid, stype in opened:
+            if live is None or sid in live:
+                return sid, stype
+    sid = str(state.get("session_id", "") or "")
+    if sid:
+        return sid, str(state.get("session_type", "") or "command_shell")
+    # No session in state (e.g. SESSION_DEAD recovery). Reuse the legacy live
+    # resolver, which scans tool_session_command ids + session.list.
+    legacy = _resolve_live_session_id(state)
+    return (legacy, "") if legacy else ("", "")
+
+
 def critic_node(state: PrivEscState) -> dict:
     """3-way evaluation of privesc attempt."""
     current_step = state.get("loop_step", 0)
@@ -1064,12 +1125,18 @@ def _extract_privesc_findings(state: dict) -> PrivEscFindings:
     else:
         summary = f"PrivEsc failed. Attempted: {technique}. {escalation_result[:100] if escalation_result else ''}"
 
+    # Surface the session privesc landed on (the upgraded/root session when the
+    # kernel path ran) so the orchestrator can route impact to it.
+    final_sid, final_stype = _resolve_final_session(state)
+
     return PrivEscFindings(
         success=success,
         technique=technique,
         previous_level=previous_level,
         new_level=new_level,
         summary=summary,
+        session_id=final_sid,
+        session_type=final_stype,
     )
 
 # =============================================================================
@@ -1097,6 +1164,8 @@ def run_privesc(
             previous_level="root",
             new_level="root",
             summary="Already had root access. No escalation needed.",
+            session_id=str(session_id or ""),
+            session_type=session_type or "",
         )
 
     # Fast-path: passwordless sudo. If the orchestrator already determined the
@@ -1151,6 +1220,8 @@ def run_privesc(
                     previous_level=access_level,
                     new_level="root",
                     summary="Escalated via passwordless sudo (NOPASSWD).",
+                    session_id=str(session_id or ""),
+                    session_type=session_type or "",
                 )
             print_colored(
                 "[PrivEsc] Fast-path sudo check did not confirm root — falling through to graph.",
@@ -1388,6 +1459,8 @@ def run_privesc(
             previous_level=access_level,
             new_level=access_level,
             summary=f"PrivEsc crashed: {str(e)[:200]}",
+            session_id=str(session_id or ""),
+            session_type=session_type or "",
         )
 
     final_snapshot = app.get_state(config)
