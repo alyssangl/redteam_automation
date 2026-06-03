@@ -431,6 +431,23 @@ def _render_command(template: str, params: dict) -> str:
         return template
 
 
+def _with_stderr_capture(cmd: str) -> str:
+    """Append `2>&1` so a session command's STDERR is captured.
+
+    P0 fix: a non-root `echo > /root/x` / `cat /root/x` writes its error
+    ("Permission denied", "No such file or directory") to STDERR, which the MSF
+    shell_read did NOT capture — so the failure scanner saw clean output and the
+    node FALSELY reported success (flaw_impact). Merging stderr into stdout lets
+    the existing _FAILURE_INDICATORS catch it -> success=False -> the node retries
+    -> _resolve_command_params swaps in command_params_alternatives (e.g. /tmp).
+    Skip commands that already manage stderr (e.g. `... 2>/dev/null`).
+    """
+    cmd = cmd.strip()
+    if not cmd or "2>" in cmd:
+        return cmd
+    return f"{cmd} 2>&1"
+
+
 # Concrete failure-indicator phrases. These are case-insensitive substring
 # matches against command output. The list comes from observed false positives
 # in live runs (see reports/stage_{1,2,3}_live_test.md) — every entry here is
@@ -554,7 +571,10 @@ def _execute_session_commands(
     for template in node.commands_to_run:
         cmd = _render_command(template, params)
         log.info(f"  [direct] session({session_id})> {cmd}")
-        output = msf_session.run_session_command(session_id, cmd, timeout=30)
+        # Capture stderr so denied writes / missing files are SEEN by the failure
+        # scanner (else false success — see _with_stderr_capture).
+        output = msf_session.run_session_command(
+            session_id, _with_stderr_capture(cmd), timeout=30)
         node.add_command(cmd, tool="session", output=output, target="target")
         all_output += output + "\n"
 
