@@ -347,12 +347,18 @@ You evaluate whether privilege escalation succeeded.
 
 **Primary success criterion:** `whoami` returns `root` OR `id` shows `uid=0(root)`.
 
-**GROUNDING RULE (critical):** You are given a `DIRECT ID CHECK` field — the raw
-output of `id` run by YOU on the target moments ago. This is authoritative. If
-it shows `uid=0(root)`, escalation succeeded (PASS) regardless of the prose. If
-it does NOT show `uid=0` (e.g. `uid=1000(vagrant)`, an error, empty, or a
-timeout message), you MUST NOT return PASS even if the EXECUTION RESULT prose
-claims success — the executor is hallucinating. Classify it as a failure.
+**GROUNDING RULE (critical):** You are given a `DIRECT ID CHECK` field — a raw
+ground-truth privilege check run by YOU on the target moments ago. It is prefixed
+with the session type that was probed:
+  - `[command_shell id] ...` → root IFF the output shows `uid=0(root)`.
+  - `[meterpreter getuid] ...` → root IFF the output shows `Server username: root`
+    (or `uid=0`). On a meterpreter session `id` is NOT a valid command, so
+    `getuid` is the authoritative probe — do not expect a `uid=` line here.
+This field is authoritative. If it shows root by the rule above, escalation
+succeeded (PASS) regardless of the prose. If it does NOT (e.g. `uid=1000(vagrant)`,
+`Server username: vagrant`, an error, empty, or a timeout message), you MUST NOT
+return PASS even if the EXECUTION RESULT prose claims success — the executor is
+hallucinating. Classify it as a failure.
 
 **3-way failure classification:**
 
@@ -579,20 +585,18 @@ def executor_node(state: PrivEscState) -> dict:
         # Force one direct ground-truth verification before summarizing, so the
         # cap summary (and the critic) has a real whoami result rather than a
         # context-window guess.
-        sid = state.get("session_id", "")
-        direct_verify = _session_command_capped(sid, "whoami", timeout=15) if sid else "(no session_id)"
-        # Retry once if the first read came back empty / preamble-only — a
-        # command_shell can return an empty first chunk (metasploit_tools breaks
-        # on the first read), losing the actual 'root'/'user' line.
-        if (not str(direct_verify).strip()) or str(direct_verify).strip() in ("(no output)",):
-            time.sleep(2)
-            direct_verify = _session_command_capped(sid, "whoami", timeout=15) if sid else "(no session_id)"
+        # Resolve the session privesc actually landed on (upgraded meterpreter /
+        # kernel-exploit session), and probe it with the type-appropriate check
+        # (id for a shell, getuid for meterpreter — `whoami`/`id` are invalid on
+        # meterpreter and would lose the real result).
+        sid = _resolve_final_session(state)[0]
+        direct_verify = _direct_priv_check(sid, timeout=15) if sid else "(no session_id)"
         direct_verify = str(direct_verify)[:500]
         response = call_llm(
             messages=executor_msgs + [HumanMessage(content=(
-                f"DIRECT VERIFICATION: whoami returned: {direct_verify}\n"
+                f"DIRECT VERIFICATION (ground-truth privilege check): {direct_verify}\n"
                 "Max tool calls reached. Based on this output, report whether "
-                "escalation succeeded (did whoami return root?) and what happened."
+                "escalation succeeded (root reached?) and what happened."
             ))],
             system_prompt=EXECUTOR_PROMPT
         )
@@ -839,6 +843,34 @@ def _resolve_final_session(state: PrivEscState) -> tuple:
     return (legacy, "") if legacy else ("", "")
 
 
+def _direct_priv_check(sid: str, timeout: int = 15) -> str:
+    """Run a SESSION-TYPE-APPROPRIATE ground-truth privilege check and return the
+    raw output, prefixed with the session type so the critic knows how to read it.
+
+    A command_shell takes `id` (root => uid=0(root)). A meterpreter session does
+    NOT understand `id` (it returns 'Unknown command: id'); its native privilege
+    probe is `getuid` (root => 'Server username: root'). Sending `id` to a rooted
+    meterpreter session would otherwise make the critic falsely FAIL — the exact
+    blind spot the kernel path hits, since the kernel exploit lands on meterpreter.
+    Retries once on an empty/preamble-only first read (shell reads can chunk)."""
+    stype = ""
+    try:
+        st = msf_session.get_session_type(sid)
+        if isinstance(st, bytes):
+            st = st.decode("utf-8", errors="ignore")
+        stype = (st or "").lower()
+    except Exception:
+        stype = ""
+
+    cmd = "getuid" if "meterpreter" in stype else "id"
+    label = "meterpreter getuid" if "meterpreter" in stype else "command_shell id"
+    out = _session_command_capped(sid, cmd, timeout=timeout)
+    if (not str(out).strip()) or str(out).strip() in ("(no output)",):
+        time.sleep(2)
+        out = _session_command_capped(sid, cmd, timeout=timeout)
+    return f"[{label}] {out}"
+
+
 def critic_node(state: PrivEscState) -> dict:
     """3-way evaluation of privesc attempt."""
     current_step = state.get("loop_step", 0)
@@ -855,14 +887,13 @@ def critic_node(state: PrivEscState) -> dict:
     # session_id is '' and the direct check would be meaningless; resolving the
     # recovered session lets the critic's ground-truth `id` reach the real shell.
     direct_id = ""
-    sid = _resolve_live_session_id(state)
+    # Resolve against the session privesc actually landed on — after a
+    # command_shell->meterpreter upgrade or a kernel exploit that opened a new
+    # root session, that is NOT state['session_id']. _direct_priv_check then
+    # issues the right probe for the session type (id vs getuid).
+    sid = _resolve_final_session(state)[0]
     if sid:
-        direct_id = _session_command_capped(sid, "id", timeout=15)
-        # Retry once if the command shell returned nothing / only preamble —
-        # command_shell reads can return an empty first chunk.
-        if (not direct_id.strip()) or direct_id.strip() in ("(no output)",):
-            time.sleep(2)
-            direct_id = _session_command_capped(sid, "id", timeout=15)
+        direct_id = _direct_priv_check(sid, timeout=15)
     else:
         direct_id = "(no live session_id available for a direct check)"
     print_colored(f"[PrivEsc Critic] DIRECT ID CHECK: {str(direct_id)[:200]}", Colors.OKCYAN)
