@@ -159,11 +159,21 @@ session, recovered by the replanner when escalate kills the session.
 
 | Graph | Result |
 |---|---|
-| **proftpd** (R-v9) | **EXECUTION COMPLETE 83%** — recon✓ proftpd_check✓ proftpd_rce✓ escalate✗(honest no-root) file_drop✓ via replanner-recovered session 22. Solid example. |
-| unrealircd | (examples batch) |
-| samba | (examples batch) |
-| continuum | (examples batch) |
-| drupal | (examples batch) |
+| **proftpd** (R-v9) | **COMPLETE 83%** — proftpd_modcopy (own vector), escalate✗, file_drop✓ (replanner-recovered session). |
+| **unrealircd** (v11) | **COMPLETE 80%** — irc_backdoor (own vector) session 1, escalate✗, file_drop✓. |
+| **samba** (v11) | **COMPLETE 80%** — is_known_pipename DIDN'T land → fallback improvised to UnrealIRCd (session 2), escalate✗, file_drop✓. Demonstrates fallback resilience, not a Samba compromise. |
+| **continuum** (v11) | **TIMEOUT (40m cap)** — apache_continuum_cmd_exec didn't land; fallback ground through options without converging. |
+| **drupal** (v11) | **TIMEOUT (40m cap)** — drupalgeddon2 didn't land; fallback ground without converging. |
+
+v11 ALSO live-validated v8 (lazy MSF connects on first use, not import) + v10 (escalate
+one-attempt: "failed (non-retryable / deterministic)" — no 3× grind).
+
+NEW FINDING (→ roadmap P1): continuum/drupal timed out because the EXPLOIT subagent
+(run_exploitation) has NO wall-clock time-box (privesc got one in v7). When the
+prescribed vector fails it grinds for 40 min instead of bounding the attempt and
+letting the walker pivot to a known-good vector. Fix = mirror v7's time-box in
+run_exploitation. Secondary: the fallback/replanner should prioritize a PROVEN
+vector (UnrealIRCd here) over grinding unproven ones.
 
 KEY FINDING (→ roadmap): on this box network RCEs land non-root (www-data/boba_fett)
 and there is no kernel-exploit in privesc's repertoire, so escalate honestly fails —
