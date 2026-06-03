@@ -46,6 +46,13 @@ MSF_PASS = "kali"
 MAX_RETRIES = 5
 MAX_EXECUTOR_TOOL_CALLS = 15
 MAX_RESEARCHER_TOOL_CALLS = 10
+# v12: hard wall-clock cap on the WHOLE exploitation attempt (mirrors v7's
+# privesc time-box). When a prescribed vector fails, the fallback/researcher can
+# grind through modules for tens of minutes (continuum/drupal hit the 40-min
+# runner cap). On expiry we stop streaming and return best-effort findings marked
+# "time-boxed" so the category-aware retry (v10) treats it as non-retryable and
+# the walker replans to a different/known-good vector instead of grinding.
+EXPLOIT_WALLCLOCK_TIMEOUT = 600  # seconds
 TOKEN_SENSITIVE_THRESHOLD = 100000
 HEAVY_MESSAGE_THRESHOLD = 20000
 
@@ -2117,8 +2124,17 @@ def run_exploitation(
     print_colored(f"  Thread: {thread_id}", Colors.HEADER)
     print_colored(f"{'='*60}\n", Colors.HEADER)
 
-    # Stream to completion, printing progress
+    # Stream to completion, printing progress (with a wall-clock time-box)
+    _start = time.time()
+    _timed_out = False
     for event in app.stream(initial_state, config=config):
+        if time.time() - _start > EXPLOIT_WALLCLOCK_TIMEOUT:
+            print_colored(
+                f"\n[Exploitation] TIME-BOX hit ({EXPLOIT_WALLCLOCK_TIMEOUT}s) — "
+                f"stopping; returning best-effort findings so the walker can pivot.",
+                Colors.WARNING)
+            _timed_out = True
+            break
         for key, value in event.items():
             if not value or "messages" not in value:
                 continue
@@ -2156,6 +2172,15 @@ def run_exploitation(
     final_state = final_state_snapshot.values
 
     findings = _extract_findings(final_state)
+    if _timed_out and not findings.get("success"):
+        # "time-boxed" in summary -> v10 _is_retryable_failure() treats it as
+        # non-retryable -> walker replans to a different vector instead of grinding.
+        findings["failure_category"] = "timeout"
+        findings["failure_cause"] = f"exploitation time-boxed at {EXPLOIT_WALLCLOCK_TIMEOUT}s"
+        findings["summary"] = (
+            f"Exploitation time-boxed at {EXPLOIT_WALLCLOCK_TIMEOUT}s without a "
+            f"session. " + findings.get("summary", "")
+        )
 
     print_colored(f"\n{'='*60}", Colors.HEADER)
     print_colored(f"[run_exploitation] Complete — success={findings['success']}", Colors.OKGREEN if findings['success'] else Colors.FAIL)
