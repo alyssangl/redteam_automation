@@ -26,6 +26,45 @@ Then remaining items below.
 
 ---
 
+## Findings from the flaw-adaptation batch (5 graphs, one broken stage each)
+flaw_recon 100% (replanner re-routed past a bad edge), flaw_initial_access 75%
+(fallback→UnrealIRCd + replanner→file_drop), flaw_privesc 75% (adapts but 2 issues
+below), flaw_persistence 100% (persistence subagent FIXED the broken module's
+options — best adaptation), flaw_impact "100%" but FALSE (see P0).
+
+### P0 — Direct-execution path has NO verification (false success)  (effort M, risk M)
+flaw_impact wrote to /root as a non-root session → "access: PERMISSION DENIED" →
+the file_drop node still reported STATUS=success ("Executed 3 commands") and the
+run logged 100%. The no-LLM `_execute_direct` path (commands_to_run over a session)
+counts "ran N commands" as success without checking output, and never tried the
+command_params_alternatives (/tmp). v2's grounded verification lives in the
+SUBAGENTS; the direct path has none.
+Fix: in `_execute_direct` (core_agents/orchestrator.py), verify session-command
+success — detect "permission denied"/error markers, and for proof-file drops read
+the file back; on real failure try command_params_alternatives, else fail honestly
+(so the walker adapts). This is a correctness bug, not just efficiency.
+
+### P1 — Replanner re-routes to non-retryably-dead nodes  (effort M, risk M)
+flaw_privesc: after escalate failed NON-RETRYABLY (deterministic time-box), the
+replanner created `gain_access→escalate` again and re-ran the dead node (~2× 300s)
+before finally routing to file_drop. Fix: track nodes that failed non-retryably
+and never re-route to them; route to the objective instead. (Pairs with the
+earlier "replanner emitted recon→persist with no session" precondition bug.)
+
+### Confirmed — privesc repertoire gap (this is the P2 item below, now evidenced)
+flaw_privesc forced the privesc subagent to improvise; it tried only manual vectors
+(cron_abuse, suid) and time-boxed — never `local_exploit_suggester` / overlayfs /
+dirtycow. It CAN (it has msfconsole), it just isn't prompted to. Scope right,
+prompt/tool-breadth incomplete.
+
+### Minor — impact-edge gating + flaky direct UnrealIRCd
+- escalate→file_drop gated on session_id, but privesc findings don't emit session_id
+  → replanner must re-route every time. Gate impact on "a session exists upstream".
+- the prescribed UnrealIRCd module frequently fails on the DIRECT path but the
+  exploit subagent recovers it every time — direct-path payload/handler timing.
+
+---
+
 ## P1 — Category-aware retry policy  (effort M, risk M)
 **Problem:** node retries fire blindly on `max_retries` regardless of *why* the
 node failed. Identical-param retries of a deterministic failure are pure waste
