@@ -1440,6 +1440,16 @@ Rules:
 - *** NEVER propose a module path or command that already appears in the
     FAILED entries of REMAINING NODES. *** Read those entries' `module` and
     `commands_to_run` fields carefully -- if it's there, it already failed.
+- *** CREDENTIAL ROTATION FIRST: if a FAILED node in REMAINING NODES has
+    `failure_category: auth_failed`, the LOGIN itself failed — the service and
+    module are fine, only the credentials were wrong. STRONGLY PREFER retrying
+    that SAME module with DIFFERENT credentials (shape 1b, setting
+    module_options.USERNAME and .PASSWORD) BEFORE switching to a different attack
+    vector. Read that node's `module_options` to see which creds already failed
+    and pick an UNTRIED pair. Common Metasploitable / lab credentials, one per
+    replan: vagrant/vagrant, msfadmin/msfadmin, admin/admin, root/toor,
+    ubuntu/ubuntu. Only switch vectors once the plausible credential pairs are
+    exhausted.
 - DIVERSIFY across replans: if FTP didn't work, try Samba / IRC / HTTP / etc.
   Each replan should try a SUBSTANTIALLY different vector.
 - Match exploits to the DETECTED SERVICES versions you see in the context.
