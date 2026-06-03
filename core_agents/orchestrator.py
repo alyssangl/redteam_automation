@@ -1319,13 +1319,19 @@ def _rewrite_commands_with_hint(
 def _try_replanner(
     graph: AttackGraph, current: str, log: logging.Logger,
     checkpoint_path: str, replan_attempts: int, max_replan_attempts: int,
-    explore: bool,
+    explore: bool, dead_nodes: set = None,
 ) -> tuple[Optional[str], int]:
     """
     Try to replan from `current`. Returns (new_target_or_None, updated_attempts).
 
     Returns (None, replan_attempts) without firing the LLM if explore is off,
     the budget is exhausted, or the LLM gave up.
+
+    P1 fix: `dead_nodes` is the set of nodes that already failed non-retryably
+    (deterministic). If the replanner proposes re-routing to one of them, we
+    REJECT it — re-running a dead node just burns time (flaw_privesc looped on a
+    time-boxed escalate ~2× 300s before progressing). Rejecting keeps the cheap
+    LLM replan but never re-EXECUTES the dead node.
     """
     if not explore:
         return None, replan_attempts
@@ -1341,6 +1347,12 @@ def _try_replanner(
         f"from '{current}'"
     )
     new_target = _replan_from(graph, current, log)
+    if new_target and dead_nodes and new_target in dead_nodes:
+        log.warning(
+            f"[Orchestrator] Replanner targeted '{new_target}', which already "
+            f"failed non-retryably — rejecting (won't re-run a dead node)."
+        )
+        return None, replan_attempts
     if new_target:
         _checkpoint(graph, checkpoint_path, log)
     return new_target, replan_attempts
@@ -1996,6 +2008,8 @@ def run_graph(
     # earlier; per-call cost is unchanged, just more attempts allowed.
     replan_attempts = 0
     max_replan_attempts = 10
+    # P1: nodes that failed non-retryably (deterministic) — never re-route to them.
+    dead_nodes: set = set()
 
     # Find first root node
     roots = graph.root_nodes()
@@ -2017,7 +2031,7 @@ def run_graph(
                 needs_replan = False
                 new_target, replan_attempts = _try_replanner(
                     graph, current, log, checkpoint_path,
-                    replan_attempts, max_replan_attempts, explore,
+                    replan_attempts, max_replan_attempts, explore, dead_nodes=dead_nodes,
                 )
                 if new_target:
                     path.append(current)
@@ -2044,7 +2058,7 @@ def run_graph(
             # All existing edges exhausted — try replanner
             new_target, replan_attempts = _try_replanner(
                 graph, current, log, checkpoint_path,
-                replan_attempts, max_replan_attempts, explore,
+                replan_attempts, max_replan_attempts, explore, dead_nodes=dead_nodes,
             )
             if new_target:
                 path.append(current)
@@ -2079,7 +2093,7 @@ def run_graph(
                     )
                     new_target, replan_attempts = _try_replanner(
                         graph, current, log, checkpoint_path,
-                        replan_attempts, max_replan_attempts, explore,
+                        replan_attempts, max_replan_attempts, explore, dead_nodes=dead_nodes,
                     )
                     if new_target:
                         path.append(current)
@@ -2116,7 +2130,7 @@ def run_graph(
                     )
                     new_target, replan_attempts = _try_replanner(
                         graph, current, log, checkpoint_path,
-                        replan_attempts, max_replan_attempts, explore,
+                        replan_attempts, max_replan_attempts, explore, dead_nodes=dead_nodes,
                     )
                     if new_target:
                         path.append(current)
@@ -2131,7 +2145,7 @@ def run_graph(
 
             new_target, replan_attempts = _try_replanner(
                 graph, current, log, checkpoint_path,
-                replan_attempts, max_replan_attempts, explore,
+                replan_attempts, max_replan_attempts, explore, dead_nodes=dead_nodes,
             )
             if new_target:
                 path.append(current)
@@ -2156,6 +2170,10 @@ def run_graph(
                 f"  [{current}] Node failed ({reason}) -- "
                 f"backtracking with replan flag..."
             )
+            # P1: a node that exhausted its retries is a dead end — record it so
+            # the replanner won't re-route here and loop (flaw_privesc escalate).
+            if reason == "retries_exhausted":
+                dead_nodes.add(current)
             if path:
                 predecessor = path[-1]
                 tried_edges.add(f"{predecessor}→{current}")
