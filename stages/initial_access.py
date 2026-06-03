@@ -271,6 +271,7 @@ prefer those over RAG-sourced or general-knowledge exploits unless they've alrea
 5. If retrying after failure, MUST choose a DIFFERENT approach
 6. SCOPE: Exploitation only — no recon/scanning
 6b. **MISSED-PORT / PROVEN-EXPLOIT OVERRIDE**: When the researcher's summary mentions a well-known service (e.g., IRC/UnrealIRCd on port 6667) that is NOT in target_info.ports but has HIGH-CONFIDENCE past-success evidence (a successful_attacks log for this exploit/IP), you MAY select it with approach="msf" and note the port explicitly in PART 1. Do NOT discard proven exploits just because the port was missed in recon's top-100 scan — a service can be open even if Nmap's default scan did not list it.
+6c. **PROVEN-VECTOR PRIORITY (decisive on retry/fallback)**: The research results mark vectors with prior real successes as `[PROVEN]` (a successful_attacks hit for this target/OS/service). A `[PROVEN]` vector is worth more than any unproven RAG or general-knowledge module. On a RETRY, or on a fallback from a prescribed vector that just failed, if a `[PROVEN]` vector exists and is NOT banned, SELECT IT NOW — do not keep tuning parameters on, or guessing alternatives for, the unproven vector that failed. Burning the wall-clock time-box grinding an unproven module while a proven one is on the table is the failure mode this rule exists to prevent (even if the proven service's port was missed in recon — see 6b).
 7. **CHOOSE APPROACH** — select "msf" (Metasploit module) or "manual" (Linux terminal commands):
    - Use "msf" when a compatible MSF module exists that supports the user's needs
    - Use "manual" when the user wants a payload type no MSF module supports, or when MSF has already failed and a manual approach is more promising
@@ -315,6 +316,7 @@ Your job: query the knowledge bases to find viable exploits for the target's ser
    Focus your RAG queries on services NOT covered by deterministic matches.
 8. When done, respond with a TEXT SUMMARY (no tool calls) listing all viable exploits found:
    - MSF module path for each
+   - **Prefix with `[PROVEN]` any exploit that `query_successful_attacks` returned as a real prior success against this or a similar target** — this is the single most important label for the planner; it routes around unproven trial-and-error. List `[PROVEN]` vectors FIRST.
    - Compatible payload types (e.g., cmd/unix/reverse_python, cmd/unix/reverse_perl)
    - Required parameters
    - Target service/version/OS compatibility
@@ -798,6 +800,10 @@ def planner_node(state: AgentState) -> dict:
             f"BANNED — THESE MODULES/PAYLOADS ALREADY FAILED. DO NOT SELECT THEM:\n"
             f"{banned}\n"
             f"You MUST choose a completely different exploit module.\n\n"
+            f"RETRY/FALLBACK MODE: a prior vector already failed. If RESEARCH "
+            f"RESULTS list any [PROVEN] vector that is NOT banned, SELECT IT now "
+            f"(rule 6c) rather than tuning or guessing alternatives for the failed "
+            f"unproven vector.\n\n"
         )
 
     context += f"USER OBJECTIVE:\n{user_input}\n\n"
