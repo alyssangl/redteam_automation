@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **New here? Read `HANDOFF.md` first** — it has the verified mental model, lab
+> operations, landmines, and roadmap. The current pipeline is
+> `core_agents/orchestrator.py` + `stages/*.py` on branch `graph-orchestrator`.
+> The old `single_focus.py` is retired (now `legacy_agents/single_focus.py`).
+
 ## Project Overview
 
 **lgg_automation** is an AI-powered penetration testing automation framework using LangChain, LangGraph, and GPT-4o. It conducts autonomous red team exercises with:
@@ -14,14 +19,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Build/rebuild the RAG knowledge base (ChromaDB)
-python build_database.py
+# Run the offline test suite (no lab needed — do this before every commit)
+python tests/run_offline.py
 
-# Run the main autonomous agent (interactive REPL)
-python single_focus.py
+# Run a live scenario against the lab (bring the lab up first — see HANDOFF.md §4)
+python experiments/live_test_continuum.py     # or live_test_proftpd.py, etc.
+
+# Run the orchestrator directly on a graph
+python -m core_agents.orchestrator examples/continuum_rce_graph.json
+python -m core_agents.orchestrator --interactive
+
+# Build/rebuild the RAG knowledge base (ChromaDB)
+python database_utils/build_database.py
 ```
 
-No formal test suite, linting, or build configuration exists. Test files (`test.py`, `test_attack_tool.py`, `test_graphing.py`) are ad-hoc.
+The `tests/` directory IS a real offline suite (run via `tests/run_offline.py`).
+The `experiments/test_stage_*.py` files are ad-hoc, not part of that suite.
 
 ## Architecture
 
@@ -44,18 +57,25 @@ PASS → END
 
 | File | Purpose |
 |------|---------|
-| `single_focus.py` | **Current main agent** - Worker/Critic loop, tool integration, state management |
-| `refined.py` | **WIP** - Refactored agent with cleaner architecture (planned migration target) |
-| `build_database.py` | RAG ingestion - processes PDFs, CSVs, YAML, Markdown into ChromaDB |
-| `rag.py` | LangChain tool for knowledge base queries |
-| `metasploit_tools.py` | Persistent Metasploit RPC console session management |
-| `user_input.txt` | Attack prompts/objectives fed to the agent |
+| `core_agents/orchestrator.py` | **Current main engine** — `run_graph` walker, `judge()` (L2), `_replan_from` (L3), stage dispatch |
+| `core_agents/attack_graph.py` | AttackGraph/Node/Edge dataclasses + JSON (de)serialize + checkpointing |
+| `core_agents/state.py` | Stage output contracts (Findings TypedDicts) |
+| `stages/*.py` | The 5 L1 subagents (recon, initial_access, privesc, persistence, impact) |
+| `examples/*_graph.py` | Attack graph definitions (`goal_only`/`flaw_*` exercise the subagents) |
+| `experiments/live_test_*.py` | Live test drivers (one per scenario) |
+| `database_utils/build_database.py` | RAG ingestion — PDFs, CSVs, YAML, Markdown into ChromaDB |
+| `tools/rag.py` | LangChain tool for knowledge base queries |
+| `tools/metasploit_tools.py` | Persistent Metasploit RPC console session management (lazy-connected) |
+| `legacy_agents/single_focus.py` | **RETIRED** — the old linear Worker/Critic agent; do not use (`refined.py` was never built) |
 
 ### Development Focus
 
-Currently working in `single_focus.py`, planning migration to `refined.py` for better agent architecture. The refactor introduces:
-- Functional `call_llm()` helper for cleaner LLM invocation
-- Separate node functions (e.g., `planner_node`) for more modular graph structure
+Active work is the **graph-driven orchestrator** (`core_agents/orchestrator.py` +
+`stages/*.py`) on branch `graph-orchestrator` — a backtracking walker with a
+2-layer feedback system (`judge()` + `_replan_from`) that replaced the old linear
+`single_focus.py` pipeline. The 3-layer model (L1 stage subagents / L2 judge /
+L3 replanner) and the full evolution are documented in `HANDOFF.md` and
+`reports/refinement_history_v0_v19.md`.
 
 ### Agent Tools
 
@@ -74,10 +94,14 @@ Currently working in `single_focus.py`, planning migration to `refined.py` for b
 Environment variables in `.env`:
 - `OPENAI_API_KEY` - Required for GPT-4o and embeddings
 
-Hardcoded in `single_focus.py`:
+Hardcoded in `core_agents/common.py` (and duplicated in `stages/recon.py`,
+`stages/initial_access.py` — grep when the lab moves; see `HANDOFF.md` §6):
 - Kali machine: `192.168.34.6` (SSH port 22, MSF RPC port 55553)
 - Credentials: `kali`/`kali`
-- Model: `gpt-4o`
+- Models: replanner/judge `gpt-4o` (`orchestrator.py:66-67`), recon `gpt-4o`,
+  initial_access + default `gpt-4o-mini` (`common.py:24`)
+- Target IP `192.168.34.7` lives in each `experiments/live_test_*.py` and
+  `examples/*_graph.py`
 
 ## Dependencies
 
@@ -87,7 +111,9 @@ No `requirements.txt` exists. Core dependencies (inferred from imports):
 
 ## Agent Constraints
 
-From system prompts in `single_focus.py`:
+These Worker/Critic principles originated in the retired `single_focus.py` and now
+live, per-stage, in each `stages/*.py` Planner/Executor/Critic (grounding,
+non-interactive commands, and persistence-checking still apply):
 
 **Worker**:
 - Must query knowledge base before attacking (intelligence phase)
