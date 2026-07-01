@@ -11,6 +11,9 @@ services:
       dockerfile: docker/Dockerfile.kali
     image: lgg-kali
     container_name: lgg-kali
+    # Auto-restart the container (and thus a FRESH msfrpcd) if it or the Docker
+    # engine drops; the entrypoint also supervises/restarts msfrpcd in-container.
+    restart: unless-stopped
     environment:
       MSF_USER: ${MSF_USER:-kali}
       MSF_PASS: ${MSF_PASS:-kali}
