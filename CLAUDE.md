@@ -16,6 +16,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Direct control of Metasploit Framework and Linux terminal via SSH
 - Real-time attack orchestration against target systems in controlled lab environments
 
+## Design Philosophy
+
+These principles are the grain of the codebase — build *with* them. Full reasoning
+and the evolution story in **`docs/DESIGN_PHILOSOPHY.md`**; the design arc that
+produced them is in `reports/refinement_history_v0_v19.md`.
+
+1. **Three-layer decisions; the LLM enters in the middle.** L1 tactical (in-node
+   ReAct loop) → L2 strategic (`judge()` between nodes: continue/adapt/escalate) →
+   L3 heavyweight (`_replan_from` graph mutation). The LLM enters at **L2**, never
+   inside the deterministic edge routing — that's what preserves replay/audit.
+2. **Determinism where it counts.** Hand-authored `EdgeCheck`s are testable,
+   deterministic claims — a strength; keep them. Only *LLM-grown* edges are
+   lightweight `(source, target, rationale)`.
+3. **Lower the emission bar.** Never make the LLM emit a full ~25-field AttackNode
+   under stress — it emits a tiny `{action, target, hint}` intent; **code expands
+   it** (`_expand_intent_to_node`). Audit which fields are actually load-bearing.
+4. **Failure is signal — don't pre-empt it.** Validate *structurally* + against
+   the MSF catalog (ground truth); demote *semantic* gates (version matching) to
+   advisory. Let wrong ideas run and fail; that failure is what the replanner needs.
+5. **Feed prose, not just typed findings.** Give judge/replanner the raw output an
+   operator reads (nmap banners, stderr, exit codes), not only stripped summaries.
+6. **Review every step, not only on failure.** `judge()` runs after every node on
+   fresh context; alts and replan are parallel options it picks between, not a
+   rigid `alts → replan → backtrack` sequence.
+7. **Grounding beats prose.** Every stage critic verifies success against the
+   target itself (`id`/`getuid` in the session, raw output as evidence, mandatory
+   FAIL when unverified). Never let a stage claim success on its own say-so.
+8. **Tight scope, rich capability inside it.** A stage stays precise to its
+   kill-chain scope (no planning/orchestration bleed) but its tools/prompts are
+   broad enough to attack a real machine freely — avoid "too formatted."
+
+**Working method:** when a run misbehaves, first classify the bug —
+**logical** (unintended; bad code → patch it) vs **design** (bad outcome from a
+bad shape → rethink it, don't paper over with code). Test the fix on a single
+graph, then on all test graphs (including the deliberately-broken `flaw_*` ones).
+
 ## Commands
 
 ```bash
