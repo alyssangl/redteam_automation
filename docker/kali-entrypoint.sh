@@ -15,7 +15,8 @@ set -u
 echo "[kali] starting sshd..."
 service ssh start || /usr/sbin/sshd
 
-echo "[kali] initialising msf database (best-effort)..."
+echo "[kali] starting postgresql + initialising msf database (best-effort)..."
+service postgresql start >/dev/null 2>&1 || true
 msfdb init >/dev/null 2>&1 || true
 
 # Supervise msfrpcd: kill any stale instance, start fresh, restart on exit.
