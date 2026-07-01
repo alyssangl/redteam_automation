@@ -1,0 +1,26 @@
+# Keep the build context small and never bake secrets or lab artifacts.
+.git/
+__pycache__/
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# secrets
+.env
+
+# runtime artifacts (regenerated / mounted as volumes)
+logs/
+creme_logs/
+graphs/
+databases/
+my_knowledge_base/
+.refine_snapshots/
+_pdf_extract/
+*.log
+
+# local editor / OS
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,55 @@
+# Hybrid lab, container half: the framework + the Kali attacker.
+# The Metasploitable 3 TARGET is a VM (see Vagrantfile) — it CANNOT be a
+# container, because the privesc kernel exploits need a real guest kernel 3.13.
+# See REPRODUCIBILITY.md for the networking (how the Kali container reaches the
+# VM target) and first-run steps.
+
+services:
+  kali:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.kali
+    image: lgg-kali
+    container_name: lgg-kali
+    environment:
+      MSF_USER: ${MSF_USER:-kali}
+      MSF_PASS: ${MSF_PASS:-kali}
+      MSF_PORT: ${MSF_PORT:-55553}
+    ports:
+      - "55553:55553"   # msfrpcd, exposed to host (optional; app reaches it via the 'lab' net)
+      - "2222:22"       # sshd, exposed to host on 2222 (optional)
+    networks:
+      - lab
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    image: lgg-app
+    container_name: lgg-app
+    depends_on:
+      - kali
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      # Reach the Kali service by its compose DNS name (override in .env if needed).
+      KALI_IP: ${KALI_IP:-kali}
+      TARGET_IP: ${TARGET_IP:-192.168.34.7}
+      KALI_USER: ${KALI_USER:-kali}
+      KALI_PASS: ${KALI_PASS:-kali}
+      MSF_PORT: ${MSF_PORT:-55553}
+      MSF_USER: ${MSF_USER:-kali}
+      MSF_PASS: ${MSF_PASS:-kali}
+    volumes:
+      - .:/app                 # live code (edit on host, run in container)
+      - lgg-db:/app/databases  # persist the RAG DB across runs
+    networks:
+      - lab
+    stdin_open: true
+    tty: true
+
+networks:
+  lab:
+    driver: bridge
+
+volumes:
+  lgg-db:

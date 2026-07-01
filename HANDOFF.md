@@ -201,9 +201,18 @@ before you touch the code** — that's a wedged msfrpcd, not a regression.
 
 ## 5. How to run everything (verified)
 
-Environment: conda env **`red_teaming_auto_lamgchain`** (Python 3.10). Requires
-`.env` with `OPENAI_API_KEY`. Prefix live runs with `PYTHONIOENCODING=utf-8` on
-Windows to avoid Unicode console errors.
+Environment: either the conda env **`red_teaming_auto_lamgchain`** (Python 3.10)
+**or the containers** (`docker compose` — framework + Kali; MS3 target is a VM via
+`Vagrantfile`). Full container/VM setup + networking in **`REPRODUCIBILITY.md`**.
+Requires `.env` with `OPENAI_API_KEY`. Prefix live runs with `PYTHONIOENCODING=utf-8`
+on Windows to avoid Unicode console errors.
+
+```bash
+# Containerized (see REPRODUCIBILITY.md for the target VM + networking):
+cp .env.example .env               # set OPENAI_API_KEY
+docker compose build && docker compose up -d kali
+docker compose run --rm app python tests/run_offline.py
+```
 
 ```bash
 # OFFLINE tests (no lab needed — run these constantly, they're your safety net)
@@ -366,7 +375,8 @@ longer exists), `experiments/test_stage_*.py` (ad-hoc, not in the offline suite)
 ## 12. The deeper docs (read in this order)
 
 1. `HANDOFF.md` ← you are here
-2. `docs/DESIGN_PHILOSOPHY.md` — *why* it's built this way (the 3-layer model, "failure is signal," the logical-vs-design bug method); read this before making structural changes
+2. `REPRODUCIBILITY.md` — stand up the whole lab from scratch (Docker framework+Kali, Vagrant MS3 target, networking)
+3. `docs/DESIGN_PHILOSOPHY.md` — *why* it's built this way (the 3-layer model, "failure is signal," the logical-vs-design bug method); read this before making structural changes
 3. `reports/refinement_history_v0_v19.md` — the whole evolution, problem→design per version
 3. `reports/refinement_roadmap.md` — open work, prioritized
 4. `reports/pipeline_end_to_end_journey.md` — a concrete replanner recovery walkthrough (disk-wipe fixture)
