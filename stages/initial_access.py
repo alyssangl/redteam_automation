@@ -6,6 +6,7 @@ Autonomous penetration testing with specialized nodes:
 """
 
 import sys
+import os
 import json
 import re
 import time
@@ -35,10 +36,10 @@ from tools.service_mapping import match_exploits
 
 dotenv.load_dotenv()
 
-MODEL_NAME = "gpt-4o-mini"
-KALI_IP = "192.168.34.6"
-KALI_USER = "kali"
-KALI_PASS = "kali"
+MODEL_NAME = os.getenv("LGG_MODEL_INITIAL_ACCESS", "gpt-4o-mini")
+KALI_IP = os.getenv("KALI_IP", "192.168.34.6")
+KALI_USER = os.getenv("KALI_USER", "kali")
+KALI_PASS = os.getenv("KALI_PASS", "kali")
 MSF_PORT = 55553
 MSF_USER = "kali"
 MSF_PASS = "kali"

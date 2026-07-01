@@ -10,6 +10,7 @@ Usage:
 """
 
 import re
+import os
 import json
 import operator
 import time
@@ -39,9 +40,9 @@ dotenv.load_dotenv()
 # violated the no-full-port-scan rule and mis-chose strategies despite critic
 # feedback. Match the reasoning-heavy components (orchestrator replanner/judge).
 MODEL_NAME = "gpt-4o"
-KALI_IP = "192.168.34.6"
-KALI_USER = "kali"
-KALI_PASS = "kali"
+KALI_IP = os.getenv("KALI_IP", "192.168.34.6")
+KALI_USER = os.getenv("KALI_USER", "kali")
+KALI_PASS = os.getenv("KALI_PASS", "kali")
 
 MAX_RECON_RETRIES = 3
 MAX_EXECUTOR_TOOL_CALLS = 10

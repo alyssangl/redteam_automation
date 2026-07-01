@@ -6,6 +6,7 @@ New stages should import from here to avoid duplication.
 """
 
 import json
+import os
 import re
 
 import dotenv
@@ -21,13 +22,17 @@ dotenv.load_dotenv()
 # CONFIGURATION CONSTANTS
 # =============================================================================
 
-MODEL_NAME = "gpt-4o-mini"
-KALI_IP = "192.168.34.6"
-KALI_USER = "kali"
-KALI_PASS = "kali"
-MSF_PORT = 55553
-MSF_USER = "kali"
-MSF_PASS = "kali"
+# Lab endpoints/creds are env-overridable (docker-compose / .env) with the
+# original lab values as defaults — the framework is portable without code edits.
+# See REPRODUCIBILITY.md and .env.example.
+MODEL_NAME = os.getenv("LGG_MODEL", "gpt-4o-mini")
+KALI_IP = os.getenv("KALI_IP", "192.168.34.6")      # attacker: Kali / msfrpcd host
+TARGET_IP = os.getenv("TARGET_IP", "192.168.34.7")  # default target (graphs may override)
+KALI_USER = os.getenv("KALI_USER", "kali")
+KALI_PASS = os.getenv("KALI_PASS", "kali")
+MSF_PORT = int(os.getenv("MSF_PORT", "55553"))
+MSF_USER = os.getenv("MSF_USER", "kali")
+MSF_PASS = os.getenv("MSF_PASS", "kali")
 
 MAX_PIPELINE_RETRIES = 3
 
