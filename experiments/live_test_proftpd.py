@@ -8,6 +8,7 @@ a low-privilege www-data shell.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -16,8 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core_agents.orchestrator import run_graph
 from examples.proftpd_modcopy_graph import build_proftpd_modcopy_graph
 
-TARGET_IP = "192.168.34.7"
-ATTACKER_IP = "192.168.34.6"
+# LHOST is the address the TARGET dials back to for the reverse shell. In the
+# container lab this is the VirtualBox host-only adapter (192.168.34.1), which
+# Docker publishes into the Kali container; override via the LHOST env var.
+TARGET_IP = os.getenv("TARGET_IP", "192.168.34.7")
+ATTACKER_IP = os.getenv("LHOST", "192.168.34.6")
 
 if __name__ == "__main__":
     graph = build_proftpd_modcopy_graph(target_ip=TARGET_IP, attacker_ip=ATTACKER_IP)

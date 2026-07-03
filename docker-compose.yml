@@ -27,6 +27,11 @@ services:
     ports:
       - "55553:55553"   # msfrpcd, exposed to host (optional; app reaches it via the 'lab' net)
       - "2222:22"       # sshd, exposed to host on 2222 (optional)
+      # Reverse-shell handler port: the VM target dials back to the host-only
+      # adapter (192.168.34.1:4444/4445); Docker forwards it here to the handler
+      # bound at 0.0.0.0 inside the container (payloads set ReverseListenerBindAddress=0.0.0.0).
+      - "4444:4444"
+      - "4445:4445"
     networks:
       - lab
 
@@ -43,6 +48,10 @@ services:
       # Reach the Kali service by its compose DNS name (override in .env if needed).
       KALI_IP: ${KALI_IP:-kali}
       TARGET_IP: ${TARGET_IP:-192.168.34.7}
+      # Reverse-shell callback address: the VirtualBox host-only adapter the
+      # target VM can reach. Docker publishes the handler ports (4444/4445) here
+      # so the target's callback to 192.168.34.1 lands in the Kali container.
+      LHOST: ${LHOST:-192.168.34.1}
       KALI_USER: ${KALI_USER:-kali}
       KALI_PASS: ${KALI_PASS:-kali}
       MSF_PORT: ${MSF_PORT:-55553}

