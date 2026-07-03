@@ -1,5 +1,6 @@
 from pymetasploit3.msfrpc import MsfRpcClient
 from langchain_core.tools import tool
+import os
 import time
 
 class MetasploitSession:
@@ -121,7 +122,15 @@ class MetasploitSession:
 # attribute access, so `import stages.*` / `import core_agents.orchestrator`
 # succeed with no lab, and the RPC connection is made on first actual use.
 class _LazyMsfSession:
-    _CFG = dict(host="192.168.34.6", port=55553, user="kali", password="kali")
+    # Read from the environment so the lab moves without code edits (matches
+    # core_agents/common.py). In the container lab KALI_IP is the compose DNS
+    # name `kali`; the old 192.168.34.6 (Kali-VM LAN IP) is the fallback default.
+    _CFG = dict(
+        host=os.getenv("KALI_IP", "192.168.34.6"),
+        port=int(os.getenv("MSF_PORT", "55553")),
+        user=os.getenv("MSF_USER", "kali"),
+        password=os.getenv("MSF_PASS", "kali"),
+    )
 
     def __init__(self):
         self._real = None

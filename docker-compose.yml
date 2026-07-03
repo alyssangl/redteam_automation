@@ -14,6 +14,12 @@ services:
     # Auto-restart the container (and thus a FRESH msfrpcd) if it or the Docker
     # engine drops; the entrypoint also supervises/restarts msfrpcd in-container.
     restart: unless-stopped
+    # nmap's binary is setcap'd (cap_net_raw) for SYN/OS scans; without these
+    # caps in the container's bounding set, execing it fails with EPERM (exit 126,
+    # "Operation not permitted"). Grant raw-socket caps so recon nmap works.
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
     environment:
       MSF_USER: ${MSF_USER:-kali}
       MSF_PASS: ${MSF_PASS:-kali}
