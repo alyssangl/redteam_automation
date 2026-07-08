@@ -7,8 +7,9 @@ __pycache__/
 venv/
 env/
 
-# secrets
-.env
+# secrets — never bake ANY env file (incl. .env.bak.*, .env.local) except the template
+.env*
+!.env.example
 
 # runtime artifacts (regenerated / mounted as volumes)
 logs/
@@ -24,3 +25,7 @@ _pdf_extract/
 .idea/
 .vscode/
 .DS_Store
+
+# Claude Code local state + git worktrees (full repo copies — bloat, and they
+# duplicated the leaked key). Never ship these.
+.claude/

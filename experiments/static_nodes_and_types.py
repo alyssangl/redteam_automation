@@ -2,7 +2,9 @@ from typing import TypedDict
 from langchain_openai import ChatOpenAI
 import os
 
-os.environ["OPENAI_API_KEY"] = "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"
+# OPENAI_API_KEY comes from the environment (.env / compose), never hardcoded.
+# The revoked key that used to live here was leaked in git history — rotate it.
+assert os.getenv("OPENAI_API_KEY"), "Set OPENAI_API_KEY in your environment/.env"
 llm = ChatOpenAI(model="gpt-5-mini-2025-08-07")
 
 class MyWorkflowState(TypedDict):
