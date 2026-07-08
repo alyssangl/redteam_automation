@@ -18,6 +18,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # the image self-contained for CI / standalone runs.
 COPY . .
 
+# Associate this GHCR package with its source repo (GHCR auto-links on push).
+LABEL org.opencontainers.image.source=https://github.com/bullyee/redteam_automation \
+      org.opencontainers.image.description="lgg_automation framework (LangGraph orchestrator + stage subagents) — drives the Kali container over SSH/RPC"
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8
 

@@ -21,6 +21,10 @@ RUN useradd -m -s /bin/bash kali \
 COPY docker/kali-entrypoint.sh /usr/local/bin/kali-entrypoint.sh
 RUN chmod +x /usr/local/bin/kali-entrypoint.sh
 
+# Associate this GHCR package with its source repo (GHCR auto-links on push).
+LABEL org.opencontainers.image.source=https://github.com/bullyee/redteam_automation \
+      org.opencontainers.image.description="Kali attacker (Metasploit + msfrpcd + sshd) for the lgg_automation hybrid lab"
+
 # 22 = SSH (tool_linux_terminal), 55553 = msfrpcd (tool_metasploit_rpc)
 EXPOSE 22 55553
 
