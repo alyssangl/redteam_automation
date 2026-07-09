@@ -190,7 +190,7 @@ planner had no rule to *jump* to a proven vector on retry. Now the researcher ta
 hits `[PROVEN]` and the planner selects a non-banned `[PROVEN]` vector on
 retry/fallback instead of grinding the failed unproven one.
 
-**Credential-retry rotation (v18/v19, from `credential_retry_plan.md`).**
+**Credential-retry rotation (v18/v19, from `docs/plans/credential_retry_plan.md`).**
 The replanner couldn't retry a credential attack with *different* credentials:
 the anti-repeat guard banned a module after one failure, and the tiny-intent had
 no creds slot. v18 (`93aabba`, plumbing): `_config_key(module, options)` so the

@@ -377,12 +377,12 @@ longer exists), `experiments/test_stage_*.py` (ad-hoc, not in the offline suite)
 1. `HANDOFF.md` ← you are here
 2. `REPRODUCIBILITY.md` — stand up the whole lab from scratch (Docker framework+Kali, Vagrant MS3 target, networking)
 3. `docs/DESIGN_PHILOSOPHY.md` — *why* it's built this way (the 3-layer model, "failure is signal," the logical-vs-design bug method); read this before making structural changes
-3. `reports/refinement_history_v0_v19.md` — the whole evolution, problem→design per version
-3. `reports/refinement_roadmap.md` — open work, prioritized
-4. `reports/pipeline_end_to_end_journey.md` — a concrete replanner recovery walkthrough (disk-wipe fixture)
-5. `reports/stage_refinement_cycle_log.md` — raw run-by-run results
-6. Root plan files (`judge_redesign_plan.md`, `replanner_reliability_plan.md`,
-   `credential_retry_plan.md`) — historical design notes, mostly now implemented
+4. `reports/refinement_history_v0_v19.md` — the whole evolution, problem→design per version
+5. `reports/refinement_roadmap.md` — open work, prioritized
+6. `reports/pipeline_end_to_end_journey.md` — a concrete replanner recovery walkthrough (disk-wipe fixture)
+7. `reports/stage_refinement_cycle_log.md` — raw run-by-run results
+8. `docs/plans/` — historical design notes (`judge_redesign_plan.md`,
+   `replanner_reliability_plan.md`, `credential_retry_plan.md`), mostly now implemented
 
 ---
 

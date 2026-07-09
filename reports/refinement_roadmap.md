@@ -121,7 +121,7 @@ preceding findings; otherwise route to an access stage first.
 
 ## P2 — Credential-retry rotation  (effort L, risk L)
 Re-trying the same creds/wordlist is meaningless. Ensure credential attacks
-rotate creds/wordlists on retry, never repeat. (See `credential_retry_plan.md`.)
+rotate creds/wordlists on retry, never repeat. (See `docs/plans/credential_retry_plan.md`.)
 
 ## P3 — Hard escalate time-box  (effort L, risk L)
 The v7 time-box is "soft" — it checks between stream steps, so a long in-flight

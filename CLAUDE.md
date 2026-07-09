@@ -7,6 +7,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > `core_agents/orchestrator.py` + `stages/*.py` on branch `graph-orchestrator`.
 > The old `single_focus.py` is retired (now `legacy_agents/single_focus.py`).
 
+### Where the detail lives (this file stays a lean index — go deep here)
+
+| I need… | Read |
+|---|---|
+| The 5 subagents (roles, watch-fors) | `HANDOFF.md` §3 — the current-state index; deep stage guides for 3 of 5 in `docs/GUIDE_{PRIVESC,PERSISTENCE,IMPACT}.md` (implementation-era, verify against code) |
+| Network / lab topology, IPs, creds, ports | `HANDOFF.md` §4 (lab reality + confounders) & §6 (config table); `REPRODUCIBILITY.md` (full setup + networking) |
+| How findings/sessions flow between stages | `HANDOFF.md` §2.5 |
+| Why it's built this way (3-layer model, etc.) | `docs/DESIGN_PHILOSOPHY.md` |
+| The evolution / past design decisions | `reports/refinement_history_v0_v19.md`, `docs/plans/` |
+| What's still open | `reports/refinement_roadmap.md` |
+
 ## Project Overview
 
 **lgg_automation** is an AI-powered penetration testing automation framework using LangChain, LangGraph, and GPT-4o. It conducts autonomous red team exercises with:
@@ -141,9 +152,14 @@ Hardcoded in `core_agents/common.py` (and duplicated in `stages/recon.py`,
 
 ## Dependencies
 
-No `requirements.txt` exists. Core dependencies (inferred from imports):
-- `langchain`, `langgraph`, `langchain-openai`, `langchain-chroma`, `langchain-community`
-- `chromadb`, `openai`, `paramiko`, `pymetasploit3`, `python-dotenv`, `msgpack`
+Pinned in `requirements.txt` (versions verified in the `red_teaming_auto_lamgchain`
+conda env, Python 3.10) — `pip install -r requirements.txt`. Direct deps only; pip
+resolves the transitive tree. Core groups:
+- LLM/graph: `langchain`, `langchain-core`, `langchain-community`, `langchain-openai`,
+  `langchain-chroma`, `langchain-text-splitters`, `langgraph`, `openai`, `tiktoken`
+- RAG vector store: `chromadb`
+- Lab I/O: `paramiko`, `pymetasploit3`, `msgpack`
+- Config + ingestion: `python-dotenv`, `pypdf`, `PyYAML`
 
 ## Agent Constraints
 

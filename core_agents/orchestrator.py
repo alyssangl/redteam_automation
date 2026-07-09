@@ -59,7 +59,7 @@ from stages.impact import run_impact
 # Stage 4 v2, and hallucinates MSF module paths ~20% of the time. Pinning these
 # two calls to gpt-4o (~10x cost of mini) is an experiment to see how much
 # improves with model strength alone, before pursuing the more invasive
-# replanner_reliability_plan.md stages.
+# docs/plans/replanner_reliability_plan.md stages.
 #
 # Stage subagents (recon, exploit, persistence, etc.) still use whatever model
 # their own modules pick — out of scope for this experiment.

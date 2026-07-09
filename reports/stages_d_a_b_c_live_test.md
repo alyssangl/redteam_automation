@@ -99,7 +99,7 @@ All four stages of the replanner reliability plan PASS. Each stage's intended be
 
 ## What this completes
 
-The replanner reliability plan (replanner_reliability_plan.md) is now fully implemented across these commits:
+The replanner reliability plan (docs/plans/replanner_reliability_plan.md) is now fully implemented across these commits:
 - `e737de0` — Pin replanner + judge to gpt-4o
 - `330c38d` — Stage D: LHOST silent default fix
 - `4859de6` — Stage A: MSF catalog validation

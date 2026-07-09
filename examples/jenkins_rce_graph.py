@@ -13,7 +13,7 @@ Chain:
   file_drop        — write proof-of-compromise file
 
 Expected: clean run. If admin/admin is wrong, replanner should propose
-alternative Jenkins credentials (Stage Y from credential_retry_plan.md).
+alternative Jenkins credentials (Stage Y from docs/plans/credential_retry_plan.md).
 """
 
 from core_agents.attack_graph import (
