@@ -122,36 +122,33 @@ class MetasploitSession:
                 elapsed += 1
             return output if output else "(no output)"
         else:
-            # command_shell — output streams back ASYNCHRONOUSLY over the session,
-            # arriving a beat after shell_write. The old code did `if not data: break`,
-            # bailing on the FIRST empty read and returning "(no output)" for anything
-            # slower than instant (e.g. a `cat` read-back) even when output was coming —
-            # which made impact/file_drop unable to verify anything (see F5).
-            # Fix: poll while empty (bounded wait for output to START), and once output
-            # has arrived keep reading until it drains (a short quiet period) or timeout.
+            # command_shell — output streams back asynchronously AND some payloads
+            # (notably UnrealIRCd's reverse_perl) don't flush a command's output until
+            # the NEXT write pokes the shell, so a bounded wait still misses it and the
+            # output leaks into the following command's read (F5b). Robust fix: write the
+            # command, THEN write a unique end-marker echo. The marker write flushes the
+            # command's buffered output, and the marker's echoed value is a definitive
+            # "output complete" signal — read until it appears (or timeout), then return
+            # everything before it. The marker is split with "" in the echo COMMAND so
+            # that, even if a shell echoes stdin, the literal token appears only in the
+            # echo's OUTPUT, never in the command text.
+            done = "__MSF_CMD_DONE_9271__"
             self.client.call('session.shell_write', [sid, command + "\n"])
+            self.client.call('session.shell_write', [sid, 'echo __MSF""_CMD_DONE_9271__\n'])
             output = ""
             elapsed = 0
-            idle_after_data = 0
-            got_data = False
-            start_wait = min(4, timeout)   # seconds to wait for output to begin
             while elapsed < timeout:
                 resp = self.client.call('session.shell_read', [sid])
                 data = resp.get(b'data', resp.get('data', b''))
                 if isinstance(data, bytes):
                     data = data.decode('utf-8', errors='ignore')
-                if data:
-                    output += data
-                    got_data = True
-                    idle_after_data = 0
-                elif got_data:
-                    idle_after_data += 1        # output started then went quiet ->
-                    if idle_after_data >= 2:    # ~2s of silence means it has drained
-                        break
-                elif elapsed >= start_wait:     # no output ever began -> genuinely none
+                output += data
+                if done in output:
+                    output = output.split(done)[0]   # keep only the real output
                     break
                 time.sleep(1)
                 elapsed += 1
+            output = output.strip()
             return output if output else "(no output)"
 
     def cleanup(self):

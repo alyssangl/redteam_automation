@@ -209,6 +209,34 @@ just proftpd). Key realization: **the architecture was fine — the plumbing was
 
 ---
 
+## 6. Overnight autonomous run — 2026-07-15 night
+
+Loop: run graph → **fully read log** → classify new bugs (code/design + importance)
+→ **re-ground** impact successes out-of-band (curl the artifact) → fix **critical/high
+CODE** bugs immediately (stop loop, commit, verify); **medium CODE** bugs after the
+full run; **design bugs + low bugs left for discussion**. F1/F2/F5 fixed pre-run.
+
+### Verified pass tally (grounded, not pipeline self-report)
+| # | Graph | Pipeline % | Verified | Note |
+|---|-------|-----------|----------|------|
+| 1 | flaw_recon | 75% | re-run pending | recon✓ replan→UnrealIRCd✓ gain_access✓; file_drop false-FAILED on the F5b bug (file WAS written) → re-running after fix |
+
+### New findings this run (F10+)
+- **F5b** · `code` · **HIGH** · ☑ FIXED — the F5 bounded-wait was incomplete: UnrealIRCd
+  `reverse_perl` command_shell buffers a command's output until the NEXT write, so `cat`
+  read-backs returned `(no output)` and F2 **false-NEGATIVED a real write** (flaw_recon
+  file_drop failed though `PWNED…User: boba_fett` was written, visible one read later).
+  Fixed with a marker-based read (write command + unique end-marker echo; read until the
+  marker, return everything before it). Verified live on reverse_perl + offline suite.
+- **F11** · `code` · **MED** — impact subagent's session-liveness check runs a malformed
+  `sessions` command (`Wrong number of arguments expected: 1, received: 0`) and concludes
+  a *live* session is dead → skips impact. Fix after full run.
+- **F12** · `design` · **MED** — F2's positive grounding only covers nodes that declare a
+  `marker`; no-marker impact/enum nodes (e.g. replanner-grown `passwd`) still pass on
+  `(no output)` (false success). For discussion — largely mooted once F5b makes output real.
+
+---
+
 ## Nemotron migration (parallel track — paused)
 
 Self-hosted Nemotron-3-super vLLM on `gx10-e36e.tail12cca0.ts.net` (Tailscale
