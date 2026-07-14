@@ -1032,10 +1032,18 @@ def run_impact(
     # Wall-clock capped: a busy/wedged console must not block the stage on the
     # very first call before any impact work begins.
     try:
+        def _live_session_ids():
+            # F11: use the authoritative RPC session list. The console `sessions`
+            # output can be desync-contaminated (leftover output from a prior command)
+            # and misparsed as "not found", falsely skipping a live session. Format as
+            # newline-separated "<id> " so the line-anchored regex below still matches.
+            sl = msf_session.client.call('session.list') or {}
+            return "\n".join(
+                f"{k.decode() if isinstance(k, bytes) else k} " for k in sl.keys()
+            )
         session_check = _run_with_timeout(
-            msf_session.send_command,
-            args=("sessions",),
-            kwargs={"timeout": _MSF_SEND_TIMEOUT},
+            _live_session_ids,
+            args=(), kwargs={},
             timeout=_MSF_WALLCLOCK_TIMEOUT,
             on_timeout="(sessions list timed out)",
         )

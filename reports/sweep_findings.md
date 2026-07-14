@@ -256,9 +256,10 @@ open items are exploit-selection quality (F14, design) and subagent-hang robustn
   file_drop failed though `PWNED…User: boba_fett` was written, visible one read later).
   Fixed with a marker-based read (write command + unique end-marker echo; read until the
   marker, return everything before it). Verified live on reverse_perl + offline suite.
-- **F11** · `code` · **MED** — impact subagent's session-liveness check runs a malformed
-  `sessions` command (`Wrong number of arguments expected: 1, received: 0`) and concludes
-  a *live* session is dead → skips impact. Fix after full run.
+- **F11** · `code` · **MED** · ☑ **FIXED** (offline) — impact subagent's session-liveness
+  check parsed the **console** `sessions` output, which can be desync-contaminated and
+  misread as "not found" → skips a *live* session. Now uses the authoritative RPC
+  `session.list` instead.
 - **F12** · `design` · **MED** — F2's positive grounding only covers nodes that declare a
   `marker`; no-marker impact/enum nodes (e.g. replanner-grown `passwd`) still pass on
   `(no output)` (false success). For discussion — largely mooted once F5b makes output real.
