@@ -229,6 +229,25 @@ Grounding method: for `/var/www/html` artifacts, curl `http://TARGET/<file>`; fo
 | 4 | flaw_persistence | ~50% (killed) | recon✓ gain_access✓ | persist stuck: direct exec used `SESSION 1` (actual 3) → **confirms F4** (session-id not propagated to module SESSION, code/MED, fix after run); `service_persistence` hung the console (F16 120s/cmd) → subagent no progress ~6min → killed. |
 | 5 | flaw_impact | 100% | ✅ **100% GROUNDED** | recon✓ gain_access✓ file_drop✓ — 1st write to `/root` failed (non-root), F2 caught it → retried `/tmp` (alternatives) → marker verified. **Validates F2 failure-detect + retry + F5b + grounding together.** |
 | 6 | init_fail | 80% | ✅ **80% GROUNDED** ⭐ | **REPLANNER thesis validated end-to-end**: root/root✗(designed) → replanner found `vagrant:vagrant` → SSH session → grew edge → privesc_verify sudo→root (`uid=0`, grounded) → file_drop✓ (marker+`ls` read back). 4/5 (only intentional-fail node fails). Confirms F4 is module-SESSION-only (command path used session 6 correctly). |
+| 7 | flawed | 25% | 25% (recon only) | gain_access✗ — subagent improvised a *manual* UnrealIRCd approach (Connection refused, wrong ports) instead of the proven MSF `unreal_ircd_3281_backdoor` → exhausted → replanner re-pointed dead node (F8). **F14 again** (design). No 429/binding. |
+| 8 | goal_only | 20% | 20% (recon only) | gain_access✗ — subagent chose the RIGHT module (`unreal_ircd_3281_backdoor`) but it failed `EOFError` (msfrpc console/session comms) ~1h into run → **F17** (msfrpcd degradation, code/infra). Not F14. Forcing fresh msfrpcd for remaining graphs. |
+| 9 | samba | 40% | 40% | recon✓ smb_enum✓ samba_rce✗ (`is_known_pipename` direct no-session → subagent improvised → exhausted). Exploit needs a writable share MS3 may not expose; subagent didn't pivot to `usermap_script`. Exploit-viability + F14. Not a fix regression. |
+| 10 | unrealircd | 40% | 40% | recon✓ irc_fingerprint✓ irc_backdoor✗ (`unreal_ircd` **EOFError even on fresh msfrpcd** → subagent exhausted). **Refines F17**: target UnrealIRCd service degrades after repeated backdoor exploitation across the sweep (worked graphs 1/3/4/5 when fresh). Target-state artifact, not a fix regression. |
+| 11 | drupal | HUNG (killed) | ~40% (recon+check) | drupal_rce direct failed (no session, likely wrong TARGETURI `/drupal/`) → exploit subagent **HUNG ~20min with zero output** (froze before its first log line) → killed. New **F18**: subagent init can hang (no timeout on a hung LLM/RAG call). |
+| 12 | elasticsearch | ~40% (capped) | recon✓ es_check✓ | es_rce✗ — `script_mvel_rce` needs Elasticsearch on :9200 which **MS3 doesn't run** → subagent improvised/stalled → capped. Target-service-absent, not a fix issue. |
+| 13 | jenkins | HUNG (killed) | 0% | **HUNG at recon** — recon dispatched then zero output ~10min → killed. **F18 recurring** (2nd hang: drupal@exploit, jenkins@recon) — subagent/LLM call hangs with no timeout guard. Possibly slow OpenAI late in run. |
+| 14 | continuum | HUNG (killed) | 0% | **HUNG at recon too** (frozen at dispatch, OpenAI verified fine) — same as jenkins. Both last-2 graphs hung at recon-init after per-graph restart → **F18 promoted to top code follow-up** (cumulative lab/docker state after 13 graphs + 6 restarts; needs a subagent wall-clock guard). |
+
+### Sweep verdict (grounded)
+**The fixes hold.** Every grounded success is real; no false positives anywhere (F2/F5b
+did their job). Replanner thesis validated (init_fail 80%). Clean grounded runs:
+flaw_recon 100%, flaw_impact 100%, init_fail 80%. Honest partials: flaw_privesc 50%,
+flaw_persistence ~50%, samba 40%. The 25%/20% graphs (flaw_initial_access, flawed,
+goal_only) are all **F14** (subagent doesn't prefer the proven vector on recovery). The
+scenario tail (unrealircd/elasticsearch/jenkins/continuum) is target-state (UnrealIRCd
+degraded from repeated exploitation; ES/Jenkins/Continuum services absent on MS3) + **F18**
+hangs — **not fix regressions**. Bottom line: the architecture + the 4 fixes work; the
+open items are exploit-selection quality (F14, design) and subagent-hang robustness (F18, code).
 
 ### New findings this run (F10+)
 - **F5b** · `code` · **HIGH** · ☑ FIXED — the F5 bounded-wait was incomplete: UnrealIRCd
@@ -258,6 +277,21 @@ Grounding method: for `/var/www/html` artifacts, curl `http://TARGET/<file>`; fo
   MS3 the UnrealIRCd shell user `boba_fett` is in the `docker` group (`999(docker)`) =
   trivial root (mount host fs / run privileged container), but the subagent only tried
   SUID and time-boxed. Should check `id` groups for docker/lxd/disk/sudo. For discussion.
+- **F16** · `code` · **LOW** (pre-existing) — direct msf console `send_command(timeout=120)`
+  waits the FULL 120s when the MSF console stays "busy" (RPC quirk; triggered by e.g.
+  `set SESSION <bad>`), making some module runs crawl (~2 min/command). Leave per protocol.
+- **F17** · `code`/`ops` · **MED** — after a long-up container (~1h, many exploits/sessions)
+  msfrpcd degrades: exploits start failing with `EOFError` and console commands slow.
+  goal_only chose the right module but EOF'd. Mitigation: restart Kali (fresh msfrpcd)
+  periodically / per graph. Root may be msfrpcd memory/handle leak — worth a look.
+  **Refined (graph 10):** also the TARGET's UnrealIRCd service degrades after repeated
+  backdoor exploitation across the sweep (EOFError on connect) — a sweep-hammering
+  artifact; a target reboot between graphs would isolate exploit-viability from it.
+- **F18** · `code`/`ops` · **MED** — the exploit subagent can **hang indefinitely** at init
+  (drupal: ~20 min zero output, froze before its first log line — a hung LLM or RAG/embedding
+  call). No timeout wraps the subagent, so a stuck upstream call stalls the whole run. Needs
+  a wall-clock guard around the subagent (the exploitation stage has a 600s cap once running,
+  but not around init/first call). For discussion — mid-priority robustness.
 
 ---
 
