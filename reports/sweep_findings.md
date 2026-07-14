@@ -225,6 +225,10 @@ Grounding method: for `/var/www/html` artifacts, curl `http://TARGET/<file>`; fo
 |---|-------|-----------|----------|------|
 | 1 | flaw_recon | 100% | ✅ **100% GROUNDED** | recon✓ replan→UnrealIRCd✓ gain_access✓ file_drop✓ — `cat` returned marker `PWNED…User: boba_fett`, F2 verified it. **Validates F5b+F2 end-to-end.** (2 earlier attempts killed by the harness/msfrpcd-hang; container-survives-task-kill worked around.) |
 | 2 | flaw_initial_access | 25% | 25% (recon only) | recon✓; gain_access✗ — subagent improvised to `apache_mod_cgi_bash_env` (wrong for this target) → no session → exhausted. **No binding errors (F1 confirmed working); no 429.** Root = exploit-selection quality → **F14** (design). |
+| 3 | flaw_privesc | 50% | ✅ **50% HONEST** | recon✓ gain_access✓ escalate✗ (time-boxed on SUID, no root) file_drop⊘ skipped. **F2 validated — no false positive** (pre-fix this inflated to 75%); session survived escalate. New **F15**: privesc missed docker-group root (`boba_fett` ∈ `docker`). |
+| 4 | flaw_persistence | ~50% (killed) | recon✓ gain_access✓ | persist stuck: direct exec used `SESSION 1` (actual 3) → **confirms F4** (session-id not propagated to module SESSION, code/MED, fix after run); `service_persistence` hung the console (F16 120s/cmd) → subagent no progress ~6min → killed. |
+| 5 | flaw_impact | 100% | ✅ **100% GROUNDED** | recon✓ gain_access✓ file_drop✓ — 1st write to `/root` failed (non-root), F2 caught it → retried `/tmp` (alternatives) → marker verified. **Validates F2 failure-detect + retry + F5b + grounding together.** |
+| 6 | init_fail | 80% | ✅ **80% GROUNDED** ⭐ | **REPLANNER thesis validated end-to-end**: root/root✗(designed) → replanner found `vagrant:vagrant` → SSH session → grew edge → privesc_verify sudo→root (`uid=0`, grounded) → file_drop✓ (marker+`ls` read back). 4/5 (only intentional-fail node fails). Confirms F4 is module-SESSION-only (command path used session 6 correctly). |
 
 ### New findings this run (F10+)
 - **F5b** · `code` · **HIGH** · ☑ FIXED — the F5 bounded-wait was incomplete: UnrealIRCd
@@ -250,6 +254,10 @@ Grounding method: for `/var/www/html` artifacts, curl `http://TARGET/<file>`; fo
   replanner can't re-point to the dead node (F8). It should strongly prefer confirmed
   services / `[PROVEN]` vectors. For discussion (may be prompt-tuning or the proven-DB not
   being consulted). Blocks reliable recovery on flaw_initial_access / goal_only.
+- **F15** · `design` · **MED** — privesc enumeration misses **group-based** escalation. On
+  MS3 the UnrealIRCd shell user `boba_fett` is in the `docker` group (`999(docker)`) =
+  trivial root (mount host fs / run privileged container), but the subagent only tried
+  SUID and time-boxed. Should check `id` groups for docker/lxd/disk/sudo. For discussion.
 
 ---
 
