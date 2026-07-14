@@ -101,18 +101,33 @@ class MetasploitSession:
                 elapsed += 1
             return output if output else "(no output)"
         else:
-            # command_shell — append newline to execute
+            # command_shell — output streams back ASYNCHRONOUSLY over the session,
+            # arriving a beat after shell_write. The old code did `if not data: break`,
+            # bailing on the FIRST empty read and returning "(no output)" for anything
+            # slower than instant (e.g. a `cat` read-back) even when output was coming —
+            # which made impact/file_drop unable to verify anything (see F5).
+            # Fix: poll while empty (bounded wait for output to START), and once output
+            # has arrived keep reading until it drains (a short quiet period) or timeout.
             self.client.call('session.shell_write', [sid, command + "\n"])
-            time.sleep(2)
             output = ""
             elapsed = 0
+            idle_after_data = 0
+            got_data = False
+            start_wait = min(4, timeout)   # seconds to wait for output to begin
             while elapsed < timeout:
                 resp = self.client.call('session.shell_read', [sid])
                 data = resp.get(b'data', resp.get('data', b''))
                 if isinstance(data, bytes):
                     data = data.decode('utf-8', errors='ignore')
-                output += data
-                if not data:
+                if data:
+                    output += data
+                    got_data = True
+                    idle_after_data = 0
+                elif got_data:
+                    idle_after_data += 1        # output started then went quiet ->
+                    if idle_after_data >= 2:    # ~2s of silence means it has drained
+                        break
+                elif elapsed >= start_wait:     # no output ever began -> genuinely none
                     break
                 time.sleep(1)
                 elapsed += 1

@@ -41,7 +41,7 @@ just proftpd). Key realization: **the architecture was fine — the plumbing was
 | ID | Title | Type | Sev | Status | Affected graphs |
 |----|-------|------|-----|--------|-----------------|
 | F2 | `impact/file_drop` declares success **without grounding** | design-gap | **CRITICAL** | ☐ | ~every graph reaching impact via command_shell |
-| F5 | `command_shell` "(no output)" read-loop starvation | coding-bug | **CRITICAL** | ☐ | ~every command_shell run (makes F2 systematic) |
+| F5 | `command_shell` "(no output)" read-loop starvation | coding-bug | **CRITICAL** | ☑ **FIXED** (verified live) | ~every command_shell run (makes F2 systematic) |
 | F1 | Handler-job leak → listener-port collision | coding-bug | **High** | ☐ | flaw_initial_access, goal_only, flawed |
 | F3 | No session-liveness gate before post-exploitation | design-gap | Med-High | ☐ | privesc / persistence / impact |
 | F4 | Session-id mismatch (looked for `1`, session was `2`) | coding-bug | Med | ☐ *needs investigation* | flaw_privesc (+?) |
