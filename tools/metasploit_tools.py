@@ -31,6 +31,27 @@ class MetasploitSession:
         # Clean the command
         command = command.strip()
 
+        # F1: a failed exploit attempt leaves its reverse-handler JOB bound to the
+        # LPORT; the next attempt (even the CORRECT exploit) then fails to bind that
+        # port ("binding issues on listener port" / "address already in use"), which
+        # blocks recovery on retry-heavy graphs (flaw_initial_access: the subagent
+        # picked proftpd_modcopy correctly but couldn't bind). Before firing an
+        # exploit, clear stale handler jobs so the fresh handler can bind. Sessions
+        # are unaffected (jobs != sessions); guarded to exploit-fire verbs so it is
+        # not re-entrant (the jobs -K below is not itself a run/exploit).
+        low = command.lower()
+        if low == "run" or low.startswith("run ") or low == "exploit" or low.startswith("exploit "):
+            try:
+                self.console.write("jobs -K\n")
+                time.sleep(1)
+                for _ in range(3):   # drain jobs -K output so it doesn't bleed into the exploit's
+                    r = self.console.read()
+                    if not r.get('busy') and not r.get('data'):
+                        break
+                    time.sleep(0.3)
+            except Exception:
+                pass
+
         # Write to the persistent console
         self.console.write(command + "\n")
 
