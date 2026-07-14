@@ -217,9 +217,14 @@ CODE** bugs immediately (stop loop, commit, verify); **medium CODE** bugs after 
 full run; **design bugs + low bugs left for discussion**. F1/F2/F5 fixed pre-run.
 
 ### Verified pass tally (grounded, not pipeline self-report)
+Grounding method: for `/var/www/html` artifacts, curl `http://TARGET/<file>`; for
+`/tmp` artifacts (not web-served), trust F2's in-session marker check (F5b makes the
+`cat` reliable — the log shows the marker in the file_drop output or it FAILs).
+
 | # | Graph | Pipeline % | Verified | Note |
 |---|-------|-----------|----------|------|
-| 1 | flaw_recon | 75% | re-run pending | recon✓ replan→UnrealIRCd✓ gain_access✓; file_drop false-FAILED on the F5b bug (file WAS written) → re-running after fix |
+| 1 | flaw_recon | 100% | ✅ **100% GROUNDED** | recon✓ replan→UnrealIRCd✓ gain_access✓ file_drop✓ — `cat` returned marker `PWNED…User: boba_fett`, F2 verified it. **Validates F5b+F2 end-to-end.** (2 earlier attempts killed by the harness/msfrpcd-hang; container-survives-task-kill worked around.) |
+| 2 | flaw_initial_access | 25% | 25% (recon only) | recon✓; gain_access✗ — subagent improvised to `apache_mod_cgi_bash_env` (wrong for this target) → no session → exhausted. **No binding errors (F1 confirmed working); no 429.** Root = exploit-selection quality → **F14** (design). |
 
 ### New findings this run (F10+)
 - **F5b** · `code` · **HIGH** · ☑ FIXED — the F5 bounded-wait was incomplete: UnrealIRCd
@@ -234,6 +239,17 @@ full run; **design bugs + low bugs left for discussion**. F1/F2/F5 fixed pre-run
 - **F12** · `design` · **MED** — F2's positive grounding only covers nodes that declare a
   `marker`; no-marker impact/enum nodes (e.g. replanner-grown `passwd`) still pass on
   `(no output)` (false success). For discussion — largely mooted once F5b makes output real.
+- **F13** · `ops` · **MED** · ☑ mitigated — a graph run can hang on a transient msfrpcd
+  hiccup and get the bash task watchdog-killed, leaving a zombie app-run container; the
+  container keeps running though. Worked around: launch DETACHED (`docker compose run -d`)
+  + watch the container's own `logs/*.log` + zombie-kill in preflight. `pgrep msfrpcd`
+  health check false-negatives → use a real RPC call instead.
+- **F14** · `design` · **MED** — subagent exploit-selection is inconsistent: from the same
+  recon it sometimes picks the proven vector (UnrealIRCd/proftpd) and sometimes a wrong one
+  (`apache_mod_cgi_bash_env`, needs a CGI MS3 lacks) → no session → exhausted, and the
+  replanner can't re-point to the dead node (F8). It should strongly prefer confirmed
+  services / `[PROVEN]` vectors. For discussion (may be prompt-tuning or the proven-DB not
+  being consulted). Blocks reliable recovery on flaw_initial_access / goal_only.
 
 ---
 
