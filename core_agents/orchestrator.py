@@ -466,6 +466,10 @@ _FAILURE_INDICATORS: list[str] = [
     "does not exist",          # covers "file does not exist" etc.
     "ssh connection/execution error",   # from common.run_ssh_command
     "(exit code:",             # from common.run_ssh_command's non-zero-exit wrap
+    # Dead/invalid MSF session: run_session_command returns this exact string when
+    # the session id isn't live. Previously NOT scanned, so a file_drop whose every
+    # command returned "Session N not found" still reported success (F2, flaw_privesc).
+    "not found. use tool_metasploit_rpc",
     "could not resolve host",
     "host key verification failed",
     # CLI usage hints that mean the command did NOTHING. Caught when a tool
@@ -588,6 +592,27 @@ def _execute_session_commands(
             "success": False,
             "session_id": session_id,
             "summary": fail_summary,
+            "output": all_output[:5000],
+        }
+
+    # Grounding (F2): if the node declares a proof marker, it MUST actually appear in
+    # the captured target output (e.g. the file_drop's `cat` read-back) — otherwise the
+    # write is unverified and we must NOT claim success. This is what made file_drop a
+    # false positive: it counted commands *executed* without confirming the read-back
+    # contained the proof (compounded by F5, now fixed, which had eaten that output).
+    marker = None
+    if isinstance(getattr(node, "command_params", None), dict):
+        marker = node.command_params.get("marker")
+    if not marker and isinstance(getattr(node, "metadata", None), dict):
+        marker = node.metadata.get("marker")
+    if marker and str(marker) not in all_output:
+        summary = (f"Unverified: proof marker {str(marker)[:60]!r} not found in target "
+                   f"output — write not confirmed (session may be dead, or write failed)")
+        log.warning(f"  [direct] {summary}")
+        return {
+            "success": False,
+            "session_id": session_id,
+            "summary": summary,
             "output": all_output[:5000],
         }
 
