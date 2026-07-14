@@ -286,7 +286,7 @@ def _execute_direct(node: AttackNode, graph: AttackGraph, log: logging.Logger) -
 
     # Structured MSF module execution
     if node.module:
-        return _execute_msf_module(node, graph, log, msf_session)
+        return _execute_msf_module(node, graph, log, msf_session, preceding)
 
     if not node.commands_to_run:
         log.warning(f"  [direct] Node has no module or commands — cannot execute directly")
@@ -335,7 +335,7 @@ def _execute_msf_console_commands(
 
 def _execute_msf_module(
     node: AttackNode, graph: AttackGraph,
-    log: logging.Logger, msf_session,
+    log: logging.Logger, msf_session, preceding: list = None,
 ) -> dict:
     """Execute a Metasploit module directly via console commands.
 
@@ -366,6 +366,20 @@ def _execute_msf_module(
                 tweaks_applied.append(f"{field_name}={new_value}")
         if tweaks_applied:
             log.info(f"  [direct] Retry {retry_idx} tweaks: {', '.join(tweaks_applied)}")
+
+    # F4: session-requiring modules (local exploits, service_persistence, ...) take a
+    # SESSION option. The graph often hard-codes SESSION=1, but msfrpcd's session
+    # counter increments, so the real session may be 2/3/... — running the module
+    # against the wrong (nonexistent) session hangs/fails (flaw_persistence: the graph
+    # set SESSION 1 while the live session was 3). Override SESSION with the actual
+    # tracked session id from preceding findings.
+    if any(str(k).upper() == "SESSION" for k in effective_module_options):
+        real_sid, _, _ = _find_session(preceding or [])
+        if real_sid:
+            for k in list(effective_module_options):
+                if str(k).upper() == "SESSION" and str(effective_module_options[k]) != str(real_sid):
+                    log.info(f"  [direct] F4: overriding {k}={effective_module_options[k]} → {real_sid} (actual session)")
+                    effective_module_options[k] = real_sid
 
     # Build command sequence from effective options
     cmds = [f"use {node.module}"]

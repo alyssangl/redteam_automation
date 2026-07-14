@@ -44,7 +44,7 @@ just proftpd). Key realization: **the architecture was fine — the plumbing was
 | F5 | `command_shell` "(no output)" read-loop starvation | coding-bug | **CRITICAL** | ☑ **FIXED** (verified live) | ~every command_shell run (makes F2 systematic) |
 | F1 | Handler-job leak → listener-port collision | coding-bug | **High** | ☑ **FIXED** (verified live) | flaw_initial_access, goal_only, flawed |
 | F3 | No session-liveness gate before post-exploitation | design-gap | Med-High | ☐ | privesc / persistence / impact |
-| F4 | Session-id mismatch (looked for `1`, session was `2`) | coding-bug | Med | ☐ *needs investigation* | flaw_privesc (+?) |
+| F4 | Session-id mismatch (module `SESSION` defaults to `1`) | coding-bug | Med | ☑ **FIXED** (offline) | flaw_privesc, flaw_persistence |
 | F6 | privesc runs **attacker-side** cmds in target shell | design-gap | Med | ☐ | privesc |
 | F7 | recon conflates `SSH_TIMEOUT` with "no open ports" | design-gap | Low-Med | ☐ | recon under lab degradation |
 | F8 | replanner weak recovery on non-retryable node fail | design-gap | Low | ☐ *moot if F1 fixed* | flaw_initial_access |
