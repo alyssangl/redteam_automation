@@ -16,6 +16,37 @@ Started **2026-07-15**. Update as the sweep finishes and as fixes land.
 
 ---
 
+## ☀️ Morning summary (2026-07-15)
+
+**Ran all 14 graphs overnight, deep-read each log, re-grounded every impact success.**
+
+**Fixes landed + pushed** (`graph-orchestrator`): plumbing (LHOST/ports/RLBA) →
+**F5 → F5b → F2 → F1** (criticals, stop-and-fixed mid-run) → **F4 + F11** (medium code,
+cleared after). All offline-verified; F5/F5b/F2/F1 also live-verified.
+
+**Validated:**
+- **No false positives anywhere** — F2+F5b grounding works; every reported success is real
+  (marker/curl-verified). The old inflated numbers are gone.
+- **Replanner thesis works** — `init_fail`: root/root✗ → found `vagrant:vagrant` → sudo→root
+  → grounded file drop (**80%**, the ideal result).
+- Clean grounded end-to-end: **flaw_recon 100%, flaw_impact 100%, init_fail 80%.**
+
+**Open for you (NOT auto-fixed):**
+- **F18** `code` · **top follow-up** — subagents can hang with no timeout guard (drupal,
+  jenkins, continuum hung at init). *Deferred:* needs investigation + a tested wall-clock
+  guard; too risky to land blind overnight. Launcher's 25-min container cap mitigates it.
+- **F14** `design` — subagent doesn't prefer the proven vector on wrong-module recovery
+  (the 25%/20% graphs). For discussion.
+- **F8 / F12 / F15** `design` + **F16** `code/low` — left per your instructions.
+
+**Not-a-bug context:** the scenario tail (samba/unrealircd/elasticsearch/jenkins/continuum)
+under-scores because those exploits target services MS3 lacks, or that the sweep itself
+degraded (UnrealIRCd after repeated exploitation) — target-state, not the architecture.
+
+Per-graph tally in §3; finding details in §2 + §6.
+
+---
+
 ## 1. Lab plumbing — ✅ FIXED (migration leftovers, NOT architecture)
 
 The VM→container migration left the reverse-shell path stale. All three fixed &
@@ -197,12 +228,15 @@ just proftpd). Key realization: **the architecture was fine — the plumbing was
    **re-ground every impact success** out-of-band (read the artifact back from the
    target, e.g. `curl http://TARGET/pwned_*.txt`) so §3 shows *verified* %, not the
    pipeline's self-report.
-3. **Fix order (revised — metric integrity first):**
-   - **F5** (read-loop) — enables grounding on command_shell. *Do first.*
-   - **F2** (impact must verify read-back, else FAIL) — depends on F5.
-   - **F1** (handler-job hygiene) — unblocks correct recovery on retry-heavy graphs.
-   - **F3** (session-liveness gate) — stops the dead-session cascades.
-   - Then F4 / F6 / F7 / F9.
+3. **Fix status (post-run):**
+   - ☑ **F5, F5b, F2, F1** (criticals) — stop-and-fixed mid-run; committed, pushed,
+     offline + live verified.
+   - ☑ **F4, F11** (medium code) — cleared after the run; committed, pushed, offline-verified.
+   - ⏳ **F18** (subagent hang) — **deferred**: needs investigation + a tested wall-clock
+     guard around subagent dispatch (recon-init hang cause unclear; not SSH/OpenAI). Top
+     follow-up. Launcher container-cap mitigates for now.
+   - 💬 **Left for discussion** (design / low, per instructions): F3, F6, F7, F8, F12, F14,
+     F15; F16 (code/low); F9/F17 (ops).
 4. Re-run the affected graphs on the fixed lab: flaw_privesc (F2/F3/F4), the
    improvisation-heavy ones (flaw_initial_access, goal_only, flawed) for F1, and a
    command_shell impact graph to confirm F5/F2 now ground.
