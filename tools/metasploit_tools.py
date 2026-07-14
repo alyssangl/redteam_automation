@@ -14,6 +14,18 @@ class MetasploitSession:
         self.cid = self.console.cid
         print(f"--- Console Created (ID: {self.cid}) ---")
 
+        # Container lab: LHOST is the VirtualBox host-only adapter IP (192.168.34.1),
+        # which the Kali *container* does not hold -- a reverse handler that binds LHOST
+        # literally fails with "Handler failed to bind" (EADDRNOTAVAIL). Bind ALL reverse
+        # handlers to 0.0.0.0 globally; the target still dials back to LHOST and Docker
+        # forwards the published ports (4444-4480) into the container. (proftpd's graph set
+        # this per-module; doing it globally here covers every path -- direct execution,
+        # the exploit subagent, and replanner-grown exploits -- through this one console.)
+        try:
+            self.send_command("setg ReverseListenerBindAddress 0.0.0.0", timeout=10)
+        except Exception:
+            pass
+
     def send_command(self, command, timeout=60):
         """Sends a command and waits for the prompt to return."""
         # Clean the command

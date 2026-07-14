@@ -22,6 +22,7 @@ If THIS fails, the issue is the executor itself, not the replanner.
 """
 
 from __future__ import annotations
+import os
 
 import sys
 from pathlib import Path
@@ -32,7 +33,7 @@ from core_agents.attack_graph import AttackGraph, AttackNode, Tactic
 from core_agents.orchestrator import run_graph
 
 TARGET_IP = "192.168.34.7"
-ATTACKER_IP = "192.168.34.6"
+ATTACKER_IP = os.getenv("LHOST", "192.168.34.1")
 
 
 def build_graph() -> AttackGraph:

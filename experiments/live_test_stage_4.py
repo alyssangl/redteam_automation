@@ -5,6 +5,7 @@ Same CREME disk_wipe scenario. The replanner now emits tiny intents
 {action, target_hint, label?, goal?, rationale}; orchestrator expands
 them into full AttackNodes locally (RHOSTS/LHOST/LPORT/RPORT defaulted
 from graph context).
+import os
 
 Pass criteria (inspected from the log):
   - At least one [Replanner] line.
@@ -28,7 +29,7 @@ from core_agents.orchestrator import run_graph
 from examples.disk_wipe_graph import build_disk_wipe_graph
 
 TARGET_IP = "192.168.34.7"
-ATTACKER_IP = "192.168.34.6"
+ATTACKER_IP = os.getenv("LHOST", "192.168.34.1")
 
 if __name__ == "__main__":
     graph = build_disk_wipe_graph(target_ip=TARGET_IP, attacker_ip=ATTACKER_IP)

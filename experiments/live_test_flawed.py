@@ -7,6 +7,7 @@ explore=True + use_judge=True so the recovery machinery is active.
 """
 
 from __future__ import annotations
+import os
 
 import sys
 from pathlib import Path
@@ -17,7 +18,7 @@ from core_agents.orchestrator import run_graph
 from examples.flawed_graph import build_flawed_graph
 
 TARGET_IP = "192.168.34.7"
-ATTACKER_IP = "192.168.34.6"
+ATTACKER_IP = os.getenv("LHOST", "192.168.34.1")
 
 if __name__ == "__main__":
     graph = build_flawed_graph(target_ip=TARGET_IP, attacker_ip=ATTACKER_IP)

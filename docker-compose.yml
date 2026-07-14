@@ -30,8 +30,8 @@ services:
       # Reverse-shell handler port: the VM target dials back to the host-only
       # adapter (192.168.34.1:4444/4445); Docker forwards it here to the handler
       # bound at 0.0.0.0 inside the container (payloads set ReverseListenerBindAddress=0.0.0.0).
-      - "4444:4444"
-      - "4445:4445"
+      # Range (not just 4444/4445) so whatever LPORT the replanner/exploit picks forwards in.
+      - "4444-4480:4444-4480"
     networks:
       - lab
 

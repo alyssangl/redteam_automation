@@ -9,6 +9,7 @@ replanner detects the Permission-denied failure and adapts to a writable
 """
 
 from __future__ import annotations
+import os
 
 import sys
 from pathlib import Path
@@ -19,7 +20,7 @@ from core_agents.orchestrator import run_graph
 from examples.flaw_impact_graph import build_flaw_impact_graph
 
 TARGET_IP = "192.168.34.7"
-ATTACKER_IP = "192.168.34.6"
+ATTACKER_IP = os.getenv("LHOST", "192.168.34.1")
 
 if __name__ == "__main__":
     graph = build_flaw_impact_graph(target_ip=TARGET_IP, attacker_ip=ATTACKER_IP)
