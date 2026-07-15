@@ -1848,18 +1848,10 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
     priv_line = _format_session_privilege_line(graph)
     priv_block = f"{priv_line}\n\n" if priv_line else ""
 
-    # F19: explicitly list DEAD nodes so the replanner stops re-proposing a
-    # new_edge back to a node that already failed non-retryably, and instead offers
-    # a fresh vector (action=use_module) against a live service.
+    # dead_block (DEAD NODES guidance) is built AFTER tech_block below so it can be
+    # session/technique-aware: a dead POST-exploitation node (persistence) means "try
+    # another TECHNIQUE", not "re-exploit for a new shell" — see V3 note below.
     dead_block = ""
-    if dead_nodes:
-        dead_block = (
-            "DEAD NODES — these FAILED non-retryably. Do NOT propose action=new_edge to "
-            "them (it will be rejected). Instead propose action=use_module with a DIFFERENT "
-            "exploit against a service in DETECTED SERVICES (e.g. ProFTPD mod_copy, "
-            "UnrealIRCd backdoor, Samba usermap_script):\n"
-            f"{json.dumps(sorted(dead_nodes), indent=2)}\n\n"
-        )
 
     # MITRE technique menu — inject when a tactic with a catalog menu (persistence
     # is the wired prototype) still has an AVAILABLE technique to try. This fires
@@ -1895,6 +1887,43 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
             f"{mitre.menu_summary(_tactic, _failed, _al, _st)}\n\n"
         )
         break
+
+    # F19 + V3: DEAD NODES guidance — now session/technique-aware. The old text
+    # ALWAYS told the replanner to re-exploit a DIFFERENT service, which is correct
+    # ONLY when there is no session yet (an access failure). When we ALREADY have a
+    # session and a post-exploitation node (e.g. persistence) died with its technique
+    # exhausted, re-exploiting for a new shell is wrong and off-goal — the fix is to
+    # try a different TECHNIQUE (grow_technique) or route to a READY node.
+    if dead_nodes:
+        _dead_json = json.dumps(sorted(dead_nodes), indent=2)
+        if tech_block:
+            # A technique menu is live → the dead node's TECHNIQUE was exhausted, not
+            # the tactic or your access. Grow the next technique; don't re-exploit.
+            dead_block = (
+                "DEAD NODES — FAILED non-retryably (do NOT action=new_edge to them). "
+                "You ALREADY HAVE a session, and only the dead node's TECHNIQUE was "
+                "exhausted — NOT the tactic and NOT your access. Do NOT re-exploit for a "
+                "new shell. GROW THE NEXT TECHNIQUE (action=grow_technique) from the MITRE "
+                "TECHNIQUE MENU above before anything else:\n"
+                f"{_dead_json}\n\n"
+            )
+        elif _has_session:
+            dead_block = (
+                "DEAD NODES — FAILED non-retryably (do NOT action=new_edge to them). "
+                "You ALREADY HAVE a session — do NOT re-exploit for a new shell. Route to a "
+                "REMAINING NODE marked READY (action=new_edge), or run post-exploitation "
+                "commands (action=run_commands) toward the OBJECTIVE:\n"
+                f"{_dead_json}\n\n"
+            )
+        else:
+            # No session yet — a genuine access failure; re-exploit a different service.
+            dead_block = (
+                "DEAD NODES — FAILED non-retryably. Do NOT propose action=new_edge to them "
+                "(it will be rejected). You have NO session yet — propose action=use_module "
+                "with a DIFFERENT exploit against a service in DETECTED SERVICES (e.g. "
+                "ProFTPD mod_copy, UnrealIRCd backdoor, Samba usermap_script):\n"
+                f"{_dead_json}\n\n"
+            )
 
     context = (
         f"OBJECTIVE: {graph.objective}\n\n"

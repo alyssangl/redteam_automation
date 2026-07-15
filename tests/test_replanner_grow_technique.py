@@ -40,7 +40,7 @@ def _build_graph(persist_status=NodeStatus.FAILED.value, persist_method="cron_jo
     return g
 
 
-def _run_replan(graph, intent_json, capture=None, stuck="persist"):
+def _run_replan(graph, intent_json, capture=None, stuck="persist", dead_nodes=None):
     """Drive _replan_from with call_llm mocked to return intent_json."""
     def fake_llm(messages=None, system_prompt=None, model_name=None, **kw):
         if capture is not None:
@@ -49,7 +49,7 @@ def _run_replan(graph, intent_json, capture=None, stuck="persist"):
     orig = orch.call_llm
     orch.call_llm = fake_llm
     try:
-        return orch._replan_from(graph, stuck, LOG)
+        return orch._replan_from(graph, stuck, LOG, dead_nodes=dead_nodes)
     finally:
         orch.call_llm = orig
 
@@ -168,6 +168,50 @@ def test_no_menu_when_persistence_already_satisfied():
                       cap, stuck="gain")
     assert "MITRE TECHNIQUE MENU" not in cap["context"]
     assert out is None                      # grow_technique rejected when satisfied
+
+
+# --- V3: DEAD NODES guidance must be session/technique-aware ---
+
+def test_dead_persist_with_session_steers_to_grow_technique_not_reexploit():
+    # persist (systemd) dead, but we HAVE a session — must steer to grow_technique,
+    # NOT "re-exploit a different service".
+    g = _build_graph(persist_status=NodeStatus.PENDING.value)
+    g.nodes["persist"].technique_id = "T1543.002"
+    g.nodes["persist"].findings = {"failure_category": "technique_infeasible",
+                                   "technique_exhausted": True, "method": "systemd_service",
+                                   "success": False}
+    cap = {}
+    _run_replan(g, '{"action":"grow_technique","technique_id":"T1053.003","rationale":"cron"}',
+                cap, stuck="gain", dead_nodes={"persist"})
+    ctx = cap["context"]
+    assert "DEAD NODES" in ctx
+    assert "GROW THE NEXT TECHNIQUE" in ctx
+    assert "do NOT re-exploit" in ctx.lower() or "Do NOT re-exploit" in ctx
+    # the old, wrong guidance must be gone in this case
+    assert "DIFFERENT exploit against a service" not in ctx
+
+
+def test_dead_access_node_without_session_keeps_reexploit_guidance():
+    # No session yet, an initial-access node died -> re-exploit a different service
+    # IS the right advice; must be preserved.
+    g = AttackGraph(name="t", objective="get a shell then persist",
+                    target_ip="192.168.34.7", attacker_ip="192.168.34.6")
+    recon = AttackNode(id="recon", label="Recon", agent_type="recon", tactic="reconnaissance")
+    recon.status = NodeStatus.SUCCESS.value
+    recon.findings = {"ports": [{"port": 21, "service": "ftp"}]}
+    g.add_node(recon)
+    gain = AttackNode(id="gain", label="Gain", agent_type="exploit", tactic="initial_access")
+    gain.status = NodeStatus.FAILED.value
+    gain.findings = {"failure_category": "exhausted", "success": False}
+    g.add_node(gain)
+    g.connect("recon", "gain")
+    cap = {}
+    _run_replan(g, '{"action":"use_module","target_hint":"exploit/x","rationale":"y"}',
+                cap, stuck="recon", dead_nodes={"gain"})
+    ctx = cap["context"]
+    assert "DEAD NODES" in ctx
+    assert "DIFFERENT exploit against a service" in ctx   # re-exploit advice preserved
+    assert "GROW THE NEXT TECHNIQUE" not in ctx
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
