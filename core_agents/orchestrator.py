@@ -2208,6 +2208,11 @@ def _is_retryable_failure(findings: dict) -> bool:
     # the walker should mark it dead and let the replanner grow the next technique.
     if cat == "technique_infeasible" or findings.get("technique_exhausted"):
         return False
+    # a dead / read-zombie session is deterministic — retrying the SAME node against
+    # the SAME unusable session just re-aborts (the grind we are killing). The
+    # replanner must re-establish a session (re-exploit) to recover, not the retry.
+    if cat == "session_unusable":
+        return False
     return True
 
 

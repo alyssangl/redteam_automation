@@ -24,6 +24,12 @@ def test_exhausted_category_not_retryable():
     assert _is_retryable_failure({"success": False, "failure_category": "exhausted"}) is False
 
 
+def test_session_unusable_not_retryable():
+    # a dead / read-zombie session is deterministic -> retrying the same node
+    # against the same session just re-aborts; the replanner must re-exploit.
+    assert _is_retryable_failure({"success": False, "failure_category": "session_unusable"}) is False
+
+
 def test_generic_failure_is_retryable():
     f = {"success": False, "failure_category": "generic", "summary": "no session created"}
     assert _is_retryable_failure(f) is True

