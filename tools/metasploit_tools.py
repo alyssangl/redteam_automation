@@ -118,8 +118,23 @@ class MetasploitSession:
         sid = str(session_id)
 
         if 'meterpreter' in session_type:
-            self.client.call('session.meterpreter_write', [sid, command])
+            # meterpreter_write targets the meterpreter COMMAND INTERPRETER, which only
+            # understands meterpreter verbs (getuid, sysinfo, upload, ...). A POSIX shell
+            # command like `crontab`/`echo`/`useradd` comes back as "Unknown command" —
+            # so persistence (all shell work) silently no-ops on an upgraded session.
+            # Fix: drop into a channelized system shell (`shell`) and run the command
+            # THERE, framing the output with the same end-marker trick as the raw
+            # command_shell path below. Self-contained per call — drain -> shell ->
+            # cmd + marker -> read-to-marker -> exit — so the session is left back at the
+            # meterpreter prompt for the next call.
+            done = "__MSF_CMD_DONE_9271__"
+            poke = 'echo __MSF""_CMD_DONE_9271__\n'
+            self.client.call('session.meterpreter_read', [sid])          # clear leftover
+            self.client.call('session.meterpreter_write', [sid, 'shell\n'])
             time.sleep(2)
+            self.client.call('session.meterpreter_read', [sid])          # drain shell banner
+            self.client.call('session.meterpreter_write', [sid, command + "\n"])
+            self.client.call('session.meterpreter_write', [sid, poke])
             output = ""
             elapsed = 0
             while elapsed < timeout:
@@ -128,10 +143,19 @@ class MetasploitSession:
                 if isinstance(data, bytes):
                     data = data.decode('utf-8', errors='ignore')
                 output += data
-                if data:
+                if done in output:
+                    output = output.split(done)[0]   # keep only the real output
                     break
                 time.sleep(1)
                 elapsed += 1
+            # Leave the shell channel so the session returns to the meterpreter prompt.
+            try:
+                self.client.call('session.meterpreter_write', [sid, 'exit\n'])
+                time.sleep(1)
+                self.client.call('session.meterpreter_read', [sid])
+            except Exception:
+                pass
+            output = output.strip()
             return output if output else "(no output)"
         else:
             # command_shell — output streams back asynchronously AND some payloads
