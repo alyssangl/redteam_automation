@@ -923,6 +923,10 @@ def _dispatch_persistence(node: AttackNode, graph: AttackGraph, preceding: dict,
         session_type=session_type,
         access_level=access_level,
         objective=objective,
+        # The node (graph author or replanner) chooses the MITRE technique; the
+        # subagent chooses the procedure under it. Empty = legacy self-select.
+        technique_id=node.technique_id,
+        technique_slug=node.technique_name,
     )
     return dict(findings)
 

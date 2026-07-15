@@ -34,8 +34,30 @@ from core_agents.common import (
     run_ssh_command, KALI_IP, MODEL_NAME, FORBIDDEN_COMMANDS,
 )
 from core_agents.state import PersistenceFindings
+from core_agents import mitre
 from tools.rag import query_knowledge_base
 from tools.metasploit_tools import msf_session
+
+
+def classify_technique(text: str) -> str:
+    """Map free-form plan/technique text to a persistence technique slug.
+
+    Slugs match the MITRE catalog (core_agents/mitre.py) so findings, the critic,
+    the catalog menu, and the node's assigned technique all speak the same
+    vocabulary. Returns "unknown" when nothing matches.
+    """
+    t = (text or "").lower()
+    if "ssh" in t and "key" in t:
+        return "ssh_key"
+    if "cron" in t:
+        return "cron_job"
+    if "systemd" in t or "service" in t:
+        return "systemd_service"
+    if "user" in t and ("account" in t or "useradd" in t):
+        return "user_account"
+    if "bashrc" in t or "profile" in t:
+        return "shell_profile"
+    return "unknown"
 
 # =============================================================================
 # CONSTANTS
@@ -57,6 +79,9 @@ class PersistenceState(TypedDict):
     session_type: str          # "command_shell" | "meterpreter"
     access_level: str          # "user" | "root"
     objective: str
+    assigned_technique: str    # MITRE technique slug the node assigned (e.g. "cron_job");
+                               # "" = unassigned (legacy self-select behavior)
+    assigned_technique_id: str # ATT&CK id of the assigned technique (e.g. "T1053.003")
     persistence_plan: str      # Planner's chosen technique + steps
     install_result: str        # Executor's summary of what was installed
     verification_result: str   # Verifier's summary of verification test
@@ -520,11 +545,19 @@ def _extract_open_ports(text: str) -> str:
     return ", ".join(sorted(ports, key=lambda p: int(p)))
 
 
-def _get_recommended_techniques(access_level: str, session_type: str, session_id: str) -> str:
+def _get_recommended_techniques(access_level: str, session_type: str, session_id: str,
+                                only_slug: str = "") -> str:
     """Return deterministic persistence technique recommendations based on context.
 
     These are pre-verified, reliable techniques that the planner should try BEFORE
     falling back to RAG. Keeps RAG available for novel techniques when these are exhausted.
+
+    When `only_slug` is set (the node assigned a MITRE technique), the menu is
+    filtered to that ONE technique's procedures — the subagent executes procedures
+    under the assigned technique and never sees the others to switch to. If no
+    pre-built procedure exists for the assigned slug (e.g. systemd on an init-based
+    target), the catalog's procedure_hint is surfaced and the planner is told to
+    use the knowledge base for procedures under that technique.
     """
     techniques = []
 
@@ -626,7 +659,44 @@ def _get_recommended_techniques(access_level: str, session_type: str, session_id
             "notes": "Fires on next user login. Less reliable than cron.",
         })
 
-    # Format for injection into context
+    # When the node assigned a technique, scope the menu to procedures under it ONLY.
+    if only_slug:
+        scoped = [t for t in techniques if classify_technique(t["name"]) == only_slug]
+        cat = mitre.get_technique("persistence", only_slug)
+        cat_name = cat.name if cat else only_slug
+        cat_id = cat.id if cat else ""
+        header = (
+            f"\n**ASSIGNED MITRE TECHNIQUE: {cat_id} {cat_name} ({only_slug})** — "
+            "You are LOCKED to this technique. Execute PROCEDURES under it only; do NOT "
+            "switch to a different persistence technique. On retry, vary the PROCEDURE "
+            "(different command/path/verification) under this SAME technique. If every "
+            "procedure under this technique is exhausted, say so plainly in your plan "
+            "(TECHNIQUE_EXHAUSTED) — the node will fail and the replanner will grow the "
+            "next technique. This overrides any generic 'switch technique on retry' guidance.\n"
+        )
+        if scoped:
+            output = header + "\n**PROCEDURES for the assigned technique:**\n"
+            for i, t in enumerate(scoped, 1):
+                compatible = "YES" if session_type in t["session_types"] else "NO (wrong session type)"
+                output += f"\n{i}. **{t['name']}** — Reliability: {t['reliability']}, Compatible: {compatible}\n"
+                output += f"   Steps:\n"
+                for step in t["steps"]:
+                    output += f"     - {step}\n"
+                output += f"   Verification: {t['verification']}\n"
+                output += f"   Notes: {t['notes']}\n"
+            output += ("\nUse a procedure above FIRST. Query the knowledge base only for a "
+                       "DIFFERENT PROCEDURE under this SAME technique if the above fails.\n")
+        else:
+            # No pre-built procedure for this slug — hand over the catalog hint + RAG.
+            hint = cat.procedure_hint if cat else ""
+            output = header + (
+                f"\nNo pre-built procedure is bundled for this technique. Procedure guidance: "
+                f"{hint}\nUse query_knowledge_base to find concrete procedures for "
+                f"{cat_id} {cat_name}, then produce your plan. Stay within this technique.\n"
+            )
+        return output
+
+    # Format for injection into context (legacy self-select: full menu)
     output = "\n**RECOMMENDED TECHNIQUES (pre-verified, prioritize these):**\n"
     for i, t in enumerate(techniques, 1):
         compatible = "YES" if session_type in t["session_types"] else "NO (wrong session type)"
@@ -703,8 +773,13 @@ def planner_node(state: PersistenceState) -> dict:
                 "Prefer cron over SSH key injection unless you confirm SSH is open.\n"
             )
 
-        # Inject deterministic technique recommendations
-        context += _get_recommended_techniques(access_level, session_type, session_id)
+        # Inject deterministic technique recommendations. When the node assigned a
+        # MITRE technique, scope the menu to procedures under THAT technique only —
+        # the subagent chooses the procedure, the node/replanner chose the technique.
+        context += _get_recommended_techniques(
+            access_level, session_type, session_id,
+            only_slug=state.get("assigned_technique", ""),
+        )
 
         # Include ALL prior critic feedback so the planner never repeats a failed
         # technique. Each retry appends a new CRITIC FEEDBACK HumanMessage; scanning
@@ -1246,19 +1321,7 @@ def _extract_persistence_findings(state: dict) -> PersistenceFindings:
 
     success = critic_verdict == "PASS"
 
-    def _classify(text: str) -> str:
-        t = (text or "").lower()
-        if "ssh" in t and "key" in t:
-            return "ssh_key"
-        if "cron" in t:
-            return "cron_job"
-        if "systemd" in t or "service" in t:
-            return "systemd_service"
-        if "user" in t and ("account" in t or "useradd" in t):
-            return "user_account"
-        if "bashrc" in t or "profile" in t:
-            return "shell_profile"
-        return "unknown"
+    _classify = classify_technique
 
     # Extract method from plan text first.
     method = _classify(persistence_plan)
@@ -1308,6 +1371,8 @@ def run_persistence(
     session_type: str,
     access_level: str,
     objective: str = "",
+    technique_id: str = "",
+    technique_slug: str = "",
     thread_id: str = None,
     recursion_limit: int = 250,
 ) -> PersistenceFindings:
@@ -1315,6 +1380,21 @@ def run_persistence(
 
     if thread_id is None:
         thread_id = f"persist_{uuid.uuid4().hex[:8]}"
+
+    # Resolve the node's assigned MITRE technique against the catalog so the planner
+    # is locked to it. Try each arg independently (technique_slug may carry a human
+    # name that doesn't resolve, so we must still try technique_id). An
+    # unresolved/empty technique falls back to legacy self-select behavior.
+    assigned = (mitre.get_technique("persistence", technique_slug)
+                or mitre.get_technique("persistence", technique_id))
+    assigned_slug = assigned.slug if assigned else ""
+    assigned_id = assigned.id if assigned else ""
+    if assigned:
+        print_colored(
+            f"[run_persistence] Assigned technique: {assigned_id} {assigned.name} "
+            f"({assigned_slug}) — locking planner to procedures under it.",
+            Colors.OKCYAN,
+        )
 
     # --- SESSION LIVENESS PROBE (before entering the graph) ---
     # A dead session causes the executor to burn all 10 tool slots receiving
@@ -1366,6 +1446,8 @@ def run_persistence(
         "session_type": session_type,
         "access_level": access_level,
         "objective": objective,
+        "assigned_technique": assigned_slug,
+        "assigned_technique_id": assigned_id,
         "persistence_plan": "",
         "install_result": "",
         "verification_result": "",

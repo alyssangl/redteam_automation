@@ -83,7 +83,7 @@ _PERSISTENCE: list[Technique] = [
         ),
     ),
     Technique(
-        id="T1546.004", slug="bash_profile", tactic="persistence",
+        id="T1546.004", slug="shell_profile", tactic="persistence",
         name="Event Triggered Execution: Unix Shell Configuration Modification",
         min_privilege="user",
         procedure_hint=(

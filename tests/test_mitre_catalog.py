@@ -16,7 +16,7 @@ def test_persistence_menu_ordered_and_slugged():
     menu = mitre.technique_menu("persistence")
     slugs = [t.slug for t in menu]
     # slugs must match persistence _classify() outputs so findings/critic/catalog agree
-    for expected in ("cron_job", "ssh_key", "user_account", "systemd_service", "bash_profile"):
+    for expected in ("cron_job", "ssh_key", "user_account", "systemd_service", "shell_profile"):
         assert expected in slugs, f"{expected} missing from persistence menu"
     # least-privilege-first: cron before the root-only techniques
     assert slugs.index("cron_job") < slugs.index("user_account")
@@ -49,7 +49,7 @@ def test_next_untried_by_id_and_privilege_gating():
                              failed=["T1053.003", "T1098.004", "T1546.004"],
                              access_level="user", session_type="command_shell")
     # remaining are user_account/systemd_service — both root-only -> exhausted for a user
-    assert nxt is None, f"user session should exhaust after user-level techniques, got {nxt}"
+    assert nxt is None, f"user session should exhaust after user-level techniques, got {nxt}"  # shell_profile=T1546.004
     # a root session, same failures, still has user_account/systemd available
     nxt_root = mitre.next_untried("persistence",
                                   failed=["T1053.003", "T1098.004", "T1546.004"],
