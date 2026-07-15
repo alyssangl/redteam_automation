@@ -1610,6 +1610,15 @@ def _extract_persistence_findings(state: dict) -> PersistenceFindings:
         method=method,
         details=details,
         summary=summary,
+        # Surface the (probed/upgraded) session so downstream impact can use it.
+        # v16b invariant: a stage holding a live session MUST propagate session_id/
+        # session_type in findings or the session orphans downstream — file_drop was
+        # reached after the routing fix but died with "no active session in preceding
+        # nodes" precisely because this was missing. `state` carries the post-probe
+        # (possibly meterpreter-upgraded) id. Only on success: a failed persistence
+        # node's session may be dead, and propagating it would hand impact a corpse.
+        session_id=str(state.get("session_id") or "") if success else "",
+        session_type=(state.get("session_type", "") if success else ""),
     )
 
 # =============================================================================
