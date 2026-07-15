@@ -1511,6 +1511,11 @@ Rules:
     it instead of spinning up new freelance steps. Example: if you have a
     session and `disk_wipe` shows `preconditions_met: true`, emit
     {"action": "new_edge", "target_hint": "disk_wipe", "rationale": "..."}.
+    EXCEPTION: if a MITRE TECHNIQUE MENU is shown (a tactic like persistence
+    FAILED but has an AVAILABLE technique), `grow_technique` for that tactic
+    takes PRECEDENCE — finish the failed tactic before skip-connecting past it
+    to a later READY node. Do NOT skip persistence to reach impact/file_drop
+    while a persistence technique is still AVAILABLE.
 - For use_module: target_hint is JUST the module path. Don't include options.
 - For run_commands: target_hint is the literal command(s). The system picks
   session vs. SSH based on whether an active session exists.
@@ -1697,6 +1702,12 @@ def _failed_techniques(graph: AttackGraph, tactic: str) -> set:
     return failed
 
 
+def _tactic_satisfied(graph: AttackGraph, tactic: str) -> bool:
+    """True if any node of this tactic already SUCCEEDED (don't grow more)."""
+    return any(n.status == NodeStatus.SUCCESS.value and _is_tactic_node(n, tactic)
+               for n in graph.nodes.values())
+
+
 def _current_session_context(graph: AttackGraph) -> tuple[str, str]:
     """Best-effort (access_level, session_type) of the live session, for menu
     privilege/session gating. Defaults ('unknown','command_shell') — 'unknown' is
@@ -1837,22 +1848,40 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
             f"{json.dumps(sorted(dead_nodes), indent=2)}\n\n"
         )
 
-    # MITRE technique menu — only when STUCK AT a node whose tactic has a catalog
-    # menu (persistence is the wired prototype). The replanner picks the next
-    # AVAILABLE technique to grow; the subagent owns the procedure under it. Failed
-    # techniques are marked TRIED so it never re-proposes one.
+    # MITRE technique menu — inject when a tactic with a catalog menu (persistence
+    # is the wired prototype) still has an AVAILABLE technique to try. This fires
+    # either when the stuck node IS that tactic, OR when a node of that tactic
+    # already FAILED and the walker backtracked to a PREDECESSOR (the common case:
+    # persist fails → walker replans from gain_access). The replanner picks the next
+    # AVAILABLE technique to grow; the subagent owns the procedure. Failed techniques
+    # are marked TRIED. Skipped once the tactic is satisfied or its menu is exhausted.
     tech_block = ""
     for _tactic in ("persistence",):
-        if _is_tactic_node(stuck_node, _tactic) and mitre.technique_menu(_tactic):
-            _al, _st = _current_session_context(graph)
-            _failed = _failed_techniques(graph, _tactic)
-            tech_block = (
-                "MITRE TECHNIQUE MENU (stuck at a "
-                f"{_tactic} node — grow the NEXT technique with action=grow_technique; "
-                "the subagent chooses the procedure under it):\n"
-                f"{mitre.menu_summary(_tactic, _failed, _al, _st)}\n\n"
-            )
-            break
+        if not mitre.technique_menu(_tactic) or _tactic_satisfied(graph, _tactic):
+            continue
+        _failed = _failed_techniques(graph, _tactic)
+        stuck_here = _is_tactic_node(stuck_node, _tactic)
+        # A failed tactic node exists (walker backtracked) and the tactic is part
+        # of the objective — don't abandon it while techniques remain.
+        failed_pending = bool(_failed) and _tactic in (graph.objective or "").lower()
+        if not (stuck_here or failed_pending):
+            continue
+        _al, _st = _current_session_context(graph)
+        if mitre.next_untried(_tactic, _failed, _al, _st) is None:
+            continue  # menu exhausted — let the general replanner route onward
+        _why = ("you are stuck at this persistence node"
+                if stuck_here else
+                f"a {_tactic} node already FAILED ({', '.join(sorted(_failed))} "
+                f"exhausted) and {_tactic} is part of the OBJECTIVE, but AVAILABLE "
+                "techniques remain")
+        tech_block = (
+            f"MITRE TECHNIQUE MENU — {_why}. Grow the NEXT available technique with "
+            "action=grow_technique (the subagent picks the procedure). This takes "
+            "PRECEDENCE over new_edge to a later node — finish the current tactic "
+            f"before advancing; do NOT abandon {_tactic} while a technique is AVAILABLE:\n"
+            f"{mitre.menu_summary(_tactic, _failed, _al, _st)}\n\n"
+        )
+        break
 
     context = (
         f"OBJECTIVE: {graph.objective}\n\n"
@@ -1928,14 +1957,17 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
         # The replanner chose a MITRE technique; grow a goal-only tactic node with
         # it assigned. The subagent picks the procedure. Gated to a tactic that has
         # a catalog menu and whose node the walker is actually stuck at.
+        # Allow when the stuck node IS this tactic, OR a node of this tactic already
+        # FAILED (walker backtracked to a predecessor) — same trigger as the menu.
         tactic = next(
             (t for t in ("persistence",)
-             if _is_tactic_node(stuck_node, t) and mitre.technique_menu(t)),
+             if mitre.technique_menu(t) and not _tactic_satisfied(graph, t)
+             and (_is_tactic_node(stuck_node, t) or _failed_techniques(graph, t))),
             "",
         )
         if not tactic:
-            log.warning("[Replanner] grow_technique proposed but stuck node has no "
-                        "catalogued tactic menu — rejecting")
+            log.warning("[Replanner] grow_technique proposed but no catalogued tactic "
+                        "is pending (stuck node not tactic-typed and none failed) — rejecting")
             return None
         tech = (mitre.get_technique(tactic, result.get("technique_id", ""))
                 or mitre.get_technique(tactic, result.get("technique_slug", "")))

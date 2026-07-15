@@ -21,9 +21,9 @@ class _FakeResp:
     def __init__(self, content): self.content = content
 
 
-def _build_graph():
+def _build_graph(persist_status=NodeStatus.FAILED.value, persist_method="cron_job"):
     """gain (SUCCESS, session) -> persist (FAILED, tried cron)."""
-    g = AttackGraph(name="t", objective="persist on target",
+    g = AttackGraph(name="t", objective="establish persistence on target",
                     target_ip="192.168.34.7", attacker_ip="192.168.34.6")
     gain = AttackNode(id="gain", label="Gain", agent_type="initial_access",
                       tactic="initial_access")
@@ -33,14 +33,14 @@ def _build_graph():
     g.add_node(gain)
     persist = AttackNode(id="persist", label="Persist", agent_type="persistence",
                          tactic="persistence", tool_name="session")
-    persist.status = NodeStatus.FAILED.value
-    persist.findings = {"method": "cron_job", "failure_category": "generic"}
+    persist.status = persist_status
+    persist.findings = {"method": persist_method, "failure_category": "generic"}
     g.add_node(persist)
     g.connect("gain", "persist")
     return g
 
 
-def _run_replan(graph, intent_json, capture=None):
+def _run_replan(graph, intent_json, capture=None, stuck="persist"):
     """Drive _replan_from with call_llm mocked to return intent_json."""
     def fake_llm(messages=None, system_prompt=None, model_name=None, **kw):
         if capture is not None:
@@ -49,7 +49,7 @@ def _run_replan(graph, intent_json, capture=None):
     orig = orch.call_llm
     orch.call_llm = fake_llm
     try:
-        return orch._replan_from(graph, "persist", LOG)
+        return orch._replan_from(graph, stuck, LOG)
     finally:
         orch.call_llm = orig
 
@@ -101,6 +101,42 @@ def test_grow_technique_rejects_unresolved():
     g = _build_graph()
     out = _run_replan(g, '{"action":"grow_technique","technique_id":"T9999","rationale":"bogus"}')
     assert out is None
+
+
+# --- V2: walker backtracked — stuck at the PREDECESSOR, persist node FAILED ---
+
+def test_menu_injected_when_stuck_at_predecessor():
+    # systemd failed on persist; replanner is stuck at gain (initial_access).
+    g = _build_graph(persist_method="systemd_service")
+    cap = {}
+    _run_replan(g, '{"action":"grow_technique","technique_id":"T1053.003","rationale":"cron"}',
+                cap, stuck="gain")
+    ctx = cap["context"]
+    assert "MITRE TECHNIQUE MENU" in ctx, "menu must appear even when stuck at predecessor"
+    assert "systemd_service" in ctx and "TRIED" in ctx
+    assert "PRECEDENCE" in ctx
+
+
+def test_grow_from_predecessor_adds_cron_node():
+    g = _build_graph(persist_method="systemd_service")
+    before = set(g.nodes)
+    new_id = _run_replan(g, '{"action":"grow_technique","technique_id":"T1053.003","rationale":"cron"}',
+                         stuck="gain")
+    assert new_id and new_id not in before
+    n = g.nodes[new_id]
+    assert n.tactic == "persistence" and n.technique_id == "T1053.003"
+    # grown from the stuck predecessor, which carries the session
+    assert any(e.source == "gain" and e.target == new_id for e in g.edges)
+
+
+def test_no_menu_when_persistence_already_satisfied():
+    # persist SUCCEEDED -> no menu, no growth (don't pile on more persistence)
+    g = _build_graph(persist_status=NodeStatus.SUCCESS.value, persist_method="cron_job")
+    cap = {}
+    out = _run_replan(g, '{"action":"grow_technique","technique_id":"T1098.004","rationale":"x"}',
+                      cap, stuck="gain")
+    assert "MITRE TECHNIQUE MENU" not in cap["context"]
+    assert out is None                      # grow_technique rejected when satisfied
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
