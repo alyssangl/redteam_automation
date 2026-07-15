@@ -1392,27 +1392,39 @@ def _try_replanner(
     """
     if not explore:
         return None, replan_attempts
-    if replan_attempts >= max_replan_attempts:
+    dead_nodes = dead_nodes or set()
+    # F19: keep spending the replan budget instead of giving up after ONE rejected
+    # proposal. Previously a single dead-node re-point OR a rejected use_module
+    # (anti-repetition on the just-failed exploit) returned None -> "Path exhausted",
+    # wasting attempts 2..N and defeating recovery (flawed / flaw_initial_access /
+    # goal_only capped at ~25%; unrealircd never tried ProFTPD/Samba after the backdoor
+    # failed). Now we re-ask; the DEAD-NODES block + accumulating failed context steer
+    # each retry to a DIFFERENT vector until one is accepted or the budget runs out.
+    while replan_attempts < max_replan_attempts:
+        replan_attempts += 1
         log.info(
-            f"[Orchestrator] Replan budget exhausted "
-            f"({replan_attempts}/{max_replan_attempts})"
+            f"[Orchestrator] Replan attempt {replan_attempts}/{max_replan_attempts} "
+            f"from '{current}'"
         )
-        return None, replan_attempts
-    replan_attempts += 1
+        new_target = _replan_from(graph, current, log, dead_nodes=dead_nodes)
+        if new_target and new_target in dead_nodes:
+            log.warning(
+                f"[Orchestrator] Replanner targeted '{new_target}' (dead) — "
+                f"re-asking for a different vector."
+            )
+            continue
+        if new_target:
+            _checkpoint(graph, checkpoint_path, log)
+            return new_target, replan_attempts
+        # None: proposal rejected (dead / already-tried / not-in-catalog) or the LLM
+        # gave up. Re-ask up to budget — the updated dead/failed context steers a
+        # different proposal (e.g. ProFTPD after UnrealIRCd failed).
+        log.info("[Orchestrator] Replan proposal rejected/empty — re-asking.")
     log.info(
-        f"[Orchestrator] Replan attempt {replan_attempts}/{max_replan_attempts} "
-        f"from '{current}'"
+        f"[Orchestrator] Replan budget exhausted "
+        f"({replan_attempts}/{max_replan_attempts})"
     )
-    new_target = _replan_from(graph, current, log)
-    if new_target and dead_nodes and new_target in dead_nodes:
-        log.warning(
-            f"[Orchestrator] Replanner targeted '{new_target}', which already "
-            f"failed non-retryably — rejecting (won't re-run a dead node)."
-        )
-        return None, replan_attempts
-    if new_target:
-        _checkpoint(graph, checkpoint_path, log)
-    return new_target, replan_attempts
+    return None, replan_attempts
 
 
 # =============================================================================
@@ -1631,7 +1643,8 @@ def _expand_intent_to_node(
     return None  # Unsupported action
 
 
-def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) -> Optional[str]:
+def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
+                 dead_nodes: set = None) -> Optional[str]:
     """
     Attempt to grow a new edge from a stuck node.
 
@@ -1745,11 +1758,25 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
     priv_line = _format_session_privilege_line(graph)
     priv_block = f"{priv_line}\n\n" if priv_line else ""
 
+    # F19: explicitly list DEAD nodes so the replanner stops re-proposing a
+    # new_edge back to a node that already failed non-retryably, and instead offers
+    # a fresh vector (action=use_module) against a live service.
+    dead_block = ""
+    if dead_nodes:
+        dead_block = (
+            "DEAD NODES — these FAILED non-retryably. Do NOT propose action=new_edge to "
+            "them (it will be rejected). Instead propose action=use_module with a DIFFERENT "
+            "exploit against a service in DETECTED SERVICES (e.g. ProFTPD mod_copy, "
+            "UnrealIRCd backdoor, Samba usermap_script):\n"
+            f"{json.dumps(sorted(dead_nodes), indent=2)}\n\n"
+        )
+
     context = (
         f"OBJECTIVE: {graph.objective}\n\n"
         f"TARGET (RHOSTS): {graph.target_ip}\n"
         f"ATTACKER (LHOST): {graph.attacker_ip}\n\n"
         f"{priv_block}"
+        f"{dead_block}"
         f"DETECTED SERVICES (from recon — match exploit versions to these!):\n"
         f"{json.dumps(detected_services, indent=2)}\n\n"
         f"STUCK AT NODE: {stuck_node_id} ({stuck_node.label})\n"
@@ -1797,6 +1824,11 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger) ->
         target_node = graph.nodes[target_id]
         if target_node.status == NodeStatus.FAILED.value:
             log.warning(f"[Replanner] Target '{target_id}' is FAILED (exhausted retries) — refusing to retry it")
+            return None
+        # F19: dead_nodes is authoritative — a node's status can be reset on backtrack,
+        # so also refuse a new_edge to any non-retryably-dead node here.
+        if dead_nodes and target_id in dead_nodes:
+            log.warning(f"[Replanner] Target '{target_id}' is DEAD (failed non-retryably) — refusing new_edge")
             return None
 
         graph.connect(

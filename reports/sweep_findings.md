@@ -78,7 +78,7 @@ just proftpd). Key realization: **the architecture was fine — the plumbing was
 | F4 | Session-id mismatch (module `SESSION` defaults to `1`) | coding-bug | Med | ☑ **FIXED** (offline) | flaw_privesc, flaw_persistence |
 | F6 | privesc runs **attacker-side** cmds in target shell | design-gap | Med | ☐ | privesc |
 | F7 | recon conflates `SSH_TIMEOUT` with "no open ports" | design-gap | Low-Med | ☐ | recon under lab degradation |
-| F8 | replanner weak recovery on non-retryable node fail | design-gap | Low | ☐ *moot if F1 fixed* | flaw_initial_access |
+| F8→**F19** | replanner **gives up after 1 rejected proposal** (loop bug) | **coding-bug** | **High** | ☑ **FIXED** (offline) | flawed, flaw_initial_access, goal_only, unrealircd |
 | F9 | **target clock drifted to Feb 9** (breaks time-based verify) | ops | Low-Med | ☐ | any time/log correlation |
 
 > ⚠️ **METRIC TRUST WARNING.** The pipeline's raw `Success rate: %` is **NOT trustworthy for the
