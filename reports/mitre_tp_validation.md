@@ -82,6 +82,25 @@ run_persistence fast-fails an infeasible locked technique to
   tactic is in the objective (not only when stuck AT it); give grow_technique PRECEDENCE
   over skip-connecting to a later READY node; suppress once the tactic is satisfied.
 
+### V2b — mark_failed never stored findings; infeasible technique was retryable  `code` · High · ☑ FIXED (`97b7f57`)
+- **Evidence:** run 4 — `node.mark_failed()` only records a reason string, so
+  failure_category/method/technique were invisible; the menu couldn't mark systemd
+  TRIED and the walker looped `new_edge → persist`.
+- **Fix:** walker stores `node.findings = findings` on failure; technique_infeasible/
+  technique_exhausted are non-retryable → the fixed-technique node is marked dead →
+  replanner grows the next technique. `_failed_techniques` is findings-based.
+- **Confirmed live (run 5):** `marked dead` → `GROW TECHNIQUE: persistence_cron_job
+  (T1053.003)` → subagent locked to cron. **B2 validated.**
+
+### V3 — DEAD NODES guidance told the replanner to re-exploit instead of trying another technique  `design-gap→code` · Med-High · ☑ FIXED (`b2b6a3f`)
+- **Found by the user** reading the raw replan context: with `persist` DEAD, the
+  dead_block said "propose use_module with a DIFFERENT exploit against a service"
+  (get a new shell) — contradicting the tech_block (grow_technique) and wrong when a
+  session already exists and only the technique failed.
+- **Fix:** dead_block is now session/technique-aware — technique menu live → steer to
+  grow_technique; session but no menu → route to a READY node; no session → keep the
+  re-exploit advice. Removes the conflict; makes grow-technique-first robust, not luck.
+
 ### V0 (ops) — harness killed the background run ~22 min in
 - The `run_in_background` python was killed mid-run (not by me). Switched to a fully
   detached `nohup … & disown` launch (untracked by the harness) so long runs survive.
