@@ -129,6 +129,37 @@ def test_grow_from_predecessor_adds_cron_node():
     assert any(e.source == "gain" and e.target == new_id for e in g.edges)
 
 
+def test_failed_techniques_findings_based_not_status_gated():
+    # The walker resets a judge_escalate'd node to PENDING but its findings persist.
+    # _failed_techniques must still count it (via failure_category + technique_id).
+    g = _build_graph(persist_status=NodeStatus.PENDING.value)
+    g.nodes["persist"].technique_id = "T1543.002"     # systemd assigned by graph
+    g.nodes["persist"].findings = {"failure_category": "technique_infeasible",
+                                   "technique_exhausted": True, "method": "systemd_service",
+                                   "success": False}
+    assert orch._failed_techniques(g, "persistence") == {"systemd_service"}
+
+
+def test_menu_injects_for_pending_but_failed_persist():
+    g = _build_graph(persist_status=NodeStatus.PENDING.value)
+    g.nodes["persist"].technique_id = "T1543.002"
+    g.nodes["persist"].findings = {"failure_category": "technique_infeasible",
+                                   "technique_exhausted": True, "method": "systemd_service",
+                                   "success": False}
+    cap = {}
+    _run_replan(g, '{"action":"grow_technique","technique_id":"T1053.003","rationale":"cron"}',
+                cap, stuck="gain")
+    assert "MITRE TECHNIQUE MENU" in cap["context"]
+    assert "systemd_service" in cap["context"] and "TRIED" in cap["context"]
+
+
+def test_technique_infeasible_is_not_retryable():
+    assert orch._is_retryable_failure({"failure_category": "technique_infeasible"}) is False
+    assert orch._is_retryable_failure({"technique_exhausted": True}) is False
+    # a generic failure is still retryable
+    assert orch._is_retryable_failure({"failure_category": "generic"}) is True
+
+
 def test_no_menu_when_persistence_already_satisfied():
     # persist SUCCEEDED -> no menu, no growth (don't pile on more persistence)
     g = _build_graph(persist_status=NodeStatus.SUCCESS.value, persist_method="cron_job")

@@ -1684,19 +1684,32 @@ def _is_tactic_node(node: AttackNode, tactic: str) -> bool:
 def _failed_techniques(graph: AttackGraph, tactic: str) -> set:
     """Slugs of techniques already tried-and-failed for a tactic across the graph.
 
-    Reads each FAILED tactic node's assigned technique (technique_id/name) when the
-    replanner grew it, else the findings `method` a self-select subagent recorded.
-    Feeds both the replanner's menu (mark TRIED) and the grow_technique guard."""
+    FINDINGS-based, not status-gated: the walker resets a node's status on
+    backtrack (a judge_escalate'd persist node is no longer FAILED when the
+    replanner runs from its predecessor), but its findings persist. So we count any
+    non-SUCCESS tactic node carrying a failure signal — FAILED status, a
+    failure_category, technique_exhausted, or success=False with a method. Resolves
+    the technique via the node's assigned technique_id/name, else the findings
+    `method`. Feeds both the replanner menu (mark TRIED) and the grow_technique guard."""
     failed = set()
     for n in graph.nodes.values():
-        if n.status != NodeStatus.FAILED.value or not _is_tactic_node(n, tactic):
+        if not _is_tactic_node(n, tactic) or n.status == NodeStatus.SUCCESS.value:
+            continue
+        f = n.findings or {}
+        failed_signal = (
+            n.status == NodeStatus.FAILED.value
+            or f.get("failure_category")
+            or f.get("technique_exhausted")
+            or (f.get("success") is False and f.get("method"))
+        )
+        if not failed_signal:
             continue
         t = (mitre.get_technique(tactic, n.technique_id)
              or mitre.get_technique(tactic, n.technique_name))
         if t:
             failed.add(t.slug)
             continue
-        method = (n.findings.get("method") or "").strip().lower()
+        method = (f.get("method") or "").strip().lower()
         if method and method != "unknown":
             failed.add(method)
     return failed
@@ -2161,6 +2174,11 @@ def _is_retryable_failure(findings: dict) -> bool:
     # initial_access exhausted every distinct vector it could devise
     if "fail_exhausted" in summary or cat == "exhausted":
         return False
+    # a locked technique that is infeasible/exhausted on this target is
+    # deterministic — retrying the SAME (fixed-technique) node re-fails identically;
+    # the walker should mark it dead and let the replanner grow the next technique.
+    if cat == "technique_infeasible" or findings.get("technique_exhausted"):
+        return False
     return True
 
 
@@ -2214,6 +2232,11 @@ def _execute_node(
             else:
                 reason = summary or "No success flag in findings"
                 node.mark_failed(reason)
+                # Persist the failure findings on the node. mark_failed only records
+                # a reason string; without this the failure_category / method / the
+                # technique that failed are lost, so the replanner's technique menu
+                # and the dead-node check (which read node.findings) can't see them.
+                node.findings = findings
                 # Category-aware retry (roadmap P1, conservative seed): for a
                 # deterministic/exhausted failure, retrying the identical node
                 # cannot help — short-circuit to let the walker backtrack/replan
@@ -2486,8 +2509,20 @@ def run_graph(
             )
             # P1: a node that exhausted its retries is a dead end — record it so
             # the replanner won't re-route here and loop (flaw_privesc escalate).
-            if reason == "retries_exhausted":
+            # V2: a node whose ASSIGNED technique is infeasible/exhausted is equally
+            # dead — its technique_id is fixed, so re-pointing to it just re-fails the
+            # same technique. Mark it dead so the replanner GROWS the next technique
+            # instead of looping new_edge→persist.
+            _cf = graph.nodes[current].findings or {}
+            _technique_dead = (
+                _cf.get("failure_category") == "technique_infeasible"
+                or _cf.get("technique_exhausted")
+            )
+            if reason == "retries_exhausted" or _technique_dead:
                 dead_nodes.add(current)
+                if _technique_dead:
+                    log.info(f"  [{current}] technique infeasible/exhausted — marked "
+                             f"dead so the replanner grows the next technique")
             if path:
                 predecessor = path[-1]
                 tried_edges.add(f"{predecessor}→{current}")
