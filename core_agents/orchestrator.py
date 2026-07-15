@@ -2088,13 +2088,21 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
         # file_drop was skipped after 10 empty replans). Copy each dead-node outgoing
         # edge to a still-live, non-tactic successor onto the grown node (gate + checks
         # preserved), so on the grown node's success the walker flows straight on.
+        # dead_nodes is AUTHORITATIVE for dead-ness: a node's status is RESET on
+        # backtrack (F19 — persist reads 'failed' at execution then gets reset before
+        # the replan, which is why keying on status==FAILED here silently found nothing
+        # and file_drop was skipped anyway). Union dead_nodes with any still-FAILED node.
+        _dead_ids = set(dead_nodes or set()) | {
+            n.id for n in graph.nodes.values() if n.status == NodeStatus.FAILED.value
+        }
         _inherited = []
-        for _dead in list(graph.nodes.values()):
-            if _dead.tactic != tactic or _dead.status != NodeStatus.FAILED.value:
+        for _dead_id in _dead_ids:
+            _dead = graph.nodes.get(_dead_id)
+            if not _dead or _dead.tactic != tactic:
                 continue
             for _e in graph.outgoing_edges(_dead.id):
                 _succ = graph.nodes.get(_e.target)
-                if (not _succ or _succ.status == NodeStatus.FAILED.value
+                if (not _succ or _succ.id in _dead_ids
                         or _succ.tactic == tactic or _succ.id in _inherited):
                     continue
                 if any(oe.target == _succ.id for oe in graph.outgoing_edges(new_node.id)):

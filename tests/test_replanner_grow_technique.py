@@ -249,6 +249,24 @@ def test_grown_node_inherits_dead_node_successor():
         "inherited edge must keep the original session_id check"
 
 
+def test_grown_node_inherits_via_dead_nodes_when_status_reset():
+    # LIVE regression: persist's status is RESET on backtrack (F19), so its dead-ness
+    # lives ONLY in the authoritative dead_nodes set, not the status field. file_drop
+    # must still be inherited (the earlier status==FAILED-only check silently missed it
+    # and file_drop got skipped on the real run).
+    g = _build_graph_with_successor()
+    p = g.nodes["persist"]
+    p.status = NodeStatus.PENDING.value            # reset — no longer 'failed'
+    p.technique_id = "T1543.002"
+    p.findings = {"failure_category": "technique_infeasible", "technique_exhausted": True,
+                  "method": "systemd_service", "success": False}
+    new_id = _run_replan(g, '{"action":"grow_technique","technique_id":"T1053.003","rationale":"cron"}',
+                         stuck="gain", dead_nodes={"persist"})
+    assert new_id
+    assert any(e.source == new_id and e.target == "file_drop" for e in g.edges), \
+        "must inherit file_drop via dead_nodes even when persist.status was reset (not 'failed')"
+
+
 def test_inherit_skips_a_dead_successor():
     # if the successor is ITSELF dead, don't re-parent onto it (it can't run).
     g = _build_graph_with_successor(succ_status=NodeStatus.FAILED.value)
