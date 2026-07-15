@@ -43,6 +43,7 @@ MODEL_NAME = "gpt-4o"
 KALI_IP = os.getenv("KALI_IP", "192.168.34.6")
 KALI_USER = os.getenv("KALI_USER", "kali")
 KALI_PASS = os.getenv("KALI_PASS", "kali")
+KALI_SSH_PORT = int(os.getenv("KALI_SSH_PORT", "22"))  # 22 in-container; 2222 host→container publish
 
 MAX_RECON_RETRIES = 3
 MAX_EXECUTOR_TOOL_CALLS = 10
@@ -91,7 +92,7 @@ def run_ssh_command(command: str, timeout: int = RECON_SSH_TIMEOUT) -> str:
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     try:
-        ssh.connect(KALI_IP, username=KALI_USER, password=KALI_PASS, timeout=10)
+        ssh.connect(KALI_IP, port=KALI_SSH_PORT, username=KALI_USER, password=KALI_PASS, timeout=10)
         stdin, stdout, stderr = ssh.exec_command(command, timeout=timeout)
 
         output_lines = []

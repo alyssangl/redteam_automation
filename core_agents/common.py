@@ -30,6 +30,7 @@ KALI_IP = os.getenv("KALI_IP", "192.168.34.6")      # attacker: Kali / msfrpcd h
 TARGET_IP = os.getenv("TARGET_IP", "192.168.34.7")  # default target (graphs may override)
 KALI_USER = os.getenv("KALI_USER", "kali")
 KALI_PASS = os.getenv("KALI_PASS", "kali")
+KALI_SSH_PORT = int(os.getenv("KALI_SSH_PORT", "22"))  # 22 in-container; 2222 host→container publish
 MSF_PORT = int(os.getenv("MSF_PORT", "55553"))
 MSF_USER = os.getenv("MSF_USER", "kali")
 MSF_PASS = os.getenv("MSF_PASS", "kali")
@@ -122,7 +123,7 @@ def run_ssh_command(command: str) -> str:
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     try:
-        ssh.connect(KALI_IP, username=KALI_USER, password=KALI_PASS, timeout=10)
+        ssh.connect(KALI_IP, port=KALI_SSH_PORT, username=KALI_USER, password=KALI_PASS, timeout=10)
         stdin, stdout, stderr = ssh.exec_command(command, timeout=300)
 
         output_lines = []
