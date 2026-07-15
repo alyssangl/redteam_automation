@@ -37,7 +37,10 @@ and RPC auth verified.)
 
 | # | Graph | Result | B1 | B2 | B3 | Notes |
 |---|-------|--------|----|----|----|-------|
-| 1 | flaw_persistence | ◐ killed ~22min (harness bg-cap) | ✅ | ⏳ | ⏳ | B1 confirmed: planner locked to `systemd_service`, did NOT self-switch to cron. Killed before replan. Re-running detached. |
+| 1 | flaw_persistence | ◐ killed ~22min (harness bg-cap) | ✅ | ⏳ | ⏳ | B1: planner locked to `systemd_service`, no self-switch. Killed before replan. |
+| 2 | flaw_persistence | ◐ stuck 60min (V1) | ✅ | ⏳ | ⏳ | Surfaced **V1**: locked systemd ground the full retry budget. Killed, fixed. |
+| 3 | flaw_persistence | ◐ (V1 fixed, V2 found) | ✅ | ❌→fix | ⏳ | **V1 fix works live** — `INFEASIBLE … failing fast (TECHNIQUE_EXHAUSTED)` in seconds. Surfaced **V2**: replanner backtracked to gain_access, never grew cron, skipped to file_drop. Fixed (`d21e3e0`). |
+| 4 | flaw_persistence | ⏳ running (V1+V2 fixed) | | | | Expect: systemd fast-fail → replanner grows cron → cron self-verify → PASS. |
 
 ---
 
@@ -63,9 +66,27 @@ and RPC auth verified.)
 - **Silver lining:** this is exactly the messy-but-correct failure that should trigger
   B2 (replan systemd→cron). Validating that is the point of the re-run.
 
+**V1 status: ☑ FIXED (`58973ca`)** — deterministic feasibility precheck in
+run_persistence fast-fails an infeasible locked technique to
+`failure_category=technique_infeasible` before the grind. Confirmed live in run 3
+(systemd → fast-fail in seconds).
+
+### V2 — replanner abandons a failed tactic when it backtracks to a predecessor  `design-gap→code` · High · ☑ FIXED (`d21e3e0`)
+- **Evidence:** run 3 — persist (systemd) fast-failed; walker backtracked and replanned
+  from `gain_access`. Menu/grow_technique were gated on the STUCK node being a
+  persistence node, so at gain_access no menu appeared → replanner re-pointed to persist
+  (retry) then `NEW EDGE: gain_access → file_drop` (**abandoned persistence**).
+- **Root cause:** trigger shape — gated on stuck-node tactic, but the walker replans from
+  the PREDECESSOR of a failed node.
+- **Fix:** inject the menu / allow grow_technique when a node of the tactic FAILED and the
+  tactic is in the objective (not only when stuck AT it); give grow_technique PRECEDENCE
+  over skip-connecting to a later READY node; suppress once the tactic is satisfied.
+
 ### V0 (ops) — harness killed the background run ~22 min in
-- The `run_in_background` python was killed mid-run (not by me). Switching to a fully
+- The `run_in_background` python was killed mid-run (not by me). Switched to a fully
   detached `nohup … & disown` launch (untracked by the harness) so long runs survive.
+  Note: monitors on these need re-arming (they time out at their cap while the run
+  continues); poll the log directly when a monitor expires.
 
 ---
 
