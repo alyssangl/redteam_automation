@@ -1460,23 +1460,34 @@ RESPOND WITH EXACTLY ONE of these JSON shapes:
     "module_options": {"USERNAME": "vagrant", "PASSWORD": "vagrant"},
     "rationale": "root/root failed -- try the common Metasploitable creds"}
 
-2) Run shell/session commands (newline-separated if multiple):
+2) Run raw terminal commands (newline-separated) — a FIRST-CLASS way to GAIN ACCESS,
+   not just to verify after. With NO session yet, these run on the Kali box to attack the
+   target directly — reach for this whenever an MSF module isn't the best fit: `curl`/
+   `python`/`wget` a PoC or command-injection, `hydra`/`medusa` a login, `smbclient`, a
+   crafted reverse shell. With a session, the SAME action runs ON THE TARGET (enumerate/pivot).
+   Initial-access example (no session — runs on Kali against the target):
+   {"action": "run_commands",
+    "target_hint": "hydra -l vagrant -p vagrant ssh://192.168.34.7",
+    "label": "SSH credential attack", "goal": "Get a login",
+    "rationale": "SSH open, no clean MSF fit -- brute a known lab credential"}
+   Post-session example (session exists — runs on target):
    {"action": "run_commands",
     "target_hint": "id\\ncat /etc/passwd",
-    "label": "Read passwd",
-    "goal": "Confirm root + dump users",
-    "rationale": "Session is open; verify access before pivoting"}
+    "label": "Read passwd", "goal": "Confirm access",
+    "rationale": "Session open; enumerate before pivoting"}
 
 3) Connect to an existing unreached node:
    {"action": "new_edge",
     "target_hint": "<existing_node_id>",
     "rationale": "current findings satisfy that node's preconditions"}
 
-4) Give up:
-   {"action": "give_up",
-    "rationale": "..."}
-
 Rules:
+- NEVER conclude you are stuck while any DETECTED SERVICE still has an untried
+  exploitation vector. There is almost always another move: a DIFFERENT service's
+  exploit, the SAME service via a DIFFERENT technique (MSF module OR raw bash —
+  curl/python/hydra/manual via `run_commands`), UNTRIED credentials, or re-running
+  recon with a different scan (`-p-`, `-sU`, `-sC`) to surface a missed port/service.
+  Enumerate the DETECTED SERVICES and pick the next untried vector every time.
 - *** STRONGLY PREFER `new_edge` when any REMAINING NODE has
     `preconditions_met: true` (look for the `note: READY` marker). The
     pre-planned chain is closest to achieving the OBJECTIVE; skip-connect to
