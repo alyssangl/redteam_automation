@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Optional
 
 from core_agents.attack_graph import AttackGraph, AttackNode, AttackEdge, EdgeCheck, NodeStatus
+from core_agents import mitre
 from core_agents.common import (
     Colors, print_colored, run_ssh_command, call_llm, parse_json_response,
     MAX_PIPELINE_RETRIES,
@@ -1485,7 +1486,19 @@ RESPOND WITH EXACTLY ONE of these JSON shapes:
     "target_hint": "<existing_node_id>",
     "rationale": "current findings satisfy that node's preconditions"}
 
+4) Grow the NEXT technique (ONLY when a MITRE TECHNIQUE MENU is shown above —
+   i.e. you are stuck at a persistence-type node). Pick an AVAILABLE technique
+   from the menu; NEVER a TRIED or N/A one. You choose the TECHNIQUE; the subagent
+   chooses the procedure under it, so do NOT spell out commands here.
+   {"action": "grow_technique",
+    "technique_id": "T1098.004",
+    "rationale": "cron failed to fire; SSH is open (port 22) — inject an authorized_key"}
+
 Rules:
+- *** When a MITRE TECHNIQUE MENU is shown, STRONGLY PREFER action=grow_technique
+    with the next AVAILABLE technique over freelancing run_commands/use_module. The
+    subagent owns the procedure; your job is to pick the technique. Only fall back
+    to another action when the menu shows NO AVAILABLE technique (all TRIED/N/A).
 - NEVER conclude you are stuck while any DETECTED SERVICE still has an untried
   exploitation vector. There is almost always another move: a DIFFERENT service's
   exploit, the SAME service via a DIFFERENT technique (MSF module OR raw bash —
@@ -1658,6 +1671,44 @@ def _expand_intent_to_node(
     return None  # Unsupported action
 
 
+def _is_tactic_node(node: AttackNode, tactic: str) -> bool:
+    """True if a node belongs to a MITRE tactic (by explicit tactic or agent_type)."""
+    return (node.tactic or "").lower() == tactic or node.agent_type == tactic
+
+
+def _failed_techniques(graph: AttackGraph, tactic: str) -> set:
+    """Slugs of techniques already tried-and-failed for a tactic across the graph.
+
+    Reads each FAILED tactic node's assigned technique (technique_id/name) when the
+    replanner grew it, else the findings `method` a self-select subagent recorded.
+    Feeds both the replanner's menu (mark TRIED) and the grow_technique guard."""
+    failed = set()
+    for n in graph.nodes.values():
+        if n.status != NodeStatus.FAILED.value or not _is_tactic_node(n, tactic):
+            continue
+        t = (mitre.get_technique(tactic, n.technique_id)
+             or mitre.get_technique(tactic, n.technique_name))
+        if t:
+            failed.add(t.slug)
+            continue
+        method = (n.findings.get("method") or "").strip().lower()
+        if method and method != "unknown":
+            failed.add(method)
+    return failed
+
+
+def _current_session_context(graph: AttackGraph) -> tuple[str, str]:
+    """Best-effort (access_level, session_type) of the live session, for menu
+    privilege/session gating. Defaults ('unknown','command_shell') — 'unknown' is
+    treated as root-capable, so no technique is wrongly hidden."""
+    for n in graph.nodes.values():
+        if n.status == NodeStatus.SUCCESS.value and n.findings.get("session_id"):
+            stype = (n.findings.get("session_type") or "command_shell")
+            stype = "meterpreter" if "meterpreter" in stype else "command_shell"
+            return (n.findings.get("access_level") or "unknown"), stype
+    return "unknown", "command_shell"
+
+
 def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
                  dead_nodes: set = None) -> Optional[str]:
     """
@@ -1786,12 +1837,30 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
             f"{json.dumps(sorted(dead_nodes), indent=2)}\n\n"
         )
 
+    # MITRE technique menu — only when STUCK AT a node whose tactic has a catalog
+    # menu (persistence is the wired prototype). The replanner picks the next
+    # AVAILABLE technique to grow; the subagent owns the procedure under it. Failed
+    # techniques are marked TRIED so it never re-proposes one.
+    tech_block = ""
+    for _tactic in ("persistence",):
+        if _is_tactic_node(stuck_node, _tactic) and mitre.technique_menu(_tactic):
+            _al, _st = _current_session_context(graph)
+            _failed = _failed_techniques(graph, _tactic)
+            tech_block = (
+                "MITRE TECHNIQUE MENU (stuck at a "
+                f"{_tactic} node — grow the NEXT technique with action=grow_technique; "
+                "the subagent chooses the procedure under it):\n"
+                f"{mitre.menu_summary(_tactic, _failed, _al, _st)}\n\n"
+            )
+            break
+
     context = (
         f"OBJECTIVE: {graph.objective}\n\n"
         f"TARGET (RHOSTS): {graph.target_ip}\n"
         f"ATTACKER (LHOST): {graph.attacker_ip}\n\n"
         f"{priv_block}"
         f"{dead_block}"
+        f"{tech_block}"
         f"DETECTED SERVICES (from recon — match exploit versions to these!):\n"
         f"{json.dumps(detected_services, indent=2)}\n\n"
         f"STUCK AT NODE: {stuck_node_id} ({stuck_node.label})\n"
@@ -1854,6 +1923,62 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
         )
         log.info(f"[Replanner] NEW EDGE: {stuck_node_id} → {target_id} — {rationale}")
         return target_id
+
+    elif action == "grow_technique":
+        # The replanner chose a MITRE technique; grow a goal-only tactic node with
+        # it assigned. The subagent picks the procedure. Gated to a tactic that has
+        # a catalog menu and whose node the walker is actually stuck at.
+        tactic = next(
+            (t for t in ("persistence",)
+             if _is_tactic_node(stuck_node, t) and mitre.technique_menu(t)),
+            "",
+        )
+        if not tactic:
+            log.warning("[Replanner] grow_technique proposed but stuck node has no "
+                        "catalogued tactic menu — rejecting")
+            return None
+        tech = (mitre.get_technique(tactic, result.get("technique_id", ""))
+                or mitre.get_technique(tactic, result.get("technique_slug", "")))
+        if not tech:
+            log.warning(f"[Replanner] grow_technique: unresolved technique "
+                        f"{result.get('technique_id') or result.get('technique_slug')!r} — rejecting")
+            return None
+        # Anti-repeat: never grow a technique that already failed for this tactic.
+        if tech.slug in _failed_techniques(graph, tactic):
+            log.warning(f"[Replanner] grow_technique: {tech.slug} already tried and "
+                        f"failed — rejecting (pick another AVAILABLE menu technique)")
+            return None
+
+        nid = f"{tactic}_{tech.slug}"
+        suffix = 1
+        while nid in graph.nodes:
+            suffix += 1
+            nid = f"{tactic}_{tech.slug}_{suffix}"
+        new_node = AttackNode(
+            id=nid,
+            label=f"{tactic.replace('_', ' ').title()} via {tech.name}",
+            goal=f"Establish {tactic}" if tactic == "persistence" else tactic,
+            tactic=tactic,
+            technique_id=tech.id,
+            technique_name=tech.name,
+            agent_type=tactic,          # dispatch routes by agent_type
+            objective=(f"Achieve {tactic} on {graph.target_ip} using {tech.name} "
+                       f"({tech.id}). {tech.procedure_hint}"),
+            target_ip=graph.target_ip,
+            tool_name="session",        # needs the existing session (goal-only → subagent)
+            max_retries=2,
+            tags=["replanner_generated", "grow_technique", tech.id],
+        )
+        graph.add_node(new_node)
+        graph.connect(
+            stuck_node_id, new_node.id,
+            evidence=f"Replanner: grow {tech.id} from {stuck_node_id}",
+            rationale=rationale,
+            condition="on_success",
+        )
+        log.info(f"[Replanner] GROW TECHNIQUE: {new_node.id} "
+                 f"({tech.id} {tech.name}) — {rationale}")
+        return new_node.id
 
     elif action in ("use_module", "run_commands"):
         # New tiny-intent path: LLM emits {action, target_hint, label?, goal?}.
