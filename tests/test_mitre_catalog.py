@@ -37,24 +37,30 @@ def test_resolve_any_across_tactics():
 
 
 def test_next_untried_skips_failed():
-    # cron already failed -> next available should be ssh_key (user-level, before root ones)
+    # cron already failed -> next available user technique is at_job (menu order,
+    # least-privilege-first, before ssh_key/web_shell/shell_profile and the root ones)
     nxt = mitre.next_untried("persistence", failed=["cron_job"],
                              access_level="user", session_type="command_shell")
-    assert nxt is not None and nxt.slug == "ssh_key", nxt
+    assert nxt is not None and nxt.slug == "at_job", nxt
+
+
+# every user-level persistence technique (least-privilege-first slice of the menu);
+# `requires` is advisory (applies() does NOT gate on it), so web_shell is offered to a
+# user session too and must be failed for a user to truly exhaust.
+_USER_PERSISTENCE = ["T1053.003", "T1053.002", "T1098.004", "T1505.003", "T1546.004"]
 
 
 def test_next_untried_by_id_and_privilege_gating():
     # user-level session must not be offered root-only techniques
-    nxt = mitre.next_untried("persistence",
-                             failed=["T1053.003", "T1098.004", "T1546.004"],
+    nxt = mitre.next_untried("persistence", failed=_USER_PERSISTENCE,
                              access_level="user", session_type="command_shell")
-    # remaining are user_account/systemd_service — both root-only -> exhausted for a user
-    assert nxt is None, f"user session should exhaust after user-level techniques, got {nxt}"  # shell_profile=T1546.004
-    # a root session, same failures, still has user_account/systemd available
-    nxt_root = mitre.next_untried("persistence",
-                                  failed=["T1053.003", "T1098.004", "T1546.004"],
+    # remaining are user_account/rc_local/systemd_service/ld_preload — all root-only
+    assert nxt is None, f"user session should exhaust after user-level techniques, got {nxt}"
+    # a root session, same failures, still has the root techniques available
+    nxt_root = mitre.next_untried("persistence", failed=_USER_PERSISTENCE,
                                   access_level="root", session_type="command_shell")
-    assert nxt_root is not None and nxt_root.slug in ("user_account", "systemd_service")
+    assert nxt_root is not None and nxt_root.slug in (
+        "user_account", "rc_local", "systemd_service", "ld_preload")
 
 
 def test_next_untried_exhaustion_returns_none():

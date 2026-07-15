@@ -49,8 +49,16 @@ def classify_technique(text: str) -> str:
     t = (text or "").lower()
     if "ssh" in t and "key" in t:
         return "ssh_key"
+    if "web shell" in t or "webshell" in t or "/var/www" in t or "webroot" in t or "web root" in t:
+        return "web_shell"
+    if "ld_preload" in t or "ld.so.preload" in t or "dynamic linker" in t:
+        return "ld_preload"
+    if "rc.local" in t or "rc_local" in t or "init.d" in t or "update-rc.d" in t or "rc script" in t:
+        return "rc_local"
     if "cron" in t:
         return "cron_job"
+    if "atq" in t or "atd" in t or "at now" in t or "| at " in t or "at job" in t:
+        return "at_job"
     if "systemd" in t or "service" in t:
         return "systemd_service"
     if "user" in t and ("account" in t or "useradd" in t):

