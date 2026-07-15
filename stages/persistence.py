@@ -1310,6 +1310,54 @@ def _probe_session(target_ip: str, session_id: str, session_type: str):
 
 
 # =============================================================================
+# TECHNIQUE FEASIBILITY PRECHECK
+# =============================================================================
+# When a node assigns a MITRE technique, the subagent is LOCKED to it and must not
+# self-switch. But a locked technique that cannot possibly work here (systemd absent
+# on this target, or a root-only technique on a non-root session) would otherwise
+# make the subagent grind its full 5×retry × 10-tool budget (~an hour) before
+# failing. A cheap deterministic precheck fails FAST to failure_category=
+# technique_infeasible so the walker/replanner immediately grows a COMPATIBLE
+# technique instead. Probes are best-effort: any error → assume feasible (don't
+# block on a flaky probe).
+
+def _probe_priv(session_id: str, session_type: str) -> str:
+    """Best-effort 'root'|'user'|'unknown' for the live session (meterpreter uses
+    getuid, command_shell uses id — meterpreter rejects id)."""
+    try:
+        cmd = "getuid" if "meterpreter" in (session_type or "").lower() else "id"
+        out = (msf_session.run_session_command(session_id, cmd, timeout=15) or "").lower()
+    except Exception:
+        return "unknown"
+    if "uid=0(" in out or "server username: root" in out or "system" in out:
+        return "root"
+    if "uid=" in out or "server username:" in out:
+        return "user"
+    return "unknown"
+
+
+def _technique_feasibility_precheck(tech, session_id, session_type, access_level):
+    """(feasible, reason). Only blocks on a CONFIRMED impossibility — never on an
+    ambiguous/failed probe — so we don't wrongly skip a workable technique."""
+    # Root requirement: block only if the session is CONFIRMED non-root.
+    if tech.min_privilege == "root" and access_level not in ("root", "user_with_sudo"):
+        if _probe_priv(session_id, session_type) == "user":
+            return False, (f"{tech.name} requires root but this session is non-root "
+                           f"(id shows a non-zero uid)")
+    # Tooling requirement: systemd needs systemctl present on the target.
+    if tech.slug == "systemd_service":
+        try:
+            out = msf_session.run_session_command(
+                session_id, "command -v systemctl || echo NO_SYSTEMCTL", timeout=15) or ""
+        except Exception:
+            out = ""  # probe failed → don't block
+        if out.strip() and ("NO_SYSTEMCTL" in out or "systemctl" not in out):
+            return False, ("systemd is not present on this target (systemctl missing) "
+                           "— cannot create a systemd service")
+    return True, ""
+
+
+# =============================================================================
 # FINDINGS EXTRACTION
 # =============================================================================
 
@@ -1424,6 +1472,34 @@ def run_persistence(
             Colors.WARNING,
         )
     session_id, session_type = probed_id, probed_type
+
+    # --- TECHNIQUE FEASIBILITY PRECHECK (assigned technique only) ---
+    # Fail FAST if the locked technique cannot work on this target/session, so the
+    # replanner grows a compatible technique instead of the subagent grinding its
+    # full retry budget on a doomed install. failure_category=technique_infeasible
+    # + method=<slug> lets _failed_techniques mark it TRIED for the replanner menu.
+    if assigned:
+        feasible, reason = _technique_feasibility_precheck(
+            assigned, session_id, session_type, access_level
+        )
+        if not feasible:
+            print_colored(
+                f"[run_persistence] Technique {assigned_id} ({assigned.name}) "
+                f"INFEASIBLE here: {reason} — failing fast (TECHNIQUE_EXHAUSTED) so "
+                f"the replanner grows a different technique.",
+                Colors.WARNING,
+            )
+            return dict(PersistenceFindings(
+                success=False,
+                method=assigned_slug,
+                details=f"Technique {assigned_id} ({assigned.name}) infeasible: {reason}",
+                summary=(
+                    f"Persistence via {assigned.name} not applicable on this "
+                    f"target/session — {reason}. TECHNIQUE_EXHAUSTED; the replanner "
+                    f"should grow a different, compatible technique."
+                ),
+            ), failure_category="technique_infeasible", technique_exhausted=True,
+               failed_technique=assigned_slug)
 
     workflow = build_graph()
     checkpointer = MemorySaver()
