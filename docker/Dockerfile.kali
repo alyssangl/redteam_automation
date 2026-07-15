@@ -11,12 +11,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         procps \
     && rm -rf /var/lib/apt/lists/*
 
-# The framework logs into Kali as kali/kali over SSH.
+# The framework logs into Kali as kali/kali over SSH (paramiko, password auth).
+# UsePAM no is deliberate: kali-rolling's containerised sshd routes password auth
+# through PAM -> unix_chkpwd, which fails to verify *any* correct password from
+# sshd's unprivileged privsep child (systemic, reproduced with a throwaway user).
+# UsePAM no makes sshd verify the password itself via crypt() against /etc/shadow,
+# which is all this lab attacker box needs. SHA512 hashing keeps that crypt() path
+# portable. Without this, `tool_linux_terminal` (recon nmap, listener checks) can
+# never authenticate to the container Kali.
 RUN useradd -m -s /bin/bash kali \
-    && echo 'kali:kali' | chpasswd \
-    && mkdir -p /var/run/sshd \
+    && echo 'kali:kali' | chpasswd -c SHA512 \
+    && mkdir -p /var/run/sshd /run/sshd \
     && sed -i 's/#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config \
-    && sed -i 's/#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    && sed -i 's/#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config \
+    && sed -i 's/#\?UsePAM.*/UsePAM no/' /etc/ssh/sshd_config
 
 COPY docker/kali-entrypoint.sh /usr/local/bin/kali-entrypoint.sh
 RUN chmod +x /usr/local/bin/kali-entrypoint.sh
