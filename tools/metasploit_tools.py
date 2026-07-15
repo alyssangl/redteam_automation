@@ -1,6 +1,7 @@
 from pymetasploit3.msfrpc import MsfRpcClient
 from langchain_core.tools import tool
 import os
+import re
 import time
 
 class MetasploitSession:
@@ -95,9 +96,20 @@ class MetasploitSession:
 
         Bypasses the MSF console entirely — each command is atomic and targeted.
         """
+        # A bare `sleep N` on the single-threaded reverse_perl command_shell freezes
+        # it (no job control), so every SUBSEQUENT read returns "(no output)" — the
+        # bug that blocked cron heartbeat verification. Waits belong off the target
+        # shell: intercept a standalone sleep and wait on the orchestrator instead,
+        # keeping the session responsive. (Compound commands that merely contain
+        # 'sleep' are left alone — only a lone `sleep N` is the footgun.)
+        _sleep = re.fullmatch(r"sleep\s+(\d+)", command.strip())
+        if _sleep:
+            n = min(int(_sleep.group(1)), 75)
+            time.sleep(n)
+            return f"(waited {n}s on the orchestrator; the target session was NOT blocked)"
         session_type = self.get_session_type(session_id)
         if session_type is None:
-            return f"Error: Session {session_id} not found. Use tool_metasploit_rpc('sessions') to list active sessions."
+            return f"Error: Session {session_id} not found. Use tool_list_sessions() to list active sessions."
 
         # Decode bytes if needed
         if isinstance(session_type, bytes):
@@ -133,10 +145,13 @@ class MetasploitSession:
             # that, even if a shell echoes stdin, the literal token appears only in the
             # echo's OUTPUT, never in the command text.
             done = "__MSF_CMD_DONE_9271__"
+            poke = 'echo __MSF""_CMD_DONE_9271__\n'
             self.client.call('session.shell_write', [sid, command + "\n"])
-            self.client.call('session.shell_write', [sid, 'echo __MSF""_CMD_DONE_9271__\n'])
+            self.client.call('session.shell_write', [sid, poke])
             output = ""
             elapsed = 0
+            idle = 0
+            repokes = 0
             while elapsed < timeout:
                 resp = self.client.call('session.shell_read', [sid])
                 data = resp.get(b'data', resp.get('data', b''))
@@ -146,6 +161,27 @@ class MetasploitSession:
                 if done in output:
                     output = output.split(done)[0]   # keep only the real output
                     break
+                # A flaky reverse_perl command_shell can swallow the marker echo (it
+                # flushes buffered output only on the NEXT write). On a read stall,
+                # (a) tell a DEAD session apart from a merely-slow one via the RPC
+                # session list — NEVER the wedge-prone interactive console — and
+                # (b) re-poke the shell to force the flush. Without this, a live but
+                # slow session returns "(no output)", the caller assumes the session
+                # died and falls back to tool_metasploit_rpc('sessions') (which wedges
+                # into 'sessions -i' mode and spews "received: 0"), and cron heartbeat
+                # verification never grounds even though /tmp/.hb did get written.
+                if data:
+                    idle = 0
+                else:
+                    idle += 1
+                    if idle >= 3:
+                        idle = 0
+                        if self.get_session_type(sid) is None:
+                            return (f"Error: Session {session_id} not found. "
+                                    f"Use tool_list_sessions() to see active sessions.")
+                        if repokes < 3:
+                            repokes += 1
+                            self.client.call('session.shell_write', [sid, poke])
                 time.sleep(1)
                 elapsed += 1
             output = output.strip()
@@ -209,3 +245,31 @@ def tool_session_command(session_id: str, command: str):
         command: The command to run on the target
     """
     return msf_session.run_session_command(session_id, command)
+
+
+@tool
+def tool_list_sessions():
+    """List active Metasploit sessions via the RPC session API.
+
+    Use this to check whether a session is still alive (e.g. after a command
+    returns no output). It queries the RPC session list directly and NEVER touches
+    the interactive msfconsole, so — unlike tool_metasploit_rpc("sessions") — it
+    cannot wedge into "sessions -i" mode and return "Wrong number of arguments...
+    received: 0". Returns each active session's id, type and info, or a clear
+    "No active sessions." when none exist.
+    """
+    try:
+        result = msf_session.client.call('session.list') or {}
+    except Exception as e:
+        return f"Error listing sessions: {e.__class__.__name__}: {e}"
+    if not result:
+        return "No active sessions."
+    lines = []
+    for sid, details in result.items():
+        sid_s = sid.decode() if isinstance(sid, bytes) else str(sid)
+        def _dec(v):
+            return v.decode('utf-8', errors='ignore') if isinstance(v, bytes) else str(v)
+        stype = _dec(details.get(b'type', details.get('type', b'')))
+        info = _dec(details.get(b'info', details.get('info', b'')))
+        lines.append(f"Session {sid_s}: {stype} {info}".strip())
+    return "\n".join(lines)
