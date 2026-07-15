@@ -1848,6 +1848,18 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
     priv_line = _format_session_privilege_line(graph)
     priv_block = f"{priv_line}\n\n" if priv_line else ""
 
+    # A post-exploitation node that died with failure_category=session_unusable means
+    # the SESSION is dead/unreadable (a read-zombie) — NOT that the technique was wrong.
+    # Growing another persistence technique just re-hits the same dead session (it walks
+    # the whole menu against a corpse — observed live: cron→ssh_key→shell_profile all
+    # failing on one zombie). Detect it so we steer to RE-EXPLOIT for a FRESH session
+    # instead of the technique menu.
+    _session_unusable = any(
+        (n.findings or {}).get("failure_category") == "session_unusable"
+        for n in graph.nodes.values()
+        if n.status == "failed"
+    )
+
     # dead_block (DEAD NODES guidance) is built AFTER tech_block below so it can be
     # session/technique-aware: a dead POST-exploitation node (persistence) means "try
     # another TECHNIQUE", not "re-exploit for a new shell" — see V3 note below.
@@ -1862,7 +1874,9 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
     # are marked TRIED. Skipped once the tactic is satisfied or its menu is exhausted.
     tech_block = ""
     for _tactic in ("persistence",):
-        if not mitre.technique_menu(_tactic) or _tactic_satisfied(graph, _tactic):
+        # Skip the technique menu when the session is dead — a new technique can't run
+        # on a corpse; the dead_block below will steer to re-exploit for a fresh session.
+        if _session_unusable or not mitre.technique_menu(_tactic) or _tactic_satisfied(graph, _tactic):
             continue
         _failed = _failed_techniques(graph, _tactic)
         stuck_here = _is_tactic_node(stuck_node, _tactic)
@@ -1896,7 +1910,21 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
     # try a different TECHNIQUE (grow_technique) or route to a READY node.
     if dead_nodes:
         _dead_json = json.dumps(sorted(dead_nodes), indent=2)
-        if tech_block:
+        if _session_unusable:
+            # The SESSION is dead/unreadable — a different technique would re-hit the
+            # same corpse. Get a FRESH session, then persistence can run on it.
+            dead_block = (
+                "DEAD NODES — these FAILED because the SESSION is DEAD/UNREADABLE "
+                "(read-zombie), NOT because the technique was wrong. A different "
+                "persistence TECHNIQUE would just re-hit the SAME dead session — do NOT "
+                "action=grow_technique and do NOT action=new_edge to them. Get a FRESH "
+                "session: action=use_module with a known-working exploit against a "
+                "service in DETECTED SERVICES (e.g. UnrealIRCd backdoor on 6667, ProFTPD "
+                "mod_copy, Samba usermap_script). Persistence can then run on the NEW "
+                "session:\n"
+                f"{_dead_json}\n\n"
+            )
+        elif tech_block:
             # A technique menu is live → the dead node's TECHNIQUE was exhausted, not
             # the tactic or your access. Grow the next technique; don't re-exploit.
             dead_block = (
