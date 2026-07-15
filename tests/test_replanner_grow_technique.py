@@ -12,7 +12,7 @@ import sys, os, logging
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import core_agents.orchestrator as orch
-from core_agents.attack_graph import AttackGraph, AttackNode, NodeStatus
+from core_agents.attack_graph import AttackGraph, AttackNode, NodeStatus, EdgeCheck
 
 LOG = logging.getLogger("test"); LOG.addHandler(logging.NullHandler())
 
@@ -212,6 +212,51 @@ def test_dead_access_node_without_session_keeps_reexploit_guidance():
     assert "DEAD NODES" in ctx
     assert "DIFFERENT exploit against a service" in ctx   # re-exploit advice preserved
     assert "GROW THE NEXT TECHNIQUE" not in ctx
+
+
+# --- V4: grown node inherits the DEAD node's successors (file_drop routing gap) ---
+
+def _build_graph_with_successor(persist_method="systemd_service", succ_status=None):
+    """gain (SUCCESS) -> persist (FAILED) -> file_drop (PENDING).
+
+    Mirrors flaw_persistence: the impact/file_drop node hangs off the persist node,
+    which then dies. The grown replacement must take over persist's place in the
+    chain so file_drop stays reachable."""
+    g = _build_graph(persist_method=persist_method)
+    fd = AttackNode(id="file_drop", label="Drop proof", agent_type="impact",
+                    tactic="impact", tool_name="session")
+    fd.status = succ_status or NodeStatus.PENDING.value
+    g.add_node(fd)
+    g.connect("persist", "file_drop",
+              checks=[EdgeCheck(field="session_id", operator="exists",
+                                description="Session still usable for impact")])
+    return g
+
+
+def test_grown_node_inherits_dead_node_successor():
+    # persist(systemd) dead; grow cron from the predecessor. The grown cron node must
+    # inherit persist->file_drop so the objective's final step isn't orphaned/skipped.
+    g = _build_graph_with_successor()
+    new_id = _run_replan(g, '{"action":"grow_technique","technique_id":"T1053.003","rationale":"cron"}',
+                         stuck="gain")
+    assert new_id
+    edges = [(e.source, e.target) for e in g.edges]
+    assert (new_id, "file_drop") in edges, \
+        f"grown node must inherit persist->file_drop; edges={edges}"
+    # the inherited edge preserves the original gate (session_id exists)
+    inh = next(e for e in g.edges if e.source == new_id and e.target == "file_drop")
+    assert any(c.field == "session_id" for c in inh.checks), \
+        "inherited edge must keep the original session_id check"
+
+
+def test_inherit_skips_a_dead_successor():
+    # if the successor is ITSELF dead, don't re-parent onto it (it can't run).
+    g = _build_graph_with_successor(succ_status=NodeStatus.FAILED.value)
+    new_id = _run_replan(g, '{"action":"grow_technique","technique_id":"T1053.003","rationale":"cron"}',
+                         stuck="gain")
+    assert new_id
+    assert not any(e.source == new_id and e.target == "file_drop" for e in g.edges), \
+        "must NOT inherit an edge to a dead successor"
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

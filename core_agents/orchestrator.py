@@ -2078,8 +2078,39 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
             rationale=rationale,
             condition="on_success",
         )
+        # Re-parent the DEAD tactic node's successors onto the grown node. A grown
+        # technique node REPLACES the failed tactic node (e.g. the flawed `persist`),
+        # so it must also take over that node's place IN THE CHAIN — otherwise the
+        # dead node's downstream steps (e.g. file_drop / impact) are orphaned: their
+        # only inbound edge came from the now-dead node, new_edge to a dead node is
+        # refused, so the walker reaches the grown node, finds no outgoing edge, and
+        # SKIPS the rest of the objective (observed live: cron grounded WORKING but
+        # file_drop was skipped after 10 empty replans). Copy each dead-node outgoing
+        # edge to a still-live, non-tactic successor onto the grown node (gate + checks
+        # preserved), so on the grown node's success the walker flows straight on.
+        _inherited = []
+        for _dead in list(graph.nodes.values()):
+            if _dead.tactic != tactic or _dead.status != NodeStatus.FAILED.value:
+                continue
+            for _e in graph.outgoing_edges(_dead.id):
+                _succ = graph.nodes.get(_e.target)
+                if (not _succ or _succ.status == NodeStatus.FAILED.value
+                        or _succ.tactic == tactic or _succ.id in _inherited):
+                    continue
+                if any(oe.target == _succ.id for oe in graph.outgoing_edges(new_node.id)):
+                    continue                       # already connected
+                graph.connect(
+                    new_node.id, _succ.id,
+                    checks=list(_e.checks),
+                    evidence=f"Replanner: {new_node.id} inherits {_dead.id}→{_succ.id} "
+                             f"(grown technique replaces the dead node)",
+                    rationale=f"Continue the chain: {tech.id} supersedes dead {_dead.id}",
+                    condition=_e.condition,
+                )
+                _inherited.append(_succ.id)
         log.info(f"[Replanner] GROW TECHNIQUE: {new_node.id} "
-                 f"({tech.id} {tech.name}) — {rationale}")
+                 f"({tech.id} {tech.name}) — {rationale}"
+                 + (f" [inherits successors: {_inherited}]" if _inherited else ""))
         return new_node.id
 
     elif action in ("use_module", "run_commands"):
