@@ -177,8 +177,21 @@ def _spawn_cell(scenario: str, variant: str, rep: int,
         return "timeout"
 
 
+def _cell_done(scenario: str, variant: str, rep: int) -> bool:
+    """A cell counts as done if its eval log exists AND reached EXECUTION
+    COMPLETE — lets an interrupted overnight matrix resume without redoing work."""
+    log = EVAL_DIR / f"{_run_tag(scenario, variant, rep)}.log"
+    if not log.exists():
+        return False
+    try:
+        return "[Orchestrator] EXECUTION COMPLETE" in log.read_text(
+            encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+
+
 def _run_matrix(scenarios, variants, reps, target, attacker,
-                timeout, restart) -> None:
+                timeout, restart, skip_done=True) -> None:
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
     total = len(scenarios) * len(variants) * reps
     done = 0
@@ -187,13 +200,18 @@ def _run_matrix(scenarios, variants, reps, target, attacker,
         for variant in variants:
             for rep in range(reps):
                 done += 1
-                print(f"\n########## [{done}/{total}] "
-                      f"{_run_tag(scenario, variant, rep)} ##########", flush=True)
+                tag = _run_tag(scenario, variant, rep)
+                if skip_done and _cell_done(scenario, variant, rep):
+                    print(f"\n########## [{done}/{total}] {tag} — SKIP (already complete) ##########",
+                          flush=True)
+                    results[tag] = "skip"
+                    continue
+                print(f"\n########## [{done}/{total}] {tag} ##########", flush=True)
                 if restart:
                     _restart_msf()
                 status = _spawn_cell(scenario, variant, rep,
                                      target, attacker, timeout)
-                results[_run_tag(scenario, variant, rep)] = status
+                results[tag] = status
     print("\n================ MATRIX COMPLETE ================")
     for tag, status in results.items():
         print(f"  {status:8s} {tag}")
@@ -242,6 +260,9 @@ def main() -> int:
                     help="per-cell wall-clock ceiling (seconds)")
     ap.add_argument("--no-restart", action="store_true",
                     help="skip restart_msf before each cell")
+    ap.add_argument("--no-skip-done", action="store_true",
+                    help="re-run cells even if a completed log already exists "
+                         "(default: skip completed cells so the matrix is resumable)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the plan and exit (no lab needed)")
     args = ap.parse_args()
@@ -264,7 +285,8 @@ def main() -> int:
 
     _run_matrix(args.scenarios, args.variants, args.reps,
                 args.target, args.attacker, args.timeout,
-                restart=not args.no_restart)
+                restart=not args.no_restart,
+                skip_done=not args.no_skip_done)
     return 0
 
 
