@@ -156,6 +156,29 @@ def _restart_msf() -> None:
         print(f"[warn] restart_msf failed (continuing): {e}", file=sys.stderr)
 
 
+def _preserve_timeout_log(tag: str, since: float) -> None:
+    """On a cell timeout the subprocess is killed before it can copy its own log,
+    so the eval pair goes missing and the signal is lost. Copy the partial run
+    log (newest logs/*.log touched during the cell) into logs/eval/<tag>.log and
+    stamp a CONFOUNDED marker so parse_eval can EXCLUDE it (a wedged-console
+    timeout is a lab confounder to discard/retry, NOT full-system non-termination
+    — see eval_benchmark.md §7). skip-done still sees no EXECUTION COMPLETE, so a
+    relaunch naturally retries the cell."""
+    dest = EVAL_DIR / f"{tag}.log"
+    candidates = [p for p in LOGS_DIR.glob("*.log") if p.stat().st_mtime >= since - 2]
+    body = ""
+    if candidates:
+        newest = max(candidates, key=lambda p: p.stat().st_mtime)
+        try:
+            body = newest.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            body = ""
+    marker = ("\n[HARNESS] CELL TIMEOUT / CONFOUNDED — the run exceeded the "
+              "per-cell wall-clock cap (likely a wedged msfrpcd/console). Excluded "
+              "from metrics; retried on relaunch.\n")
+    dest.write_text(body + marker, encoding="utf-8")
+
+
 def _spawn_cell(scenario: str, variant: str, rep: int,
                 target: str, attacker: str, timeout: int) -> str:
     """Run one cell as an isolated subprocess. Returns a status string."""
@@ -168,12 +191,14 @@ def _spawn_cell(scenario: str, variant: str, rep: int,
     ]
     tag = _run_tag(scenario, variant, rep)
     print(f"\n=== CELL {tag} (timeout {timeout}s) ===", flush=True)
+    started = time.time()
     try:
         r = subprocess.run(cmd, env=env, timeout=timeout, cwd=str(ROOT))
         return "ok" if r.returncode == 0 else f"exit{r.returncode}"
     except subprocess.TimeoutExpired:
-        print(f"[timeout] {tag} exceeded {timeout}s — recorded as non-terminating",
-              file=sys.stderr)
+        print(f"[timeout] {tag} exceeded {timeout}s — preserving partial log as "
+              f"CONFOUNDED (excluded, retried on relaunch)", file=sys.stderr)
+        _preserve_timeout_log(tag, started)
         return "timeout"
 
 

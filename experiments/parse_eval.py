@@ -43,6 +43,7 @@ from typing import Optional
 # --- log markers (kept in one place; grep the codebase if the orchestrator
 #     rewords them) --------------------------------------------------------
 _COMPLETE = "[Orchestrator] EXECUTION COMPLETE"
+_CONFOUNDED = "[HARNESS] CELL TIMEOUT / CONFOUNDED"
 _SUCCESS_RATE = re.compile(r"Success rate:\s*(\d+)%")
 _REPLAN_CAP = "Replan budget exhausted"
 _REPLAN_EDIT = re.compile(r"\[Replanner\] (NEW EDGE|NEW NODE|GROW TECHNIQUE)")
@@ -109,6 +110,7 @@ def _objective_node(nodes: dict) -> Optional[dict]:
 
 def _parse_log(text: str) -> dict:
     completed = _COMPLETE in text
+    confounded = _CONFOUNDED in text
     replan_capped = _REPLAN_CAP in text
     replan_edits = len(_REPLAN_EDIT.findall(text))
     judge = {"continue": 0, "adapt": 0, "escalate": 0}
@@ -136,6 +138,7 @@ def _parse_log(text: str) -> dict:
 
     return {
         "completed": completed,
+        "confounded": confounded,
         "replan_capped": replan_capped,
         "replan_edits": replan_edits,
         "judge_continue": judge["continue"],
@@ -199,7 +202,12 @@ def _identity(log_path: Path, cp: dict) -> tuple[str, str, str]:
 
 def evaluate_run(log_path: Path, cp_path: Path) -> dict:
     text = log_path.read_text(encoding="utf-8", errors="replace")
-    cp = json.loads(cp_path.read_text(encoding="utf-8", errors="replace"))
+    try:
+        cp = json.loads(cp_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        # A confounded/killed cell can leave a truncated checkpoint — still emit a
+        # row (it will carry confounded=True and be excluded downstream).
+        cp = {}
 
     scenario, variant, rep = _identity(log_path, cp)
     row = {"scenario": scenario, "variant": variant, "rep": rep,
@@ -228,6 +236,7 @@ def evaluate_run(log_path: Path, cp_path: Path) -> dict:
 # column order for the CSV
 _COLUMNS = [
     "scenario", "variant", "rep", "log",
+    "confounded",
     "completed", "success_rate", "grounded_success", "objective_node",
     "false_success", "false_success_nodes", "recovered",
     "replan_capped", "non_termination", "replan_edits",

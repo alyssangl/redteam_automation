@@ -73,9 +73,15 @@ def _fmt_num(xs: list[float]) -> str:
     return f"{m:.1f} ± {s:.1f}"
 
 
-def _load(csv_path: Path) -> list[dict]:
+def _load(csv_path: Path) -> tuple[list[dict], int]:
+    """Return (valid rows, discarded-confounded count). Confounded cells
+    (wedged-msfrpcd timeouts) are excluded from the metrics per eval_benchmark.md
+    §7 — they are lab artifacts, not system behavior."""
     with csv_path.open(encoding="utf-8") as fh:
-        return list(csv.DictReader(fh))
+        all_rows = list(csv.DictReader(fh))
+    valid = [r for r in all_rows if str(r.get("confounded", "")).strip().lower()
+             not in ("true", "1", "yes")]
+    return valid, len(all_rows) - len(valid)
 
 
 def _variant_sort_key(v: str) -> tuple[int, str]:
@@ -109,12 +115,14 @@ def _table(rows: list[dict], flaw_only_recovery: bool = True) -> str:
     return "\n".join(lines)
 
 
-def build_headline(rows: list[dict]) -> str:
+def build_headline(rows: list[dict], discarded: int = 0) -> str:
     out = ["# Ablation table\n",
            "_Rows = system variants, cols = metrics. Each cell = mean ± std over "
            "all runs of that variant (scenarios × reps). Recovery is computed over "
            "flaw_* scenarios only._\n",
-           f"_Source: {len(rows)} runs._\n",
+           f"_Source: {len(rows)} valid runs"
+           + (f"; {discarded} confounded run(s) discarded (wedged-msfrpcd "
+              "timeouts, excluded per protocol)." if discarded else ".") + "_\n",
            _table(rows),
            "\n\n## Reading it\n",
            "- **v3_noground** should show **False success** spiking vs v0_full "
@@ -150,21 +158,22 @@ def main() -> int:
     if not csv_path.exists():
         print(f"CSV not found: {csv_path}")
         return 1
-    rows = _load(csv_path)
+    rows, discarded = _load(csv_path)
     if not rows:
-        print("no rows in CSV")
+        print(f"no valid rows in CSV ({discarded} confounded discarded)")
         return 1
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     headline = out_dir / "ablation_table.md"
     per_scen = out_dir / "eval_per_scenario.md"
-    headline.write_text(build_headline(rows), encoding="utf-8")
+    headline.write_text(build_headline(rows, discarded), encoding="utf-8")
     per_scen.write_text(build_per_scenario(rows), encoding="utf-8")
 
-    print(f"wrote {headline} and {per_scen} from {len(rows)} runs")
+    print(f"wrote {headline} and {per_scen} from {len(rows)} valid runs "
+          f"({discarded} confounded discarded)")
     print()
-    print(build_headline(rows))
+    print(build_headline(rows, discarded))
     return 0
 
 

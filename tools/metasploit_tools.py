@@ -2,6 +2,7 @@ from pymetasploit3.msfrpc import MsfRpcClient
 from langchain_core.tools import tool
 import os
 import re
+import threading
 import time
 
 class MetasploitSession:
@@ -27,10 +28,49 @@ class MetasploitSession:
         except Exception:
             pass
 
+    def _bounded_read(self, per_read_timeout):
+        """self.console.read() with a HARD wall-clock cap.
+
+        The msfrpc console read is a synchronous msgpack RPC socket read with no
+        socket-level timeout: when msfrpcd or the RPC socket wedges it blocks
+        FOREVER, which froze whole benchmark runs mid-`use exploit/...` for the
+        full 40-min cell budget (send_command's own `while ... < timeout` never
+        got to re-check the clock because the blocking call is the read itself).
+        Running each read on a DAEMON worker thread with a join deadline makes the
+        cap real: a wedged read is abandoned (returns None) and the caller stops
+        instead of hanging. The thread is a daemon so a leaked (still-blocked) read
+        can never keep the interpreter alive at exit. Returns the read dict, or
+        None if the read wedged/errored."""
+        box: dict = {}
+        done = threading.Event()
+
+        def _worker():
+            try:
+                box["r"] = self.console.read()
+            except Exception as e:  # noqa: BLE001 — surface, don't propagate to a dead thread
+                box["e"] = e
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        if not done.wait(timeout=max(1, per_read_timeout)):
+            print(f"[msf] console.read() wedged (> {per_read_timeout:.0f}s) -- "
+                  f"abandoning read, returning partial output")
+            return None
+        if "e" in box:
+            print(f"[msf] console.read() error: {box['e']}")
+            return None
+        return box.get("r")
+
     def send_command(self, command, timeout=60):
-        """Sends a command and waits for the prompt to return."""
+        """Sends a command and waits for the prompt to return.
+
+        The read loop is bounded by a real wall-clock `timeout` (see
+        _bounded_read) so a wedged console can never hang the caller."""
         # Clean the command
         command = command.strip()
+
+        start_time = time.time()
 
         # F1: a failed exploit attempt leaves its reverse-handler JOB bound to the
         # LPORT; the next attempt (even the CORRECT exploit) then fails to bind that
@@ -46,8 +86,8 @@ class MetasploitSession:
                 self.console.write("jobs -K\n")
                 time.sleep(1)
                 for _ in range(3):   # drain jobs -K output so it doesn't bleed into the exploit's
-                    r = self.console.read()
-                    if not r.get('busy') and not r.get('data'):
+                    r = self._bounded_read(per_read_timeout=10)
+                    if r is None or (not r.get('busy') and not r.get('data')):
                         break
                     time.sleep(0.3)
             except Exception:
@@ -57,10 +97,12 @@ class MetasploitSession:
         self.console.write(command + "\n")
 
         output = ""
-        start_time = time.time()
-
         while time.time() - start_time < timeout:
-            response = self.console.read()
+            remaining = timeout - (time.time() - start_time)
+            response = self._bounded_read(per_read_timeout=remaining)
+            if response is None:
+                # Read wedged past the wall-clock cap — stop with partial output.
+                break
             chunk = response.get('data', '')
             output += chunk
 
@@ -72,7 +114,9 @@ class MetasploitSession:
                 # Slight delay to ensure buffer is flushed
                 time.sleep(0.5)
                 # One last read to catch tail end
-                output += self.console.read().get('data', '')
+                tail = self._bounded_read(per_read_timeout=5)
+                if tail is not None:
+                    output += tail.get('data', '')
                 break
 
             time.sleep(1)
