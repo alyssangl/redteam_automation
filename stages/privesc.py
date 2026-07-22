@@ -39,6 +39,7 @@ from core_agents.common import (
     run_ssh_command, KALI_IP, MODEL_NAME, FORBIDDEN_COMMANDS,
 )
 from core_agents.state import PrivEscFindings
+from core_agents import eval_flags
 from tools.rag import query_knowledge_base
 from tools.metasploit_tools import msf_session, tool_session_command
 
@@ -887,15 +888,23 @@ def critic_node(state: PrivEscState) -> dict:
     # session_id is '' and the direct check would be meaningless; resolving the
     # recovered session lets the critic's ground-truth `id` reach the real shell.
     direct_id = ""
-    # Resolve against the session privesc actually landed on — after a
-    # command_shell->meterpreter upgrade or a kernel exploit that opened a new
-    # root session, that is NOT state['session_id']. _direct_priv_check then
-    # issues the right probe for the session type (id vs getuid).
-    sid = _resolve_final_session(state)[0]
-    if sid:
-        direct_id = _direct_priv_check(sid, timeout=15)
+    if not eval_flags.grounding_enabled():
+        # Ablation V3 (-grounding): skip the independent uid=0 re-check. The
+        # critic must judge escalation from the executor's PROSE alone — a
+        # hallucinated "id showed uid=0" now goes unchallenged, so false-success
+        # is expected to spike.
+        direct_id = "(grounding ablation active: no independent ground-truth check performed)"
+        print_colored("[PrivEsc Critic] GROUNDING DISABLED (ablation V3) — prose-only verdict", Colors.WARNING)
     else:
-        direct_id = "(no live session_id available for a direct check)"
+        # Resolve against the session privesc actually landed on — after a
+        # command_shell->meterpreter upgrade or a kernel exploit that opened a new
+        # root session, that is NOT state['session_id']. _direct_priv_check then
+        # issues the right probe for the session type (id vs getuid).
+        sid = _resolve_final_session(state)[0]
+        if sid:
+            direct_id = _direct_priv_check(sid, timeout=15)
+        else:
+            direct_id = "(no live session_id available for a direct check)"
     print_colored(f"[PrivEsc Critic] DIRECT ID CHECK: {str(direct_id)[:200]}", Colors.OKCYAN)
 
     evidence = (

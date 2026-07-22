@@ -37,6 +37,7 @@ from core_agents.common import (
     run_ssh_command, KALI_IP, MODEL_NAME, FORBIDDEN_COMMANDS,
 )
 from core_agents.state import ImpactFindings
+from core_agents import eval_flags
 from tools.rag import query_knowledge_base
 from tools.metasploit_tools import msf_session, tool_session_command
 
@@ -659,7 +660,11 @@ def executor_node(state: ImpactState) -> dict:
         # so a falsely-claimed write (echo exits 0 even on permission error)
         # cannot reach the critic unverified. Guard with a state flag so we
         # only ever inject the reminder once and never hang.
-        if not state.get("_verify_prompted", False):
+        #
+        # Ablation V3 (-grounding): skip the forced read-back so a falsely-claimed
+        # write (echo exits 0 even on permission error) reaches the critic
+        # unverified — the whole point of the grounding ablation.
+        if not state.get("_verify_prompted", False) and eval_flags.grounding_enabled():
             written_paths = []
             verified_paths = set()
             # Scan AIMessage tool_calls in this cycle for write vs read commands.

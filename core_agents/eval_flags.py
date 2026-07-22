@@ -12,9 +12,17 @@ Toggles (all default True = full system):
   EVAL_ENABLE_REPLAN          V1: L3 graph mutation (_replan_from). Off -> the
                               replanner is a no-op; a stuck/failed node just
                               backtracks. Recovery should collapse.
-  EVAL_GROUND_SUCCESS         V3: deterministic ground-truth re-check in the
-                              stage critics. Off -> a critic PASS is accepted on
-                              the LLM's say-so. False-success should explode.
+  EVAL_GROUND_SUCCESS         V3: independent ground-truth re-checks in the stage
+                              critics. Off -> the critic judges on the executor's
+                              prose alone. Gated where the check is a discrete,
+                              signal-rich probe: privesc's uid=0/getuid re-check
+                              and impact's forced write read-back — the two stages
+                              carrying the clearest ground truth and where the
+                              false-success metric is computed. (initial_access
+                              grounding is intrinsic to MSF "Session N opened";
+                              persistence grounding is the Fix-3 verifier node,
+                              left intact to avoid destabilising it.) False-success
+                              should spike on privesc/impact.
   EVAL_DETERMINISTIC_TECHNIQUE V4: technique lock + feasibility precheck +
                               replanner tried-tracking. Off -> the subagent may
                               free-select and repeat techniques. Loops should rise.
