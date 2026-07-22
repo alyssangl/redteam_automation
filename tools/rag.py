@@ -51,6 +51,15 @@ def query_knowledge_base(query: str, db_name: str = "") -> str:
     - BAD: query_knowledge_base('Samba 4.3.11')
     - GOOD: query_knowledge_base('Remote code execution exploit for Samba 4.3.11 using shared library loading or symlink vulnerabilities')
     """
+    # Ablation V5 (-RAG): return no intelligence so the subagent must proceed on
+    # the model's parametric knowledge alone. Kept here so every caller is covered.
+    try:
+        from core_agents.eval_flags import rag_enabled
+        if not rag_enabled():
+            return "No results found in the knowledge base for this query."
+    except Exception:
+        pass
+
     if db_name:
         db = _get_db(os.path.join("../databases", db_name))
     else:
@@ -98,6 +107,14 @@ def query_successful_attacks(query: str) -> str:
     Call this FIRST before query_knowledge_base — past successes are the highest-value intelligence.
     - query: Verbose search query (e.g., "ProFTPD 1.3.5 remote code execution")
     """
+    # Ablation V5 (-RAG): the proven-attacks DB is part of the RAG layer too.
+    try:
+        from core_agents.eval_flags import rag_enabled
+        if not rag_enabled():
+            return "No past successful attacks found for this query. Proceed to query the main knowledge base."
+    except Exception:
+        pass
+
     db_path = os.path.join("../databases", "successful_attacks")
     try:
         db = _get_db(db_path)

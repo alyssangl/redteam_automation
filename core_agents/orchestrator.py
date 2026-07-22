@@ -38,6 +38,7 @@ from typing import Optional
 
 from core_agents.attack_graph import AttackGraph, AttackNode, AttackEdge, EdgeCheck, NodeStatus
 from core_agents import mitre
+from core_agents import eval_flags
 from core_agents.common import (
     Colors, print_colored, run_ssh_command, call_llm, parse_json_response,
     MAX_PIPELINE_RETRIES,
@@ -1397,6 +1398,12 @@ def _try_replanner(
     """
     if not explore:
         return None, replan_attempts
+    # Ablation V1 (-replanner): L3 graph mutation is knocked out. A stuck/failed
+    # node just backtracks as if the replan budget were spent. Recovery on the
+    # flaw_* scenarios should collapse relative to V0.
+    if not eval_flags.replan_enabled():
+        log.info("[Orchestrator] Replanner DISABLED (ablation V1) — no graph mutation")
+        return None, replan_attempts
     dead_nodes = dead_nodes or set()
     # F19: keep spending the replan budget instead of giving up after ONE rejected
     # proposal. Previously a single dead-node re-point OR a rejected use_module
@@ -2434,6 +2441,9 @@ def run_graph(
     log.info(f"  Target: {graph.target_ip}  Attacker: {graph.attacker_ip}")
     log.info(f"  Nodes: {len(graph.nodes)}  Edges: {len(graph.edges)}")
     log.info(f"  Explore: {explore}  Judge: {use_judge}")
+    _ablations = eval_flags.active_ablations()
+    if _ablations:
+        log.info(f"  ABLATIONS DISABLED: {', '.join(_ablations)}")
     log.info(f"  Models: replanner={REPLAN_MODEL_NAME}  judge={JUDGE_MODEL_NAME}")
     log.info(f"  Checkpoint: {checkpoint_path}")
     log.info(f"{'='*70}")
