@@ -1880,7 +1880,12 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
     # AVAILABLE technique to grow; the subagent owns the procedure. Failed techniques
     # are marked TRIED. Skipped once the tactic is satisfied or its menu is exhausted.
     tech_block = ""
-    for _tactic in ("persistence",):
+    # Ablation V4 (-determinism): drop the deterministic MITRE technique menu
+    # (next_untried + failed-technique tracking). Without it the replanner
+    # free-selects and may re-propose an already-failed technique, so loops /
+    # non-termination should rise.
+    _tp_tactics = ("persistence",) if eval_flags.deterministic_technique_enabled() else ()
+    for _tactic in _tp_tactics:
         # Skip the technique menu when the session is dead — a new technique can't run
         # on a corpse; the dead_block below will steer to re-exploit for a fresh session.
         if _session_unusable or not mitre.technique_menu(_tactic) or _tactic_satisfied(graph, _tactic):

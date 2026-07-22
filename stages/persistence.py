@@ -35,6 +35,7 @@ from core_agents.common import (
 )
 from core_agents.state import PersistenceFindings
 from core_agents import mitre
+from core_agents import eval_flags
 from tools.rag import query_knowledge_base
 from tools.metasploit_tools import msf_session, tool_list_sessions
 
@@ -1694,7 +1695,10 @@ def run_persistence(
     # replanner grows a compatible technique instead of the subagent grinding its
     # full retry budget on a doomed install. failure_category=technique_infeasible
     # + method=<slug> lets _failed_techniques mark it TRIED for the replanner menu.
-    if assigned:
+    # Ablation V4 (-determinism): skip the fast-fail precheck so an infeasible
+    # technique grinds its full retry budget instead of yielding cleanly — cost
+    # and loop pressure should rise.
+    if assigned and eval_flags.deterministic_technique_enabled():
         feasible, reason = _technique_feasibility_precheck(
             assigned, session_id, session_type, access_level
         )
