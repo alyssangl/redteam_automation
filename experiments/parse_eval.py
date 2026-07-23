@@ -43,7 +43,11 @@ from typing import Optional
 # --- log markers (kept in one place; grep the codebase if the orchestrator
 #     rewords them) --------------------------------------------------------
 _COMPLETE = "[Orchestrator] EXECUTION COMPLETE"
+# A cell is confounded (lab artifact, excluded from metrics) if the harness timed
+# it out OR the msf console wedged mid-run (the sentinel rides into the log via
+# the orchestrator's output-preview line) — either way it's not real system behavior.
 _CONFOUNDED = "[HARNESS] CELL TIMEOUT / CONFOUNDED"
+_WEDGE_SENTINEL = "[MSF_CONSOLE_WEDGED]"
 _SUCCESS_RATE = re.compile(r"Success rate:\s*(\d+)%")
 _REPLAN_CAP = "Replan budget exhausted"
 _REPLAN_EDIT = re.compile(r"\[Replanner\] (NEW EDGE|NEW NODE|GROW TECHNIQUE)")
@@ -110,7 +114,7 @@ def _objective_node(nodes: dict) -> Optional[dict]:
 
 def _parse_log(text: str) -> dict:
     completed = _COMPLETE in text
-    confounded = _CONFOUNDED in text
+    confounded = (_CONFOUNDED in text) or (_WEDGE_SENTINEL in text)
     replan_capped = _REPLAN_CAP in text
     replan_edits = len(_REPLAN_EDIT.findall(text))
     judge = {"continue": 0, "adapt": 0, "escalate": 0}

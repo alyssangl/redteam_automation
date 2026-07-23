@@ -28,39 +28,47 @@ class MetasploitSession:
         except Exception:
             pass
 
-    def _bounded_read(self, per_read_timeout):
-        """self.console.read() with a HARD wall-clock cap.
+    # Sentinel appended to send_command output when a console op wedged. It rides
+    # back through the orchestrator's output-preview log line into the run log, so
+    # parse_eval can mark the whole cell CONFOUNDED (a wedged msfrpcd is a lab
+    # artifact to discard/retry, NOT a real exploit failure) instead of counting
+    # it as a genuine v0 failure.
+    WEDGE_SENTINEL = "[MSF_CONSOLE_WEDGED]"
 
-        The msfrpc console read is a synchronous msgpack RPC socket read with no
-        socket-level timeout: when msfrpcd or the RPC socket wedges it blocks
-        FOREVER, which froze whole benchmark runs mid-`use exploit/...` for the
-        full 40-min cell budget (send_command's own `while ... < timeout` never
-        got to re-check the clock because the blocking call is the read itself).
-        Running each read on a DAEMON worker thread with a join deadline makes the
-        cap real: a wedged read is abandoned (returns None) and the caller stops
-        instead of hanging. The thread is a daemon so a leaked (still-blocked) read
-        can never keep the interpreter alive at exit. Returns the read dict, or
-        None if the read wedged/errored."""
+    def _bounded_call(self, fn, timeout, label):
+        """Run a synchronous msfrpc console op (write/read) on a DAEMON thread with
+        a hard wall-clock cap. The msgpack RPC socket has no timeout, so when
+        msfrpcd/the socket wedges the op blocks FOREVER — this is what froze whole
+        benchmark runs mid-`use exploit/...` (the hang was `console.write`, not the
+        read loop). A daemon thread means a leaked (still-blocked) op can never keep
+        the interpreter alive at exit. Returns (result, ok); ok=False on
+        wedge/error."""
         box: dict = {}
         done = threading.Event()
 
         def _worker():
             try:
-                box["r"] = self.console.read()
+                box["r"] = fn()
             except Exception as e:  # noqa: BLE001 — surface, don't propagate to a dead thread
                 box["e"] = e
             finally:
                 done.set()
 
         threading.Thread(target=_worker, daemon=True).start()
-        if not done.wait(timeout=max(1, per_read_timeout)):
-            print(f"[msf] console.read() wedged (> {per_read_timeout:.0f}s) -- "
-                  f"abandoning read, returning partial output")
-            return None
+        if not done.wait(timeout=max(1, timeout)):
+            print(f"[msf] console {label} wedged (> {timeout:.0f}s) -- abandoning "
+                  f"(msfrpcd likely wedged)")
+            return None, False
         if "e" in box:
-            print(f"[msf] console.read() error: {box['e']}")
-            return None
-        return box.get("r")
+            print(f"[msf] console {label} error: {box['e']}")
+            return None, False
+        return box.get("r"), True
+
+    def _bounded_read(self, per_read_timeout):
+        """self.console.read() bounded by a real wall-clock cap. Returns the read
+        dict, or None if the read wedged/errored."""
+        r, ok = self._bounded_call(self.console.read, per_read_timeout, "read")
+        return r if ok else None
 
     def send_command(self, command, timeout=60):
         """Sends a command and waits for the prompt to return.
@@ -83,7 +91,7 @@ class MetasploitSession:
         low = command.lower()
         if low == "run" or low.startswith("run ") or low == "exploit" or low.startswith("exploit "):
             try:
-                self.console.write("jobs -K\n")
+                self._bounded_call(lambda: self.console.write("jobs -K\n"), 15, "write")
                 time.sleep(1)
                 for _ in range(3):   # drain jobs -K output so it doesn't bleed into the exploit's
                     r = self._bounded_read(per_read_timeout=10)
@@ -93,15 +101,24 @@ class MetasploitSession:
             except Exception:
                 pass
 
-        # Write to the persistent console
-        self.console.write(command + "\n")
+        # Write to the persistent console. This is the OTHER unbounded RPC call
+        # (the read loop below is already bounded): a wedged msfrpcd froze whole
+        # runs here mid-`use exploit/...`. Bound it too, and if it wedges, surface
+        # the sentinel so the cell is scored CONFOUNDED rather than a real failure.
+        _, wrote = self._bounded_call(
+            lambda: self.console.write(command + "\n"), 15, "write")
+        if not wrote:
+            return self.WEDGE_SENTINEL
 
         output = ""
         while time.time() - start_time < timeout:
             remaining = timeout - (time.time() - start_time)
             response = self._bounded_read(per_read_timeout=remaining)
             if response is None:
-                # Read wedged past the wall-clock cap — stop with partial output.
+                # Read wedged past the wall-clock cap — stop. If we never got any
+                # output, flag it as a wedge so the cell is scored CONFOUNDED.
+                if not output:
+                    output = self.WEDGE_SENTINEL
                 break
             chunk = response.get('data', '')
             output += chunk
