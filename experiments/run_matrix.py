@@ -203,16 +203,28 @@ def _spawn_cell(scenario: str, variant: str, rep: int,
 
 
 def _cell_done(scenario: str, variant: str, rep: int) -> bool:
-    """A cell counts as done if its eval log exists AND reached EXECUTION
-    COMPLETE — lets an interrupted overnight matrix resume without redoing work."""
+    """A cell counts as done only if its eval log reached EXECUTION COMPLETE AND
+    the run is NOT confounded — so resume skips valid results but RETRIES confounded
+    ones until a clean run lands.
+
+    Subtlety: a recon/root-node failure (flaky target) still prints EXECUTION
+    COMPLETE at 0%, so an EXECUTION-COMPLETE check alone would wrongly treat it as
+    done and never retry it. We exclude the same confounders parse_eval excludes
+    (harness timeout, wedged console, recon/root failure) using its markers."""
+    from experiments import parse_eval as _pe
     log = EVAL_DIR / f"{_run_tag(scenario, variant, rep)}.log"
     if not log.exists():
         return False
     try:
-        return "[Orchestrator] EXECUTION COMPLETE" in log.read_text(
-            encoding="utf-8", errors="replace")
+        text = log.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return False
+    if "[Orchestrator] EXECUTION COMPLETE" not in text:
+        return False
+    if (_pe._CONFOUNDED in text or _pe._WEDGE_SENTINEL in text
+            or _pe._RECON_FAILED_LINE.search(text)):
+        return False  # confounded -> not a valid result -> retry on resume
+    return True
 
 
 def _run_matrix(scenarios, variants, reps, target, attacker,
