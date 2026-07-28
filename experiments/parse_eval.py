@@ -48,6 +48,13 @@ _COMPLETE = "[Orchestrator] EXECUTION COMPLETE"
 # the orchestrator's output-preview line) — either way it's not real system behavior.
 _CONFOUNDED = "[HARNESS] CELL TIMEOUT / CONFOUNDED"
 _WEDGE_SENTINEL = "[MSF_CONSOLE_WEDGED]"
+# A recon/root-node FAILURE is a lab artifact too, not real system behavior: recon
+# is the graph root, so when the flaky target drops nmap packets recon fails and the
+# walker skips the ENTIRE downstream chain -> a spurious 0%. Treat it exactly like
+# the msf-wedge confounder (excluded + resume-retried). Scope is PRECISE: only the
+# recon/root node failing — a run that recons fine and legitimately dead-ends later
+# (v1_noreplan, a privesc that can't escalate) is REAL data and stays counted.
+_RECON_FAILED_LINE = re.compile(r"[✗x]\s*recon:\s*failed", re.IGNORECASE)
 _SUCCESS_RATE = re.compile(r"Success rate:\s*(\d+)%")
 _REPLAN_CAP = "Replan budget exhausted"
 _REPLAN_EDIT = re.compile(r"\[Replanner\] (NEW EDGE|NEW NODE|GROW TECHNIQUE)")
@@ -108,13 +115,55 @@ def _objective_node(nodes: dict) -> Optional[dict]:
     return next(iter(nodes.values()), None)
 
 
+def _root_node_ids(cp: dict) -> set[str]:
+    """Graph root(s) = node ids that are never the TARGET of any edge.
+
+    Recon is the entry node in every eval scenario; a root failure cascades to
+    every downstream node (they end up `skipped`). We derive it structurally from
+    the edge list so it holds even if the root is renamed away from "recon".
+    """
+    nodes = cp.get("nodes") or {}
+    if not nodes:
+        return set()
+    targets = {e.get("target") for e in (cp.get("edges") or []) if e.get("target")}
+    return {nid for nid in nodes if nid not in targets}
+
+
+def _recon_or_root_failed(cp: dict) -> bool:
+    """True iff the recon stage OR the graph root node ended `status == 'failed'`.
+
+    This is the confounder signal: a root/recon failure is (in this lab) a flaky-
+    target artifact that zeroes the whole chain. Deliberately narrow — it does NOT
+    fire for a downstream node failing, so genuine later dead-ends stay counted.
+    """
+    nodes = cp.get("nodes") or {}
+    if not nodes:
+        return False
+    root_ids = _root_node_ids(cp)
+    for nid, n in nodes.items():
+        if (n.get("status") or "").lower() != "failed":
+            continue
+        if (n.get("agent_type") or "").lower() == "recon":
+            return True
+        if nid in root_ids:
+            return True
+    return False
+
+
 # =============================================================================
 # Log parsing
 # =============================================================================
 
 def _parse_log(text: str) -> dict:
     completed = _COMPLETE in text
-    confounded = (_CONFOUNDED in text) or (_WEDGE_SENTINEL in text)
+    # confounded from the log: harness timeout, msf-console wedge, OR the summary
+    # line showing the recon/root node failed (the checkpoint gives the primary,
+    # structural signal — this log line is a resilient fallback).
+    confounded = (
+        (_CONFOUNDED in text)
+        or (_WEDGE_SENTINEL in text)
+        or bool(_RECON_FAILED_LINE.search(text))
+    )
     replan_capped = _REPLAN_CAP in text
     replan_edits = len(_REPLAN_EDIT.findall(text))
     judge = {"continue": 0, "adapt": 0, "escalate": 0}
@@ -182,6 +231,10 @@ def _parse_checkpoint(cp: dict) -> dict:
         "false_success_nodes": ";".join(false_nodes),
         "grown_node_success": grown_success,
         "graph_status": cp.get("status", ""),
+        # Primary (structural) confounder signal: recon/root node failed -> the
+        # whole chain was skipped, a lab artifact. OR'd into `confounded` in
+        # evaluate_run alongside the log-derived signal.
+        "recon_confounded": _recon_or_root_failed(cp),
     }
 
 
@@ -218,6 +271,11 @@ def evaluate_run(log_path: Path, cp_path: Path) -> dict:
            "log": log_path.name}
     row.update(_parse_log(text))
     row.update(_parse_checkpoint(cp))
+
+    # Fold the structural recon/root-failure signal into `confounded` (the log
+    # parser already OR'd in its own recon-fail line). Keeping both makes the
+    # exclusion robust to a truncated checkpoint OR a reworded summary line.
+    row["confounded"] = bool(row.get("confounded")) or bool(row.pop("recon_confounded", False))
 
     # derived: recovery is only meaningful on flaw_* scenarios
     is_flaw = scenario.startswith("flaw")
