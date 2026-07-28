@@ -54,6 +54,15 @@ MAX_PLANNER_TOOL_CALLS = 5
 # this bounds worst-case wall-clock to a few minutes per cycle instead of hours.
 RECON_SSH_TIMEOUT = 120
 
+# The lab target is intermittently unreachable (packet loss), so a single nmap can
+# spuriously time out / come back empty on a transient blip. Retry a small, strictly
+# bounded number of times (with a short sleep) before surfacing the failure, so one
+# flaky moment doesn't fail the whole recon stage (and cascade to a skipped chain).
+# Bounded by design: at most MAX_NMAP_RETRIES extra attempts, each already capped by
+# RECON_SSH_TIMEOUT — worst case (MAX_NMAP_RETRIES+1)*RECON_SSH_TIMEOUT per command.
+MAX_NMAP_RETRIES = 2
+NMAP_RETRY_SLEEP = 3
+
 FORBIDDEN_COMMANDS = ["rm -rf /", ":(){ :|:& };:"]
 
 # =============================================================================
@@ -124,6 +133,55 @@ def run_ssh_command(command: str, timeout: int = RECON_SSH_TIMEOUT) -> str:
     finally:
         ssh.close()
 
+
+def _is_transient_ssh_failure(output: str) -> bool:
+    """Does this run_ssh_command result look like a transient/flaky-target blip?
+
+    These are the outcomes worth retrying (the target dropped packets, the scan
+    timed out, or came back with nothing). A clean failure with real data (e.g. a
+    finished scan reporting closed ports) is NOT transient and is returned as-is.
+    """
+    if not output:
+        return True
+    low = output.lower()
+    return (
+        "ssh_timeout" in low
+        or "timed out" in low
+        or "ssh_error" in low
+        or "host seems down" in low
+        or "0 hosts up" in low
+        or "failed to resolve" in low
+        or "returned no output" in low   # exit 0 but empty — nothing usable
+    )
+
+
+def run_ssh_command_with_retry(
+    command: str,
+    timeout: int = RECON_SSH_TIMEOUT,
+    max_retries: int = MAX_NMAP_RETRIES,
+    retry_sleep: int = NMAP_RETRY_SLEEP,
+) -> str:
+    """run_ssh_command with a small, bounded retry for transient blips.
+
+    Rides out an intermittently-unreachable target: if the result looks transient
+    (`_is_transient_ssh_failure`), sleep briefly and re-run, up to `max_retries`
+    extra attempts. Returns on the first non-transient result, else the last
+    result (so the caller still sees the real error text). Never loops unbounded —
+    each attempt is capped by `timeout`.
+    """
+    result = run_ssh_command(command, timeout=timeout)
+    attempts = 0
+    while attempts < max_retries and _is_transient_ssh_failure(result):
+        attempts += 1
+        print_colored(
+            f"[Recon] Transient scan failure (attempt {attempts}/{max_retries}) — "
+            f"retrying in {retry_sleep}s: {command}",
+            Colors.WARNING,
+        )
+        time.sleep(retry_sleep)
+        result = run_ssh_command(command, timeout=timeout)
+    return result
+
 # =============================================================================
 # TOOLS
 # =============================================================================
@@ -148,7 +206,9 @@ def tool_linux_terminal(command: str):
     if any(bad in command for bad in FORBIDDEN_COMMANDS):
         return "Command blocked by safety guardrails."
     print_colored(f"\n[Terminal Tool] Executing: {command}", Colors.OKCYAN)
-    return run_ssh_command(command, timeout=RECON_SSH_TIMEOUT)
+    # Bounded retry so a transient flaky-target blip (packet loss / timeout) doesn't
+    # sink the whole recon stage. Non-transient results return on the first attempt.
+    return run_ssh_command_with_retry(command, timeout=RECON_SSH_TIMEOUT)
 
 
 RECON_TOOLS = [tool_linux_terminal]
