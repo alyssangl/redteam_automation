@@ -51,12 +51,22 @@ MAX_PRIVESC_RETRIES = 8
 MAX_ENUM_TOOL_CALLS = 8
 MAX_PLANNER_TOOL_CALLS = 5
 MAX_EXECUTOR_TOOL_CALLS = 12
-# v7: hard wall-clock cap on the WHOLE escalate attempt. With the crash fixed,
-# privesc honestly exhausts vectors against a non-root user, which can run for
-# tens of minutes and blow the orchestrator's per-node budget. When this cap is
-# hit we stop streaming and return best-effort findings (clean "couldn't
-# escalate"), so the graph still reaches EXECUTION COMPLETE.
-PRIVESC_WALLCLOCK_TIMEOUT = 300  # seconds
+# Hard wall-clock cap on the WHOLE escalate attempt. When this cap is hit we stop
+# streaming and return best-effort findings (clean "couldn't escalate"), so the
+# graph still reaches EXECUTION COMPLETE.
+#
+# Sizing: the first enumeration turn is expensive — a command_shell->meterpreter
+# upgrade (~90s MSF call) plus local_exploit_suggester (~90s) plus the manual
+# sudo/SUID/kernel/cap scans easily burn 200-250s BEFORE a single technique is
+# even attempted. At 300s only ONE enum->plan->exec->critic cycle fit, so when the
+# first-chosen vector failed (e.g. SUID, a losing path on Metasploitable 3) there
+# was no budget left for the critic's FAIL_TECHNIQUE->planner loop to cycle to
+# sudo/kernel/capabilities — privesc time-boxed after exactly one vector
+# (flaw_privesc v0 scored 0/5). The subagent already supports cycling
+# (MAX_PRIVESC_RETRIES=8); the cap, not the design, was the limiter. 600s leaves
+# ~350s after enumeration for 3-4 additional technique cycles (each re-enters at
+# the planner, so enumeration is NOT repeated), enough to reach a working vector.
+PRIVESC_WALLCLOCK_TIMEOUT = 600  # seconds
 
 # =============================================================================
 # STATE

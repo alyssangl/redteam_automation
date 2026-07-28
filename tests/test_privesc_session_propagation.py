@@ -116,6 +116,18 @@ def test_find_session_none_returns_empty():
     assert _find_session({"x": {"success": False, "session_id": "9"}}) == ("", "", "unknown")
 
 
+# --- wall-clock time-box budget ----------------------------------------------
+
+def test_wallclock_timebox_fits_multiple_technique_cycles():
+    """Regression guard: the escalate time-box must leave budget for the critic's
+    FAIL_TECHNIQUE->planner loop to cycle to a SECOND/THIRD vector after the first
+    fails. At 300s only one enum->plan->exec->critic cycle fit and flaw_privesc
+    time-boxed after a single (losing) vector. Enumeration alone can burn ~250s
+    (meterpreter upgrade + local_exploit_suggester), so the cap must be well above
+    that to allow additional cycles. Must not silently regress to 300."""
+    assert pe.PRIVESC_WALLCLOCK_TIMEOUT >= 600, pe.PRIVESC_WALLCLOCK_TIMEOUT
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":
