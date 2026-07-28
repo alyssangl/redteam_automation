@@ -947,21 +947,30 @@ def _direct_priv_check(sid: str, timeout: int = 15) -> str:
     return f"[{label}] {out}"
 
 
-def _docker_root_probe(sid: str, timeout: int = 15) -> str:
+def _docker_root_probe(sid: str, timeout: int = 40) -> str:
     """Docker-group ground-truth probe. A docker-group breakout does NOT change
     the session's own uid — a bare `id` still shows the low-priv user — so the
     normal _direct_priv_check would falsely FAIL a successful breakout. Instead we
-    probe the root-owned artifacts a correct breakout plants on the HOST:
+    probe the root-owned artifact a correct breakout plants on the HOST:
       - `/tmp/rootbash -p -c id` — the SUID-root bash the container copied out;
         `bash -p` keeps euid=0 so `id` reports `euid=0(root)` (real root).
     Returns the raw probe output prefixed with a label. Non-interactive (`-c`),
-    so it never hangs the command_shell."""
+    so it never hangs the command_shell.
+
+    The cap is 40s (not 15s): right after the `docker run` breakout the session is
+    still catching up, so the SUID-rootbash read can take >15s — the executor's
+    (uncapped) identical call returns euid=0(root) fine, but a 15s critic cap
+    falsely timed it out. We also RETRY on a timeout/empty read (not just empty),
+    since the previous single-shot-on-empty logic never retried a timed-out probe."""
     if not sid:
         return "[docker rootbash probe] (no session_id)"
-    out = _session_command_capped(sid, "/tmp/rootbash -p -c 'id' 2>&1", timeout=timeout)
-    if (not str(out).strip()) or str(out).strip() in ("(no output)",):
-        time.sleep(2)
+    out = ""
+    for _attempt in range(3):
         out = _session_command_capped(sid, "/tmp/rootbash -p -c 'id' 2>&1", timeout=timeout)
+        s = str(out).strip()
+        if s and "(no output)" not in s and "timed out" not in s:
+            break
+        time.sleep(2)
     return f"[docker rootbash probe] {out}"
 
 
@@ -1007,7 +1016,7 @@ def critic_node(state: PrivEscState) -> dict:
                 str(state.get("escalation_result", ""))
             )
             if "uid=0" not in str(direct_id) and _plan_mentions_docker(plan_and_result):
-                docker_id = _docker_root_probe(sid, timeout=15)
+                docker_id = _docker_root_probe(sid)  # 40s cap + retry (see fn)
                 direct_id = f"{direct_id}\n{docker_id}"
         else:
             direct_id = "(no live session_id available for a direct check)"
