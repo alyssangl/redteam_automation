@@ -24,6 +24,7 @@ import re
 import time
 import operator
 import concurrent.futures
+import threading
 from typing import TypedDict, Annotated, List, Literal
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
@@ -92,21 +93,29 @@ class ImpactState(TypedDict):
 def _run_with_timeout(fn, args=(), kwargs=None, timeout=20, on_timeout="(timed out)"):
     """Run a blocking callable with a hard wall-clock cap. Returns the result,
     or `on_timeout` if it does not complete in time, or an error string on
-    exception. The worker thread is abandoned (daemon-style) on timeout so the
-    stage never blocks waiting for it. Mirrors stages/privesc.py."""
+    exception. Runs on a true DAEMON thread: a ThreadPoolExecutor worker is NOT a
+    daemon, so a wedged worker (blocked msgpack RPC) abandoned via shutdown(wait=
+    False) kept the cell subprocess alive PAST 'EXECUTION COMPLETE' to the 40-min
+    cell cap. A daemon thread is abandoned cleanly and can never block interpreter
+    exit. Mirrors metasploit_tools._bounded_call."""
     kwargs = kwargs or {}
-    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    try:
-        fut = ex.submit(fn, *args, **kwargs)
+    box: dict = {}
+    done = threading.Event()
+
+    def _worker():
         try:
-            return fut.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            return on_timeout
-        except Exception as e:  # surface the underlying error rather than hang
-            return f"(call failed: {e})"
-    finally:
-        # Do NOT block on a lingering worker; let it die in the background.
-        ex.shutdown(wait=False)
+            box["r"] = fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001 — surface, don't hang
+            box["e"] = e
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    if not done.wait(timeout=timeout):
+        return on_timeout
+    if "e" in box:
+        return f"(call failed: {box['e']})"
+    return box.get("r")
 
 
 def _session_command_capped(session_id: str, command: str,

@@ -32,6 +32,7 @@ import sys
 import json
 import time
 import logging
+import threading
 import concurrent.futures
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2835,7 +2836,16 @@ def _cleanup_msf_console(log: logging.Logger = None) -> None:
     try:
         from tools.metasploit_tools import msf_session
         if getattr(msf_session, "_real", None) is not None:
-            msf_session.cleanup()
+            # cleanup() calls consoles.destroy() — an UNBOUNDED msgpack RPC that
+            # hangs FOREVER on a wedged msfrpcd. Run it on a daemon thread with a
+            # short join so a wedged destroy can't keep the cell subprocess alive
+            # past EXECUTION COMPLETE to the 40-min cell cap (observed). The next
+            # cell's force-kill restart_msf reclaims the console regardless.
+            t = threading.Thread(target=msf_session.cleanup, daemon=True)
+            t.start()
+            t.join(timeout=10)
+            if t.is_alive():
+                log.warning("  MSF console cleanup wedged (>10s) — abandoning (daemon)")
             msf_session._real = None
     except Exception as e:
         log.warning(f"  MSF console cleanup skipped: {e}")
