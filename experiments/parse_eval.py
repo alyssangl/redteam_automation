@@ -48,6 +48,9 @@ _COMPLETE = "[Orchestrator] EXECUTION COMPLETE"
 # the orchestrator's output-preview line) — either way it's not real system behavior.
 _CONFOUNDED = "[HARNESS] CELL TIMEOUT / CONFOUNDED"
 _WEDGE_SENTINEL = "[MSF_CONSOLE_WEDGED]"
+# A wedged/slow msfrpcd that trips the bounded lazy-connect (60s cap) is the same
+# class of lab artifact — the run couldn't reach MSF, not a real system failure.
+_CONNECT_WEDGE = "connect/console-create exceeded"
 # A recon/root-node FAILURE is a lab artifact too, not real system behavior: recon
 # is the graph root, so when the flaky target drops nmap packets recon fails and the
 # walker skips the ENTIRE downstream chain -> a spurious 0%. Treat it exactly like
@@ -162,6 +165,7 @@ def _parse_log(text: str) -> dict:
     confounded = (
         (_CONFOUNDED in text)
         or (_WEDGE_SENTINEL in text)
+        or (_CONNECT_WEDGE in text)
         or bool(_RECON_FAILED_LINE.search(text))
     )
     replan_capped = _REPLAN_CAP in text
