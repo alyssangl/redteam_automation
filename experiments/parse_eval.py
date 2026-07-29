@@ -71,14 +71,71 @@ _OBJECTIVE_PRIORITY = ["impact", "persistence", "privesc", "exploit",
 
 
 # =============================================================================
-# Grounding — the independent ground-truth check (NOT the agent's own verdict)
+# Grounding — the INDEPENDENT ground-truth check (NOT the agent's own verdict)
 # =============================================================================
+#
+# Rule of the house: a claimed success is GROUNDED only if the RAW BYTES THE
+# TARGET EMITTED prove it — never a self-reported finding the stage set from its
+# own success claim (that is circular and defeats the whole grounding metric).
+# Where the raw bytes live differs by exec path, so grounding consults BOTH:
+#   - DIRECT-exec nodes  -> checkpoint `commands[].output` carries real output.
+#   - SUBAGENT-run nodes -> `commands[].output` is empty; the ground-truth is in
+#     the RUN LOG (critic/probe/read-back lines). Hence `_grounded(node, log_text)`.
+#
+# Root proof tokens: the literal strings a rooted target prints. `uid=0(root)` is
+# also a substring of `euid=0(root)`, but we list euid explicitly for clarity.
+_ROOT_TOKEN = re.compile(r"uid=0\(root\)|euid=0\(root\)|Server username:\s*root",
+                         re.IGNORECASE)
 
-def _grounded(node: dict) -> bool:
-    """Does this SUCCEEDED node carry real proof it worked, per its stage?
+# Privesc ground-truth LOG lines: the only log lines allowed to ground a privesc
+# success. A root token must co-occur with one of these markers so a plan/prose
+# line that merely mentions "uid=0(root)" can never spoof grounding — the token
+# must ride on raw captured target output (the critic's DIRECT ID CHECK, the
+# executor's grounded target output, the docker rootbash probe, or a `[direct]`
+# command-output line).
+_PRIVESC_GT_LINE = re.compile(
+    r"DIRECT ID CHECK|grounded target output|docker rootbash probe|"
+    r"command_shell id|meterpreter getuid|\[direct\]", re.IGNORECASE)
 
-    Deterministic re-derivation from the node's findings — this is what
-    separates a grounded success from a false success (claimed, no evidence).
+
+def _node_output_blob(node: dict) -> str:
+    """All raw command OUTPUT captured on this node (direct-exec path)."""
+    return "\n".join(str(c.get("output") or "")
+                     for c in (node.get("commands") or []))
+
+
+def _root_proof_in_log(log_text: str) -> bool:
+    """A raw root token on a privesc ground-truth line of the run log.
+
+    Independent by construction: the token must appear on a line that also
+    carries a probe/output marker, i.e. it came off the target — not the stage's
+    prose summary or its self-reported `new_level`.
+    """
+    if not log_text:
+        return False
+    for line in log_text.splitlines():
+        if _ROOT_TOKEN.search(line) and _PRIVESC_GT_LINE.search(line):
+            return True
+    return False
+
+
+def _privesc_grounded(node: dict, log_text: str) -> bool:
+    """Independent root proof for a privesc success.
+
+    Grounded IFF a raw root token (`uid=0(root)` / `euid=0(root)` /
+    `Server username: root`) shows up in the node's captured command output OR on
+    a ground-truth line of the run log. NEVER `new_level`/`access_level` (the
+    stage sets those from its own claim — circular). No token -> false success.
+    """
+    return bool(_ROOT_TOKEN.search(_node_output_blob(node))) or \
+        _root_proof_in_log(log_text)
+
+
+def _grounded(node: dict, log_text: str = "") -> bool:
+    """Does this SUCCEEDED node carry INDEPENDENT proof it worked, per its stage?
+
+    `log_text` is the run's full log — needed for subagent-run nodes whose
+    checkpoint `commands` are empty, so the raw ground-truth is only in the log.
     """
     f = node.get("findings") or {}
     atype = (node.get("agent_type") or "").lower()
@@ -90,11 +147,15 @@ def _grounded(node: dict) -> bool:
         # Ground truth = a real session was opened.
         return bool(f.get("session_id")) or "session" in summary and "opened" in summary
     if atype == "privesc":
-        # Ground truth = escalated session + root level.
-        lvl = str(f.get("new_level") or f.get("access_level") or "").lower()
-        return bool(f.get("session_id")) and (lvl in ("root", "") ) or "uid=0" in summary
+        # INDEPENDENT: raw root token in captured target output / log ground-truth
+        # lines. NOT new_level (circular), and NOT an empty level (C4).
+        return _privesc_grounded(node, log_text)
     if atype == "persistence":
-        # Ground truth = a concrete method landed and was NOT exhausted/unverified.
+        # C5 LIMITATION: persistence grounding stays FINDINGS-derived — there is no
+        # cheap independent probe of a landed cron/ssh-key/service the way `id`
+        # probes root. It is therefore EXCLUDED from the false_success money-metric
+        # (see _parse_checkpoint / threats-to-validity). Kept only for objective
+        # grounded_success when persistence is the objective node.
         if f.get("technique_exhausted") or f.get("direct_attempt_failed") and not f.get("session_id"):
             return False
         return bool(f.get("method")) and bool(f.get("success"))
@@ -210,16 +271,20 @@ def _parse_log(text: str) -> dict:
 # Checkpoint parsing
 # =============================================================================
 
-def _parse_checkpoint(cp: dict) -> dict:
+def _parse_checkpoint(cp: dict, log_text: str = "") -> dict:
     nodes = cp.get("nodes") or {}
     total = len(nodes) or 1
     succeeded = [n for n in nodes.values() if n.get("status") == "success"]
 
-    # false success: a node claims success but has no grounding evidence
-    false_nodes = [n.get("id", "?") for n in succeeded if not _grounded(n)]
+    # false success: a node claims success but has no INDEPENDENT grounding
+    # evidence. `log_text` lets grounding reach the raw target output of
+    # subagent-run nodes (whose checkpoint `commands` are empty).
+    false_nodes = [n.get("id", "?") for n in succeeded
+                   if not _grounded(n, log_text)]
 
     obj = _objective_node(nodes)
-    obj_success = bool(obj and obj.get("status") == "success" and _grounded(obj))
+    obj_success = bool(obj and obj.get("status") == "success"
+                       and _grounded(obj, log_text))
 
     # recovery: objective met AND a replanner-grown node carried it
     grown_success = any(
@@ -274,7 +339,7 @@ def evaluate_run(log_path: Path, cp_path: Path) -> dict:
     row = {"scenario": scenario, "variant": variant, "rep": rep,
            "log": log_path.name}
     row.update(_parse_log(text))
-    row.update(_parse_checkpoint(cp))
+    row.update(_parse_checkpoint(cp, text))
 
     # Fold the structural recon/root-failure signal into `confounded` (the log
     # parser already OR'd in its own recon-fail line). Keeping both makes the
