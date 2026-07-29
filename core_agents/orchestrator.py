@@ -2801,6 +2801,9 @@ def run_graph(
     _checkpoint(graph, checkpoint_path, log)
     _print_summary(graph, log)
 
+    # A4: destroy the shared MSF console we opened so it doesn't leak on msfrpcd.
+    _cleanup_msf_console(log)
+
     return graph
 
 
@@ -2818,6 +2821,24 @@ def _mark_blocked_nodes(graph: AttackGraph, log: logging.Logger = None):
                 reason = f"Predecessor(s) failed: {', '.join(failed_preds)}"
                 node.mark_blocked(reason)
                 log.warning(f"  [{node.id}] STATUS → blocked: {reason}")
+
+
+def _cleanup_msf_console(log: logging.Logger = None) -> None:
+    """Destroy the pipeline's shared MSF console at end-of-run so it doesn't linger
+    on msfrpcd (A4). run_graph reuses a single persistent console across all nodes
+    (that's the design), so the only leak is the one console we opened, never being
+    destroyed. Guarded: reading `_real` does NOT trigger a lazy connect, so this is
+    a no-op when the run never touched MSF; when it did, destroy the console and
+    reset the lazy wrapper so any subsequent run in this process reconnects fresh.
+    The per-cell force-kill restart_msf still covers cross-cell / crash cleanup."""
+    log = log or logging.getLogger("orchestrator")
+    try:
+        from tools.metasploit_tools import msf_session
+        if getattr(msf_session, "_real", None) is not None:
+            msf_session.cleanup()
+            msf_session._real = None
+    except Exception as e:
+        log.warning(f"  MSF console cleanup skipped: {e}")
 
 
 def _checkpoint(graph: AttackGraph, path: str, log: logging.Logger = None):

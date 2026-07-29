@@ -261,6 +261,36 @@ def test_privesc_use_load_failed_helper():
     assert orch._msf_use_load_failed("PAYLOAD => cmd/unix/reverse_bash") is False
 
 
+# =============================================================================
+# A4 — end-of-run console cleanup (destroy when connected, no-op otherwise)
+# =============================================================================
+
+def test_cleanup_msf_console_noop_when_not_connected():
+    # reading _real must NOT trigger a lazy connect; cleanup is a no-op offline
+    saved = mt.msf_session._real
+    try:
+        mt.msf_session._real = None
+        orch._cleanup_msf_console(LOG)          # must not raise, must not connect
+        assert mt.msf_session._real is None
+    finally:
+        mt.msf_session._real = saved
+
+
+def test_cleanup_msf_console_destroys_and_resets_when_connected():
+    class _FakeReal:
+        def __init__(self): self.destroyed = False
+        def cleanup(self): self.destroyed = True
+    fake = _FakeReal()
+    saved = mt.msf_session._real
+    try:
+        mt.msf_session._real = fake
+        orch._cleanup_msf_console(LOG)
+        assert fake.destroyed is True, "the console must be destroyed at end-of-run"
+        assert mt.msf_session._real is None, "the lazy wrapper must reset for a fresh reconnect"
+    finally:
+        mt.msf_session._real = saved
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":
