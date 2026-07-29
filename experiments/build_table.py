@@ -73,15 +73,21 @@ def _fmt_num(xs: list[float]) -> str:
     return f"{m:.1f} ± {s:.1f}"
 
 
-def _load(csv_path: Path) -> tuple[list[dict], int]:
-    """Return (valid rows, discarded-confounded count). Confounded cells
-    (wedged-msfrpcd timeouts) are excluded from the metrics per eval_benchmark.md
-    §7 — they are lab artifacts, not system behavior."""
+def _is_confounded(r: dict) -> bool:
+    return str(r.get("confounded", "")).strip().lower() in ("true", "1", "yes")
+
+
+def _load(csv_path: Path) -> tuple[list[dict], list[dict]]:
+    """Return (valid rows, ALL rows). Confounded cells (wedged-msfrpcd timeouts,
+    recon/root failures) are excluded from the metrics per eval_benchmark.md §7 —
+    they are lab artifacts, not system behavior. ALL rows are returned too so the
+    exclusion can be reported per (scenario × variant), not just as a global total
+    (C3: a reviewer must be able to see the exclusion is not concentrated in the
+    variant whose metric we claim)."""
     with csv_path.open(encoding="utf-8") as fh:
         all_rows = list(csv.DictReader(fh))
-    valid = [r for r in all_rows if str(r.get("confounded", "")).strip().lower()
-             not in ("true", "1", "yes")]
-    return valid, len(all_rows) - len(valid)
+    valid = [r for r in all_rows if not _is_confounded(r)]
+    return valid, all_rows
 
 
 def _variant_sort_key(v: str) -> tuple[int, str]:
@@ -115,23 +121,97 @@ def _table(rows: list[dict], flaw_only_recovery: bool = True) -> str:
     return "\n".join(lines)
 
 
-def build_headline(rows: list[dict], discarded: int = 0) -> str:
+def _exclusion_section(all_rows: list[dict]) -> str:
+    """C3 — confounded/excluded COUNT per (scenario × variant), so a reviewer can
+    confirm the exclusion is not concentrated in the grounding-claim variant."""
+    confounded = [r for r in all_rows if _is_confounded(r)]
+    lines = ["## Confounded / excluded cells\n",
+             f"_{len(confounded)} of {len(all_rows)} run(s) excluded as lab "
+             "artifacts (wedged-msfrpcd timeouts, recon/root-node failures), shown "
+             "per (scenario × variant). A reviewer should confirm the exclusions "
+             "are NOT concentrated in the variant whose metric we claim "
+             "(v3_noground for false_success)._\n"]
+    if not confounded:
+        lines.append("_No cells excluded._")
+        return "\n".join(lines)
+
+    scenarios = sorted({r.get("scenario", "?") for r in all_rows})
+    variants = sorted({r.get("variant", "?") for r in all_rows},
+                      key=_variant_sort_key)
+    cnt: dict[tuple[str, str], int] = defaultdict(int)
+    vtot: dict[str, int] = defaultdict(int)
+    for r in confounded:
+        cnt[(r.get("scenario", "?"), r.get("variant", "?"))] += 1
+        vtot[r.get("variant", "?")] += 1
+
+    header = ["Scenario \\ Variant"] + variants
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("|" + "|".join(["---"] * len(header)) + "|")
+    for s in scenarios:
+        cells = [s] + [str(cnt[(s, v)]) if cnt[(s, v)] else "·" for v in variants]
+        lines.append("| " + " | ".join(cells) + " |")
+    lines.append("| **excluded / variant** | "
+                 + " | ".join(f"**{vtot[v]}**" for v in variants) + " |")
+
+    worst_v, worst_n = max(vtot.items(), key=lambda kv: kv[1])
+    claim_n = vtot.get("v3_noground", 0)
+    verdict = ("NOT the most-excluded — no exclusion bias toward the grounding "
+               "claim." if worst_v != "v3_noground"
+               else "also the most-excluded — investigate exclusion bias.")
+    lines.append(f"\n_Most-excluded variant: **{worst_v}** ({worst_n} run(s)). "
+                 f"v3_noground has {claim_n} exclusion(s) — {verdict}_")
+    return "\n".join(lines)
+
+
+def _threats_to_validity() -> str:
+    return "\n".join([
+        "## Threats to validity\n",
+        "- **Persistence grounding is findings-derived (C5).** privesc and impact "
+        "have cheap INDEPENDENT probes (root `id`/`getuid`; a proof-marker read "
+        "back off the target), but a landed cron/ssh-key/service does not, so its "
+        "grounding rests on the stage's own findings. `false_success` is therefore "
+        "SCOPED to privesc+impact; a persistence over-claim is not counted. Widen "
+        "only once persistence can be grounded independently.",
+        "- **Subagent ground-truth capture.** When privesc/impact run as subagents "
+        "their raw root/probe output is emitted to stdout, which the per-run file "
+        "log does not capture (it lands in the combined matrix stdout). For those "
+        "nodes the per-run artifacts can lack the token, so a real escalation may "
+        "be scored `false_success`. The bias is CONSERVATIVE (never over-credits a "
+        "claim); routing subagent ground-truth into the per-run log would tighten "
+        "it.",
+        "- **Exclusions.** Confounded cells are dropped as lab artifacts; the "
+        "per-cell table above lets a reviewer confirm the drops are not "
+        "concentrated in the grounding-claim variant.\n",
+    ])
+
+
+def build_headline(rows: list[dict], all_rows: list[dict] | None = None) -> str:
+    all_rows = all_rows if all_rows is not None else list(rows)
+    discarded = sum(1 for r in all_rows if _is_confounded(r))
     out = ["# Ablation table\n",
            "_Rows = system variants, cols = metrics. Each cell = mean ± std over "
            "all runs of that variant (scenarios × reps). Recovery is computed over "
            "flaw_* scenarios only._\n",
            f"_Source: {len(rows)} valid runs"
            + (f"; {discarded} confounded run(s) discarded (wedged-msfrpcd "
-              "timeouts, excluded per protocol)." if discarded else ".") + "_\n",
+              "timeouts, excluded per protocol — see the per-cell breakdown below)."
+              if discarded else ".") + "_\n",
            _table(rows),
            "\n\n## Reading it\n",
            "- **v3_noground** should show **False success** spiking vs v0_full "
-           "(grounding is what suppresses unproven claims).",
+           "(grounding is what suppresses unproven claims). False success is "
+           "re-derived from INDEPENDENT evidence (root token / proof-marker read "
+           "back), never the agent's own findings, and is scoped to privesc+impact.",
            "- **v1_noreplan** should show **Recovery** collapsing (the replanner "
            "is what restructures around the injected failure).",
            "- **v4_nodeterm** should show **Non-termination** rising (deterministic "
            "tried-tracking is what prevents technique loops).",
-           "- **v6_naive** is the external floor: no graph, judge, or replanner.\n"]
+           "- **v6_naive** is the external floor: no graph, judge, or replanner. It "
+           "is graded off the SAME independent evidence (its raw tool outputs), so "
+           "it cannot be grounded off a self-report V0 would be denied.\n",
+           _exclusion_section(all_rows),
+           "\n",
+           _threats_to_validity()]
     return "\n".join(out)
 
 
@@ -158,7 +238,8 @@ def main() -> int:
     if not csv_path.exists():
         print(f"CSV not found: {csv_path}")
         return 1
-    rows, discarded = _load(csv_path)
+    rows, all_rows = _load(csv_path)
+    discarded = len(all_rows) - len(rows)
     if not rows:
         print(f"no valid rows in CSV ({discarded} confounded discarded)")
         return 1
@@ -167,13 +248,13 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     headline = out_dir / "ablation_table.md"
     per_scen = out_dir / "eval_per_scenario.md"
-    headline.write_text(build_headline(rows, discarded), encoding="utf-8")
+    headline.write_text(build_headline(rows, all_rows), encoding="utf-8")
     per_scen.write_text(build_per_scenario(rows), encoding="utf-8")
 
     print(f"wrote {headline} and {per_scen} from {len(rows)} valid runs "
           f"({discarded} confounded discarded)")
     print()
-    print(build_headline(rows, discarded))
+    print(build_headline(rows, all_rows))
     return 0
 
 
