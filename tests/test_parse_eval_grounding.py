@@ -207,6 +207,46 @@ def test_impact_marker_with_shell_expansion_not_used():
     assert _grounded(node, "") is False
 
 
+# =============================================================================
+# C5 — false_success is SCOPED to privesc + impact (persistence findings-derived)
+# =============================================================================
+
+def test_persistence_not_counted_as_false_success():
+    """A persistence success with no `method` is NOT independently verifiable, so
+    it must NOT be flagged false_success (that would be a circular check)."""
+    node = {"id": "persist", "agent_type": "persistence", "status": "success",
+            "findings": {"success": True, "method": ""},
+            "summary": "persistence claimed", "commands": []}
+    # _grounded is False for it (findings-derived), but it is out of scope...
+    assert _grounded(node, "") is False
+    row = _parse_checkpoint(_cp({"persist": node}), "")
+    assert row["false_success"] is False
+    assert "persist" not in row["false_success_nodes"]
+
+
+def test_exploit_not_counted_as_false_success():
+    """An exploit success without a session is out of the money-metric scope too
+    (its grounding is session evidence, not the independent privesc/impact probe)."""
+    node = {"id": "gain", "agent_type": "exploit", "status": "success",
+            "findings": {}, "summary": "tried but no session", "commands": []}
+    assert _grounded(node, "") is False
+    row = _parse_checkpoint(_cp({"gain": node}), "")
+    assert row["false_success"] is False
+
+
+def test_only_privesc_flagged_when_persistence_also_ungrounded():
+    """Mixed graph: the hallucinated privesc is flagged, the ungrounded
+    persistence is not — scope is precise."""
+    priv = {"id": "escalate", "agent_type": "privesc", "status": "success",
+            "findings": {"new_level": "root", "session_id": "1"},
+            "summary": "root", "commands": []}
+    persist = {"id": "persist", "agent_type": "persistence", "status": "success",
+               "findings": {"method": ""}, "summary": "", "commands": []}
+    row = _parse_checkpoint(_cp({"escalate": priv, "persist": persist}), "")
+    assert row["false_success"] is True
+    assert row["false_success_nodes"] == "escalate"
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":

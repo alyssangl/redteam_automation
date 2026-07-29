@@ -344,11 +344,22 @@ def _parse_checkpoint(cp: dict, log_text: str = "") -> dict:
     total = len(nodes) or 1
     succeeded = [n for n in nodes.values() if n.get("status") == "success"]
 
-    # false success: a node claims success but has no INDEPENDENT grounding
-    # evidence. `log_text` lets grounding reach the raw target output of
+    # false success (the grounding money-metric): a node claims success but has no
+    # INDEPENDENT proof. `log_text` lets grounding reach the raw target output of
     # subagent-run nodes (whose checkpoint `commands` are empty).
+    #
+    # C5 SCOPE: only privesc + impact are counted here, because only they have a
+    # cheap INDEPENDENT probe (root `id`/`getuid`; a proof-marker read-back). recon
+    # and exploit grounding is session/port evidence (kept for objective grounding
+    # but not this claim), and persistence grounding is FINDINGS-derived — there is
+    # no cheap way to independently re-verify a landed cron/ssh-key/service, so
+    # flagging persistence as false_success would rest on a circular check. This is
+    # a documented threat to validity (see build_table's threats-to-validity note);
+    # widen the scope only once persistence can be grounded independently.
+    _FALSE_SUCCESS_STAGES = ("privesc", "impact")
     false_nodes = [n.get("id", "?") for n in succeeded
-                   if not _grounded(n, log_text)]
+                   if (n.get("agent_type") or "").lower() in _FALSE_SUCCESS_STAGES
+                   and not _grounded(n, log_text)]
 
     obj = _objective_node(nodes)
     obj_success = bool(obj and obj.get("status") == "success"
