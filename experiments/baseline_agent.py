@@ -8,12 +8,15 @@ objective as V0 (pulled from the scenario's graph builder) so the rows are
 comparable.
 
 It writes the SAME artifacts as an orchestrator run so parse_eval grades it
-uniformly:
+uniformly — and, crucially, from the SAME independent evidence source (B3):
   - a checkpoint JSON with a single OBJECTIVE node whose status is the agent's
-    OWN success claim and whose findings hold whatever ground-truth evidence the
-    loop actually captured (session opened / uid=0 / proof read-back). parse_eval
-    then re-derives grounded/false success independently — a naive agent that
-    over-claims without evidence shows up as false_success, which is the point.
+    OWN success claim and whose `commands` hold the RAW tool outputs the loop
+    captured (each tool call recorded as a CommandRecord: the command + the
+    target's real output). parse_eval re-derives grounded/false success from those
+    raw bytes exactly as it does for V0 — the node's synthesized `findings` are a
+    self-report only, NOT the grounding source. A naive agent that over-claims
+    without a captured root token / proof-marker read-back shows up as
+    false_success, which is the point. No variant gets a fairer standard.
   - a timestamped log ending in the "[Orchestrator] EXECUTION COMPLETE" +
     "Success rate: N%" markers parse_eval keys off.
 
@@ -23,6 +26,7 @@ as the v6_naive variant.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -36,7 +40,7 @@ sys.path.insert(0, str(ROOT))
 from langchain_core.messages import HumanMessage, ToolMessage
 
 from core_agents.common import call_llm, print_colored, Colors
-from core_agents.attack_graph import AttackGraph, AttackNode, NodeStatus
+from core_agents.attack_graph import AttackGraph, AttackNode, NodeStatus, CommandRecord
 from tools.rag import query_knowledge_base, query_successful_attacks
 from tools.metasploit_tools import tool_session_command
 # tool_metasploit_rpc / tool_linux_terminal are defined in the initial_access
@@ -117,9 +121,26 @@ def _invoke_tool(tool_call: dict) -> str:
         return f"ERROR invoking {name}: {e}"
 
 
+def _tool_record(name: str, args: dict, output: str) -> CommandRecord:
+    """One raw tool call -> a CommandRecord (the SAME raw-evidence artifact the
+    orchestrator writes on a node). parse_eval grounds V6 off these exactly as it
+    grounds V0 off a direct-exec node's commands[] — the independent evidence
+    source is identical, so neither variant gets a fairer standard (B3)."""
+    args = args or {}
+    cmd = args.get("command") or args.get("cmd")
+    if not cmd:  # RAG / non-shell tools: keep a readable stand-in
+        cmd = json.dumps(args, default=str)
+    return CommandRecord(command=str(cmd)[:500], tool=name,
+                         output=str(output)[:4000], target="target")
+
+
 def _scrape_evidence(transcript: str) -> dict:
-    """Independent ground-truth scrape from the loop transcript — the evidence
-    parse_eval will grade grounding against."""
+    """Self-report scrape from the loop transcript for the node's `findings`.
+
+    NOTE: findings are the agent's SELF-REPORT only — parse_eval does NOT ground
+    privesc/impact off them (it reads the raw CommandRecords, see _tool_record).
+    Kept so the checkpoint mirrors an orchestrator node's shape (and session_id
+    feeds the unchanged exploit-objective grounding, same as V0)."""
     findings: dict = {"success": None, "summary": ""}
     m = re.search(r"[Ss]ession (\d+) opened|Meterpreter session (\d+)"
                   r"|Command shell session (\d+)", transcript)
@@ -150,6 +171,7 @@ def run_baseline(scenario: str, target: str, attacker: str,
 
     claimed_success = False
     final_text = ""
+    command_records: list[CommandRecord] = []  # raw-evidence artifacts (B3)
     for step in range(MAX_STEPS):
         resp = call_llm(messages, system_prompt=SYSTEM_PROMPT, tools=TOOLS,
                         model_name=BASELINE_MODEL)
@@ -164,6 +186,10 @@ def run_baseline(scenario: str, target: str, attacker: str,
             log.info(f"[Baseline] step {step} tool={tc.get('name')} args={tc.get('args')}")
             out = _invoke_tool(tc)
             log.info(f"[Baseline] -> {str(out)[:200]}")
+            # Record the raw call+output so parse_eval grounds V6 off the SAME
+            # evidence source (commands[].output) it uses for V0.
+            command_records.append(_tool_record(tc.get("name", ""),
+                                                tc.get("args", {}), out))
             messages.append(ToolMessage(content=str(out),
                                         tool_call_id=tc.get("id", f"call_{step}")))
     else:
@@ -184,6 +210,8 @@ def run_baseline(scenario: str, target: str, attacker: str,
     node.status = (NodeStatus.SUCCESS.value if claimed_success
                    else NodeStatus.FAILED.value)
     node.findings = findings
+    # The RAW evidence parse_eval actually grounds against (same source as V0).
+    node.commands = command_records
     node.summary = final_text[:200] or ("claimed success" if claimed_success else "no success")
     graph.add_node(node)
     graph.status = "completed"
