@@ -35,6 +35,17 @@ class MetasploitSession:
     # it as a genuine v0 failure.
     WEDGE_SENTINEL = "[MSF_CONSOLE_WEDGED]"
 
+    # Per-op wall-clock caps (seconds) for the SESSION RPC api (shell_read/
+    # meterpreter_read/session.list) used by run_session_command. The msgpack RPC
+    # socket has NO timeout, so a wedged msfrpcd makes session.*_read block
+    # FOREVER — and because the read loop counts `elapsed` only on healthy reads,
+    # a single wedged read froze the whole stage (elapsed never advanced). These
+    # caps run every session RPC on a daemon thread with a hard ceiling (same
+    # pattern send_command uses for the console) so a wedge is detected and
+    # abandoned instead of hanging.
+    _RPC_READ_CAP = 15
+    _RPC_WRITE_CAP = 15
+
     def _bounded_call(self, fn, timeout, label):
         """Run a synchronous msfrpc console op (write/read) on a DAEMON thread with
         a hard wall-clock cap. The msgpack RPC socket has no timeout, so when
@@ -69,6 +80,40 @@ class MetasploitSession:
         dict, or None if the read wedged/errored."""
         r, ok = self._bounded_call(self.console.read, per_read_timeout, "read")
         return r if ok else None
+
+    def _bounded_client_call(self, method, args, timeout, label):
+        """Run a raw msgpack RPC (self.client.call) on a daemon thread with a hard
+        wall-clock cap. The RPC socket has no timeout, so a wedged msfrpcd blocks
+        the call forever; inside run_session_command's read loop that means
+        `elapsed` never advances and the whole stage hangs. Returns (result, ok);
+        ok=False on wedge/error (mirrors _bounded_call, used by send_command).
+
+        `args is None` preserves the exact `client.call(method)` (no-args) form."""
+        if args is None:
+            fn = lambda: self.client.call(method)          # noqa: E731
+        else:
+            fn = lambda: self.client.call(method, args)    # noqa: E731
+        return self._bounded_call(fn, timeout, label)
+
+    def _sess_read(self, method, sid, timeout):
+        """One bounded session read (session.shell_read / session.meterpreter_read).
+        Returns the decoded output string ("" when the read was empty), or None
+        when the read wedged/errored past the cap — the caller BREAKS on None so a
+        wedged msfrpcd can never spin the loop forever."""
+        resp, ok = self._bounded_client_call(method, [sid], timeout, method)
+        if not ok or resp is None:
+            return None
+        data = resp.get(b'data', resp.get('data', b''))
+        if isinstance(data, bytes):
+            data = data.decode('utf-8', errors='ignore')
+        return data
+
+    def _sess_write(self, method, sid, payload):
+        """One bounded session write (session.shell_write / session.meterpreter_write).
+        Best-effort: a wedged write is abandoned after the cap and the following
+        bounded read is what terminates the loop. Returns True on a clean write."""
+        _, ok = self._bounded_client_call(method, [sid, payload], self._RPC_WRITE_CAP, method)
+        return ok
 
     def send_command(self, command, timeout=60):
         """Sends a command and waits for the prompt to return.
@@ -141,8 +186,14 @@ class MetasploitSession:
         return output
 
     def get_session_type(self, session_id):
-        """Query session.list and return the session type string (e.g., 'shell' or 'meterpreter')."""
-        result = self.client.call('session.list')
+        """Query session.list and return the session type string (e.g., 'shell' or 'meterpreter').
+
+        Bounded (session.list is a blocking RPC with no socket timeout, and this
+        is called INSIDE run_session_command's read loop — a wedge here would hang
+        the loop). Returns None if the list call wedged/errored."""
+        result, ok = self._bounded_client_call('session.list', None, self._RPC_READ_CAP, "session.list")
+        if not ok or not result:
+            return None
         # Keys can be int or str depending on msgpack decoding
         for sid, details in result.items():
             if str(sid) == str(session_id):
@@ -177,6 +228,11 @@ class MetasploitSession:
             session_type = session_type.decode('utf-8', errors='ignore')
 
         sid = str(session_id)
+        # Per-read wall-clock cap: never exceed the caller's nominal `timeout`, but
+        # floor at 2s so a wedged read is still detectable. Every session RPC below
+        # goes through _sess_read/_sess_write (bounded) so a wedged msfrpcd can
+        # never block this call forever.
+        read_cap = max(2, min(timeout, self._RPC_READ_CAP))
 
         if 'meterpreter' in session_type:
             # meterpreter_write targets the meterpreter COMMAND INTERPRETER, which only
@@ -190,19 +246,18 @@ class MetasploitSession:
             # meterpreter prompt for the next call.
             done = "__MSF_CMD_DONE_9271__"
             poke = 'echo __MSF""_CMD_DONE_9271__\n'
-            self.client.call('session.meterpreter_read', [sid])          # clear leftover
-            self.client.call('session.meterpreter_write', [sid, 'shell\n'])
+            self._sess_read('session.meterpreter_read', sid, read_cap)          # clear leftover
+            self._sess_write('session.meterpreter_write', sid, 'shell\n')
             time.sleep(2)
-            self.client.call('session.meterpreter_read', [sid])          # drain shell banner
-            self.client.call('session.meterpreter_write', [sid, command + "\n"])
-            self.client.call('session.meterpreter_write', [sid, poke])
+            self._sess_read('session.meterpreter_read', sid, read_cap)          # drain shell banner
+            self._sess_write('session.meterpreter_write', sid, command + "\n")
+            self._sess_write('session.meterpreter_write', sid, poke)
             output = ""
             elapsed = 0
             while elapsed < timeout:
-                resp = self.client.call('session.meterpreter_read', [sid])
-                data = resp.get(b'data', resp.get('data', b''))
-                if isinstance(data, bytes):
-                    data = data.decode('utf-8', errors='ignore')
+                data = self._sess_read('session.meterpreter_read', sid, read_cap)
+                if data is None:
+                    break   # wedged msfrpcd read — stop rather than block/spin forever
                 output += data
                 if done in output:
                     output = output.split(done)[0]   # keep only the real output
@@ -211,9 +266,9 @@ class MetasploitSession:
                 elapsed += 1
             # Leave the shell channel so the session returns to the meterpreter prompt.
             try:
-                self.client.call('session.meterpreter_write', [sid, 'exit\n'])
+                self._sess_write('session.meterpreter_write', sid, 'exit\n')
                 time.sleep(1)
-                self.client.call('session.meterpreter_read', [sid])
+                self._sess_read('session.meterpreter_read', sid, read_cap)
             except Exception:
                 pass
             output = output.strip()
@@ -231,17 +286,16 @@ class MetasploitSession:
             # echo's OUTPUT, never in the command text.
             done = "__MSF_CMD_DONE_9271__"
             poke = 'echo __MSF""_CMD_DONE_9271__\n'
-            self.client.call('session.shell_write', [sid, command + "\n"])
-            self.client.call('session.shell_write', [sid, poke])
+            self._sess_write('session.shell_write', sid, command + "\n")
+            self._sess_write('session.shell_write', sid, poke)
             output = ""
             elapsed = 0
             idle = 0
             repokes = 0
             while elapsed < timeout:
-                resp = self.client.call('session.shell_read', [sid])
-                data = resp.get(b'data', resp.get('data', b''))
-                if isinstance(data, bytes):
-                    data = data.decode('utf-8', errors='ignore')
+                data = self._sess_read('session.shell_read', sid, read_cap)
+                if data is None:
+                    break   # wedged msfrpcd read — stop rather than block/spin forever
                 output += data
                 if done in output:
                     output = output.split(done)[0]   # keep only the real output
@@ -266,7 +320,7 @@ class MetasploitSession:
                                     f"Use tool_list_sessions() to see active sessions.")
                         if repokes < 3:
                             repokes += 1
-                            self.client.call('session.shell_write', [sid, poke])
+                            self._sess_write('session.shell_write', sid, poke)
                 time.sleep(1)
                 elapsed += 1
             output = output.strip()
@@ -307,28 +361,77 @@ class _LazyMsfSession:
 
     def __init__(self):
         self._real = None
+        # Tracks the most recent connect worker's completion. Used to avoid
+        # STACKING connect threads: if a prior attempt timed out and its worker is
+        # STILL running (msfrpcd wedged), we must not spawn another leaking thread.
+        self._pending = None
 
     def _ensure(self):
-        if self._real is None:
-            box: dict = {}
-            done = threading.Event()
+        if self._real is not None:
+            return self._real
 
-            def _connect():
-                try:
-                    box["s"] = MetasploitSession(**self._CFG)
-                except Exception as e:  # noqa: BLE001
+        # Don't stack connect threads. If a previous _ensure timed out and its
+        # worker never returned (msfrpcd truly wedged), _pending stays un-set —
+        # spawning more workers would leak an unbounded number of threads (and
+        # each may eventually create an orphan console). Fail fast until the
+        # outstanding attempt resolves. A resolved worker (success OR abandoned-
+        # cleanup) sets its event, which re-enables a fresh attempt.
+        if self._pending is not None and not self._pending.is_set():
+            raise RuntimeError(
+                "MSF connect already in flight and unresolved (msfrpcd wedged) "
+                "— failing fast instead of stacking connect threads")
+
+        box: dict = {}
+        done = threading.Event()
+        # abandoned/lock close the race between "waiter gives up" and "worker
+        # finishes": exactly one of them takes ownership of the freshly-created
+        # session, and whoever does NOT own it destroys its console so a late
+        # connect can never strand an orphaned console on msfrpcd (msfrpcd wedge).
+        abandoned = threading.Event()
+        lock = threading.Lock()
+        self._pending = done
+
+        def _connect():
+            try:
+                s = MetasploitSession(**self._CFG)
+            except Exception as e:  # noqa: BLE001
+                with lock:
                     box["e"] = e
-                finally:
                     done.set()
+                return
+            leak = False
+            with lock:
+                if abandoned.is_set():
+                    leak = True          # waiter already gave up — we must clean up
+                else:
+                    box["s"] = s
+                done.set()
+            if leak:
+                # Destroy the console this late connect created; leaving it would
+                # wedge msfrpcd (the discarded box is never cleaned up otherwise).
+                try:
+                    s.cleanup()
+                except Exception:
+                    pass
 
-            threading.Thread(target=_connect, daemon=True).start()
-            if not done.wait(timeout=self._CONNECT_TIMEOUT):
-                raise RuntimeError(
-                    f"MSF connect/console-create exceeded {self._CONNECT_TIMEOUT}s "
-                    f"(msfrpcd wedged/slow) — failing fast instead of hanging")
-            if "e" in box:
-                raise box["e"]
-            self._real = box["s"]
+        threading.Thread(target=_connect, daemon=True).start()
+        if not done.wait(timeout=self._CONNECT_TIMEOUT):
+            with lock:
+                abandoned.set()
+                # The worker may have beaten us to the lock and stored a session;
+                # take ownership and destroy its console so it doesn't leak.
+                stranded = box.pop("s", None)
+            if stranded is not None:
+                try:
+                    stranded.cleanup()
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"MSF connect/console-create exceeded {self._CONNECT_TIMEOUT}s "
+                f"(msfrpcd wedged/slow) — failing fast instead of hanging")
+        if "e" in box:
+            raise box["e"]
+        self._real = box["s"]
         return self._real
 
     def __getattr__(self, name):
