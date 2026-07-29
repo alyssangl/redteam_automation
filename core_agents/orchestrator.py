@@ -32,6 +32,7 @@ import sys
 import json
 import time
 import logging
+import concurrent.futures
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -496,6 +497,10 @@ _FAILURE_INDICATORS: list[str] = [
     "not found. use tool_metasploit_rpc",
     "could not resolve host",
     "host key verification failed",
+    # A direct session command that blew its hard wall-clock cap (a wedged
+    # session RPC the inner bounds somehow missed). The on_timeout sentinel below
+    # carries this phrase so a hang is scored as a failure, never a false success.
+    "session command timed out",
     # CLI usage hints that mean the command did NOTHING. Caught when a tool
     # prints a help-style message instead of doing the work. Real example:
     # `wipe -f -q /tmp` prints "Use -r option to wipe directories" and exits
@@ -588,6 +593,38 @@ def _execute_ssh_commands(node: AttackNode, log: logging.Logger) -> dict:
     }
 
 
+# Hard wall-clock cap (seconds) for a SINGLE direct session command. Defense in
+# depth on top of run_session_command's own bounded reads (tools/metasploit_tools):
+# even if a session RPC wedges in a way the inner caps miss, file_drop / impact-
+# via-session can never hang toward the 40-min per-cell cap. The inner call uses
+# timeout=30 with reads bounded ~15s, so it returns well under this ceiling in the
+# normal case — this only fires on a true wedge.
+_DIRECT_SESSION_WALLCLOCK = 60
+_DIRECT_SESSION_TIMEOUT_MSG = (
+    f"(direct session command timed out after {_DIRECT_SESSION_WALLCLOCK}s "
+    f"— treating as failure)"
+)
+
+
+def _run_bounded(fn, timeout, on_timeout):
+    """Run a blocking callable with a hard wall-clock cap on a worker thread.
+    Returns the result, `on_timeout` if it doesn't finish in time, or an error
+    string on exception. The worker is abandoned (not joined) on timeout so the
+    caller never blocks waiting for it. Mirrors stages/impact.py's
+    _run_with_timeout / stages/privesc.py."""
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        fut = ex.submit(fn)
+        try:
+            return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            return on_timeout
+        except Exception as e:  # surface the underlying error rather than hang
+            return f"(session command failed: {e})"
+    finally:
+        ex.shutdown(wait=False)
+
+
 def _execute_session_commands(
     node: AttackNode, log: logging.Logger,
     msf_session, session_id: str,
@@ -600,9 +637,15 @@ def _execute_session_commands(
         cmd = _render_command(template, params)
         log.info(f"  [direct] session({session_id})> {cmd}")
         # Capture stderr so denied writes / missing files are SEEN by the failure
-        # scanner (else false success — see _with_stderr_capture).
-        output = msf_session.run_session_command(
-            session_id, _with_stderr_capture(cmd), timeout=30)
+        # scanner (else false success — see _with_stderr_capture). Wrap the call in
+        # a hard wall-clock cap so a wedged session RPC can never hang the pipeline
+        # (defense in depth over run_session_command's own bounded reads).
+        output = _run_bounded(
+            lambda c=cmd: msf_session.run_session_command(
+                session_id, _with_stderr_capture(c), timeout=30),
+            timeout=_DIRECT_SESSION_WALLCLOCK,
+            on_timeout=_DIRECT_SESSION_TIMEOUT_MSG,
+        )
         node.add_command(cmd, tool="session", output=output, target="target")
         all_output += output + "\n"
 
