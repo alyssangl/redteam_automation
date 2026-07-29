@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import stages.privesc as pe
 from core_agents import mitre
+from langchain_core.messages import ToolMessage, AIMessage
 
 
 # --- _user_in_docker_group (feasibility) -------------------------------------
@@ -136,6 +137,36 @@ def test_mitre_catalog_has_docker_group():
     assert t.tactic == "privilege_escalation"
     # resolvable by id too
     assert mitre.get_technique("privilege_escalation", "T1611") is t
+
+
+# --- _grounded_root_evidence (critic binds to the executor's captured target
+#     bytes, not a fragile re-read — and must ignore LLM prose) ---------------
+
+def test_grounded_root_evidence_reads_tool_output():
+    # euid=0(root) in a RAW ToolMessage (real target bytes) -> proof
+    state = {"messages": [
+        AIMessage(content="running the docker breakout"),
+        ToolMessage(content="uid=1121(boba_fett) gid=100(users) euid=0(root) groups=0(root),999(docker)",
+                    tool_call_id="c1"),
+    ]}
+    out = pe._grounded_root_evidence(state)
+    assert out and "euid=0(root)" in out
+
+
+def test_grounded_root_evidence_ignores_llm_prose():
+    # euid=0(root) ONLY in LLM prose (AIMessage) -> must NOT count (honesty)
+    state = {"messages": [
+        AIMessage(content="I confirmed euid=0(root), we are root now."),
+    ]}
+    assert pe._grounded_root_evidence(state) == ""
+
+
+def test_grounded_root_evidence_none_when_no_root():
+    state = {"messages": [
+        ToolMessage(content="uid=1121(boba_fett) gid=100(users) groups=100(users),999(docker)",
+                    tool_call_id="c1"),
+    ]}
+    assert pe._grounded_root_evidence(state) == ""
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

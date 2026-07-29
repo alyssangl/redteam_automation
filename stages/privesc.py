@@ -417,6 +417,11 @@ with the session type that was probed:
     `uid=0(root)` OR `euid=0(root)`. If this probe shows euid/uid=0, escalation
     SUCCEEDED (PASS). If it errors / shows the low-priv user / 'No such file', the
     breakout did not land — do not PASS on prose.
+  - `[grounded target output] ...` → the `euid=0(root)`/`uid=0(root)` the EXECUTOR
+    already read off the target (raw command output captured by its own reliable
+    read, NOT prose). A command_shell re-probe races and can return empty even on
+    a successful breakout, so this captured target output is authoritative: if it
+    shows euid/uid=0, escalation SUCCEEDED (PASS).
 This field is authoritative. If it shows root by the rule above, escalation
 succeeded (PASS) regardless of the prose. If it does NOT (e.g. `uid=1000(vagrant)`,
 `Server username: vagrant`, an error, empty, or a timeout message), you MUST NOT
@@ -974,6 +979,28 @@ def _docker_root_probe(sid: str, timeout: int = 40) -> str:
     return f"[docker rootbash probe] {out}"
 
 
+def _grounded_root_evidence(state: PrivEscState) -> str:
+    """Root proof from what the EXECUTOR already read off the target — NOT a fresh
+    critic re-read.
+
+    A raw command_shell is an unframed byte stream, so the critic's one-shot
+    re-probe (_docker_root_probe) races and often comes back empty even when the
+    docker breakout WORKED — while the executor's adaptive read loop reliably
+    captured `euid=0(root)`. We scan ONLY raw ToolMessage contents (the target's
+    actual command output, which ToolNode appends to state['messages']) — never the
+    executor LLM's prose summary — so this stays honest ground truth that cannot be
+    hallucinated. Returns a labeled proof line, or '' if no tool output showed root."""
+    for msg in (state.get("messages") or []):
+        if not isinstance(msg, ToolMessage):
+            continue
+        content = str(getattr(msg, "content", "") or "")
+        m = re.search(r"euid=0\(root\)|uid=0\(root\)", content)
+        if m:
+            return (f"[grounded target output] {m.group(0)} — root confirmed from "
+                    f"the executor's captured target command output")
+    return ""
+
+
 def critic_node(state: PrivEscState) -> dict:
     """3-way evaluation of privesc attempt."""
     current_step = state.get("loop_step", 0)
@@ -1016,8 +1043,13 @@ def critic_node(state: PrivEscState) -> dict:
                 str(state.get("escalation_result", ""))
             )
             if "uid=0" not in str(direct_id) and _plan_mentions_docker(plan_and_result):
-                docker_id = _docker_root_probe(sid)  # 40s cap + retry (see fn)
-                direct_id = f"{direct_id}\n{docker_id}"
+                # PREFER the euid=0(root) the executor already read off the target
+                # (raw tool output — honest ground truth). Only fall back to a fresh
+                # critic re-probe if the executor never captured root, since that
+                # command_shell re-read races and often returns empty on success.
+                captured = _grounded_root_evidence(state)
+                direct_id = (f"{direct_id}\n{captured}" if captured
+                             else f"{direct_id}\n{_docker_root_probe(sid)}")
         else:
             direct_id = "(no live session_id available for a direct check)"
     print_colored(f"[PrivEsc Critic] DIRECT ID CHECK: {str(direct_id)[:200]}", Colors.OKCYAN)
