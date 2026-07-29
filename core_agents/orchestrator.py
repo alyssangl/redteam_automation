@@ -340,6 +340,23 @@ def _execute_msf_console_commands(
     return _parse_msf_output(all_output, node, target_ip, log)
 
 
+# Phrases MSF emits when `use <module>` did NOT load a module (bogus/typo'd path).
+# The persistent console is SHARED across nodes, so a failed `use` leaves the
+# PRIOR node's module armed — a subsequent blind `run` then re-fires it and
+# fabricates a spurious "session opened" (the confirmed flaw_privesc false
+# success). Detect this and abort before set/run.
+_MSF_USE_FAILURE_PHRASES = (
+    "failed to load module",
+    "no results from search",
+)
+
+
+def _msf_use_load_failed(use_output: str) -> bool:
+    """True if a `use <module>` command's output shows the module did NOT load."""
+    low = (use_output or "").lower()
+    return any(p in low for p in _MSF_USE_FAILURE_PHRASES)
+
+
 def _execute_msf_module(
     node: AttackNode, graph: AttackGraph,
     log: logging.Logger, msf_session, preceding: list = None,
@@ -349,6 +366,10 @@ def _execute_msf_module(
     On retries, swap in alternative values from `module_options_alternatives`
     (or `payload_options_alternatives` if present) based on the current retry
     count. retries=0 → original options. retries=1 → alts[0]. etc.
+
+    The `use` is VALIDATED before any set/run: on the shared persistent console a
+    failed `use` would otherwise leave the prior node's module armed and let `run`
+    re-fire it into a bogus success (B1/B2).
     """
     target_ip = node.target_ip or graph.target_ip
 
@@ -388,37 +409,72 @@ def _execute_msf_module(
                     log.info(f"  [direct] F4: overriding {k}={effective_module_options[k]} → {real_sid} (actual session)")
                     effective_module_options[k] = real_sid
 
-    # Build command sequence from effective options
-    cmds = [f"use {node.module}"]
+    # Execute the sequence, capturing output as we go so we can ABORT the moment
+    # `use` fails (before any set/run re-fires a stale module).
+    all_output = ""
+
+    def _emit(cmd: str) -> str:
+        nonlocal all_output
+        log.info(f"  [direct] > {cmd}")
+        try:
+            out = msf_session.send_command(cmd, timeout=120)
+        except Exception as e:  # bounded MSF connect timed out / RPC error -> fail cleanly
+            out = f"(msf command failed: {e})"
+            log.warning(f"  [direct] send_command failed: {e}")
+        node.add_command(cmd, tool="msf_console", output=out, target="msf_console")
+        all_output += out + "\n"
+        preview = out.strip()[:300]
+        if preview:
+            log.info(f"  [direct]   {preview}")
+        return out
+
+    # (B1/B2 b) Clear any module the SHARED console still has armed from a prior
+    # node. Without this, a failed `use` below would silently inherit that module
+    # and `run` would fire it.
+    try:
+        msf_session.send_command("back", timeout=30)
+    except Exception as e:
+        log.warning(f"  [direct] console reset (back) failed: {e}")
+
+    # (B1/B2 a) Load the module, then VALIDATE it actually loaded before set/run.
+    use_out = _emit(f"use {node.module}")
+    if _msf_use_load_failed(use_out):
+        log.warning(
+            f"  [direct] `use {node.module}` FAILED to load — aborting before "
+            f"set/run (a stale armed module on the shared console would otherwise "
+            f"re-fire and fabricate a session). Returning a clean failure so the "
+            f"direct→subagent recovery fallback can fire."
+        )
+        try:
+            msf_session.send_command("back", timeout=30)   # leave nothing armed
+        except Exception:
+            pass
+        return {
+            "success": False,
+            "target_ip": target_ip,
+            "exploit_used": node.module,
+            "session_id": "",
+            "session_type": "",
+            "access_level": "unknown",
+            "summary": (f"Module failed to load in MSF: {node.module} "
+                        f"(not a valid/available module path)"),
+            "failure_category": "module_load_failed",
+            "failure_cause": (use_out or "").strip()[:200],
+        }
+
+    # Module loaded — set options and run.
     for k, v in effective_module_options.items():
-        cmds.append(f"set {k} {v}")
+        _emit(f"set {k} {v}")
     if effective_payload:
-        cmds.append(f"set PAYLOAD {effective_payload}")
+        _emit(f"set PAYLOAD {effective_payload}")
     # Always set LHOST/LPORT/etc. from payload_options so the module's
     # default payload (when no explicit PAYLOAD is set) still gets our
     # values -- otherwise MSF binds LHOST to 127.0.0.1 and the reverse
     # handler never sees the callback. Fixes Stage 4 v1/v2's 70+ "binding
     # to a loopback address" warnings.
     for k, v in effective_payload_options.items():
-        cmds.append(f"set {k} {v}")
-    cmds.append("run")
-
-    # Execute each command
-    all_output = ""
-    for cmd in cmds:
-        log.info(f"  [direct] > {cmd}")
-        try:
-            output = msf_session.send_command(cmd, timeout=120)
-        except Exception as e:  # bounded MSF connect timed out / RPC error -> fail cleanly
-            output = f"(msf command failed: {e})"
-            log.warning(f"  [direct] send_command failed: {e}")
-        node.add_command(cmd, tool="msf_console", output=output, target="msf_console")
-        all_output += output + "\n"
-
-        # Log first 300 chars of output
-        preview = output.strip()[:300]
-        if preview:
-            log.info(f"  [direct]   {preview}")
+        _emit(f"set {k} {v}")
+    _emit("run")
 
     # Parse the combined output for results
     return _parse_msf_output(all_output, node, target_ip, log)
@@ -821,9 +877,39 @@ def _parse_msf_output(output: str, node: AttackNode, target_ip: str, log: loggin
         output, re.IGNORECASE,
     )
     if session_match:
+        stype = session_match.group(1).lower().replace(" ", "_")
+        sid = session_match.group(2)
+
+        # (B1/B2 c) A PRIVESC node must PROVE root — a bare "session opened" is not
+        # escalation. The shared console can re-fire a prior exploit and open a
+        # duplicate USER-level session (the confirmed flaw_privesc false success),
+        # and dispatch_node returns a direct success BEFORE the privesc stage critic
+        # runs, bypassing all grounding. So for a privilege-escalation node, require
+        # a uid=0 root proof in the SAME output; without it, FAIL the direct path so
+        # the node routes to the grounded privesc subagent instead of short-circuiting.
+        # A REAL local-exploit that opens a root session (uid=0 present) still passes.
+        is_privesc = (
+            node.agent_type == "privesc"
+            or (node.tactic or "").lower() == "privilege_escalation"
+        )
+        root_proven = bool(priv.get("is_root")) if priv else False
+        if is_privesc and not root_proven:
+            findings["success"] = False
+            findings["session_id"] = ""   # do NOT propagate a bogus escalated session
+            findings["session_type"] = ""
+            findings["summary"] = (
+                f"Privesc via {node.module} opened {stype} session {sid} but did NOT "
+                f"prove root (no uid=0) — not accepted as escalation; routing to the "
+                f"grounded privesc critic."
+            )
+            findings["failure_category"] = "privesc_unverified"
+            findings["failure_cause"] = "session opened without uid=0 root proof"
+            log.warning(f"  [direct] {findings['summary']}")
+            return findings
+
         findings["success"] = True
-        findings["session_type"] = session_match.group(1).lower().replace(" ", "_")
-        findings["session_id"] = session_match.group(2)
+        findings["session_type"] = stype
+        findings["session_id"] = sid
         findings["summary"] = (
             f"Session {findings['session_id']} ({findings['session_type']}) "
             f"opened on {target_ip} via {node.module}"
