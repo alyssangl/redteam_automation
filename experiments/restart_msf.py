@@ -31,8 +31,13 @@ def restart() -> bool:
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     c.connect(KALI, port=22, username=USER, password=PASS, timeout=10)
-    c.exec_command("pkill -f msfrpcd", timeout=15)
-    time.sleep(3)
+    # SIGKILL, not SIGTERM: a WEDGED msfrpcd ignores SIGTERM, so `pkill -f` left the
+    # old process holding port 55553 -> the relaunched daemon couldn't bind and every
+    # RPC connect wedged (observed recurring mid-eval, ~every other cell). -9 force-
+    # kills it; `fuser -k` frees the port if anything else lingers. Then wait for the
+    # port to actually release before relaunching.
+    c.exec_command("pkill -9 -f msfrpcd; fuser -k 55553/tcp 2>/dev/null", timeout=15)
+    time.sleep(5)
     # setsid => survives the SSH channel closing (nohup did not, reliably)
     c.exec_command(
         f"bash -lc 'setsid msfrpcd -P {PASS} -U {USER} >/tmp/msfrpcd.log 2>&1 </dev/null'",
