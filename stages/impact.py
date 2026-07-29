@@ -58,6 +58,13 @@ _MSF_WALLCLOCK_TIMEOUT = 90       # outer cap for tool_metasploit_rpc
 _MSF_SEND_TIMEOUT = 85            # inner send_command read-loop timeout
 _SESSION_WALLCLOCK_TIMEOUT = 20   # outer cap for a single session command
 
+# Whole-stage wall-clock time-box. The per-tool caps above bound any SINGLE
+# blocking call, but a flailing planner/executor/critic loop (many bounded calls
+# in a row) can still run long. Mirror stages/privesc.py's PRIVESC_WALLCLOCK_TIMEOUT
+# so a stuck impact stage terminates cleanly with best-effort findings instead of
+# grinding toward the per-cell cap.
+IMPACT_WALLCLOCK_TIMEOUT = 600    # seconds
+
 # =============================================================================
 # STATE
 # =============================================================================
@@ -1093,8 +1100,17 @@ def run_impact(
         print_colored(f"[Impact] Session health check failed: {e}", Colors.WARNING)
         # Try to continue anyway — the session might still work
 
+    _start = time.time()
+    _timed_out = False
     try:
         for event in app.stream(initial_state, config=config):
+            if time.time() - _start > IMPACT_WALLCLOCK_TIMEOUT:
+                print_colored(
+                    f"\n[Impact] TIME-BOX hit ({IMPACT_WALLCLOCK_TIMEOUT}s) — "
+                    f"stopping impact, returning best-effort findings.",
+                    Colors.WARNING)
+                _timed_out = True
+                break
             for key, value in event.items():
                 if not value or "messages" not in value:
                     continue
@@ -1140,6 +1156,11 @@ def run_impact(
     final_state = final_snapshot.values
 
     findings = _extract_impact_findings(final_state)
+    if _timed_out and not findings.get("success"):
+        findings["summary"] = (
+            f"Impact time-boxed at {IMPACT_WALLCLOCK_TIMEOUT}s without a verified "
+            f"result. " + findings.get("summary", "")
+        )
 
     print_colored(f"\n{'='*60}", Colors.HEADER)
     print_colored(
