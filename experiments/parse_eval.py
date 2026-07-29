@@ -414,11 +414,24 @@ def evaluate_run(log_path: Path, cp_path: Path) -> dict:
         # row (it will carry confounded=True and be excluded downstream).
         cp = {}
 
+    # Per-cell stdout capture (run_matrix writes <tag>.stdout): the stages'
+    # print()/print_colored ground-truth (DIRECT ID CHECK / grounded target output /
+    # docker rootbash probe / impact proof read-back) lands here, NOT in the
+    # timestamped FileHandler .log — so for SUBAGENT-run privesc/impact nodes the
+    # raw root/proof token is only here. Fold it into the GROUNDING evidence only
+    # (NOT _parse_log, whose findall counts would double). Without this a genuine
+    # docker/kernel root on a subagent node is conservatively mis-scored false_success.
+    evidence_text = text
+    stdout_path = log_path.with_suffix(".stdout")
+    if stdout_path.exists():
+        evidence_text = text + "\n" + stdout_path.read_text(
+            encoding="utf-8", errors="replace")
+
     scenario, variant, rep = _identity(log_path, cp)
     row = {"scenario": scenario, "variant": variant, "rep": rep,
            "log": log_path.name}
-    row.update(_parse_log(text))
-    row.update(_parse_checkpoint(cp, text))
+    row.update(_parse_log(text))                        # markers/counts: .log ONLY
+    row.update(_parse_checkpoint(cp, evidence_text))   # grounding: + stdout evidence
 
     # Fold the structural recon/root-failure signal into `confounded` (the log
     # parser already OR'd in its own recon-fail line). Keeping both makes the

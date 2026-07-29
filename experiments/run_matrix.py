@@ -190,10 +190,20 @@ def _spawn_cell(scenario: str, variant: str, rep: int,
         "--target", target, "--attacker", attacker,
     ]
     tag = _run_tag(scenario, variant, rep)
+    stdout_path = EVAL_DIR / f"{tag}.stdout"
     print(f"\n=== CELL {tag} (timeout {timeout}s) ===", flush=True)
     started = time.time()
+    # Capture the cell's full stdout+stderr per-cell. It carries the stages'
+    # print()/print_colored GROUND-TRUTH (DIRECT ID CHECK / grounded target output /
+    # docker rootbash probe / impact proof read-back) that the orchestrator's
+    # timestamped FileHandler .log does NOT — parse_eval folds this into the
+    # GROUNDING evidence so SUBAGENT-run privesc/impact nodes can be independently
+    # grounded (else a real docker root is mis-scored false_success). Tail this file
+    # to watch a cell live.
     try:
-        r = subprocess.run(cmd, env=env, timeout=timeout, cwd=str(ROOT))
+        with open(stdout_path, "w", encoding="utf-8", errors="replace") as _fh:
+            r = subprocess.run(cmd, env=env, timeout=timeout, cwd=str(ROOT),
+                               stdout=_fh, stderr=subprocess.STDOUT)
         return "ok" if r.returncode == 0 else f"exit{r.returncode}"
     except subprocess.TimeoutExpired:
         print(f"[timeout] {tag} exceeded {timeout}s — preserving partial log as "
