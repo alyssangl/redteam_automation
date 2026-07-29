@@ -324,7 +324,11 @@ def _execute_msf_console_commands(
     for template in node.commands_to_run:
         cmd = _render_command(template, params)
         log.info(f"  [direct] msf> {cmd}")
-        output = msf_session.send_command(cmd, timeout=120)
+        try:
+            output = msf_session.send_command(cmd, timeout=120)
+        except Exception as e:  # bounded MSF connect timed out / RPC error -> fail cleanly
+            output = f"(msf command failed: {e})"
+            log.warning(f"  [direct] send_command failed: {e}")
         node.add_command(cmd, tool="msf_console", output=output, target="msf_console")
         all_output += output + "\n"
 
@@ -402,7 +406,11 @@ def _execute_msf_module(
     all_output = ""
     for cmd in cmds:
         log.info(f"  [direct] > {cmd}")
-        output = msf_session.send_command(cmd, timeout=120)
+        try:
+            output = msf_session.send_command(cmd, timeout=120)
+        except Exception as e:  # bounded MSF connect timed out / RPC error -> fail cleanly
+            output = f"(msf command failed: {e})"
+            log.warning(f"  [direct] send_command failed: {e}")
         node.add_command(cmd, tool="msf_console", output=output, target="msf_console")
         all_output += output + "\n"
 

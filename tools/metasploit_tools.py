@@ -298,12 +298,37 @@ class _LazyMsfSession:
         password=os.getenv("MSF_PASS", "kali"),
     )
 
+    # First MSF use lazily connects: MsfRpcClient(...) + consoles.console() are
+    # synchronous RPC calls with NO timeout, so a slow/wedged msfrpcd hangs the
+    # whole run at first use (observed: a cell froze 40 min at the first
+    # `use exploit/...`). Bound the connect on a daemon thread so it fails fast
+    # instead of burning the per-cell cap. Override via MSF_CONNECT_TIMEOUT.
+    _CONNECT_TIMEOUT = int(os.getenv("MSF_CONNECT_TIMEOUT", "60"))
+
     def __init__(self):
         self._real = None
 
     def _ensure(self):
         if self._real is None:
-            self._real = MetasploitSession(**self._CFG)
+            box: dict = {}
+            done = threading.Event()
+
+            def _connect():
+                try:
+                    box["s"] = MetasploitSession(**self._CFG)
+                except Exception as e:  # noqa: BLE001
+                    box["e"] = e
+                finally:
+                    done.set()
+
+            threading.Thread(target=_connect, daemon=True).start()
+            if not done.wait(timeout=self._CONNECT_TIMEOUT):
+                raise RuntimeError(
+                    f"MSF connect/console-create exceeded {self._CONNECT_TIMEOUT}s "
+                    f"(msfrpcd wedged/slow) — failing fast instead of hanging")
+            if "e" in box:
+                raise box["e"]
+            self._real = box["s"]
         return self._real
 
     def __getattr__(self, name):
