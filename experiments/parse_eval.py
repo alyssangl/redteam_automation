@@ -131,6 +131,70 @@ def _privesc_grounded(node: dict, log_text: str) -> bool:
         _root_proof_in_log(log_text)
 
 
+# --- impact proof-marker read-back (C1) --------------------------------------
+#
+# An impact success is grounded ONLY if the proof marker it WROTE was actually
+# READ BACK off the target — never on `findings['output']` being present (only
+# direct-exec sets it) and never on the substring "pwned" (goal_only embeds
+# /tmp/pwned_goalonly.txt in the objective, so EVERY impact summary carried it).
+# The expected marker is derived from the actual write command, then required to
+# appear in a read-back command's OUTPUT.
+_READBACK_CMD = re.compile(
+    r"^\s*(?:sudo\s+)?(?:cat|ls|head|tail|stat|xxd|strings|od|grep|less|more)\b",
+    re.IGNORECASE)
+# echo/printf '<literal>' > file   (a quoted literal we can later match verbatim)
+_WRITE_LITERAL = re.compile(
+    r"""(?:echo|printf)\s+(?:-\w+\s+)*(['"])(.+?)\1\s*>>?""", re.IGNORECASE)
+
+
+def _add_marker(markers: set, raw: str) -> None:
+    """Keep a written literal only if it is a stable, matchable marker: no shell
+    expansion (its value would differ between write and read-back) and long
+    enough not to match by accident."""
+    s = (raw or "").strip()
+    if len(s) >= 4 and "$(" not in s and "`" not in s and "${" not in s:
+        markers.add(s)
+
+
+def _impact_write_markers(node: dict, log_text: str) -> set:
+    """Proof-marker literals this run WROTE (from structured commands + the
+    orchestrator's `[direct] session(N)> echo '...' > file` log lines)."""
+    markers: set = set()
+    for c in (node.get("commands") or []):
+        for m in _WRITE_LITERAL.finditer(str(c.get("command") or "")):
+            _add_marker(markers, m.group(2))
+    for line in (log_text or "").splitlines():
+        if "[direct]" in line and "session(" in line:  # a command echo, i.e. a write
+            for m in _WRITE_LITERAL.finditer(line):
+                _add_marker(markers, m.group(2))
+    return markers
+
+
+def _impact_grounded(node: dict, log_text: str) -> bool:
+    """Independent proof for an impact success: a marker we WROTE was READ BACK.
+
+    Grounded IFF some written marker literal appears in the OUTPUT of a read-back
+    command — either a `commands[]` read record (direct-exec) or a `[direct]`
+    output-continuation line in the log (which, unlike the write echo, has no
+    `session(` command prefix). No write, or no read-back of it -> false success.
+    """
+    markers = _impact_write_markers(node, log_text)
+    if not markers:
+        return False
+    for c in (node.get("commands") or []):
+        if _READBACK_CMD.match(str(c.get("command") or "")):
+            out = str(c.get("output") or "")
+            if any(mk in out for mk in markers):
+                return True
+    for line in (log_text or "").splitlines():
+        # a [direct] OUTPUT line (no `session(` => not the command echo, and we
+        # skip the self-reported findings JSON line so grounding stays independent)
+        if "[direct]" in line and "session(" not in line and "findings" not in line:
+            if any(mk in line for mk in markers):
+                return True
+    return False
+
+
 def _grounded(node: dict, log_text: str = "") -> bool:
     """Does this SUCCEEDED node carry INDEPENDENT proof it worked, per its stage?
 
@@ -159,9 +223,13 @@ def _grounded(node: dict, log_text: str = "") -> bool:
         if f.get("technique_exhausted") or f.get("direct_attempt_failed") and not f.get("session_id"):
             return False
         return bool(f.get("method")) and bool(f.get("success"))
-    if atype in ("impact", "session", "discovery"):
-        # Ground truth = real command output / a read-back proof marker.
-        return bool(f.get("output")) or "pwned" in summary or bool(f.get("proof"))
+    if atype == "impact":
+        # INDEPENDENT: the written proof marker was READ BACK from the target.
+        # NOT findings['output'] presence, NOT the "pwned" objective wording.
+        return _impact_grounded(node, log_text)
+    if atype in ("session", "discovery"):
+        # Not part of the false_success money-metric; light findings check kept.
+        return bool(f.get("output")) or bool(f.get("proof"))
     # Unknown stage: fall back to any concrete evidence at all.
     return bool(f.get("output") or f.get("session_id") or f.get("ports"))
 

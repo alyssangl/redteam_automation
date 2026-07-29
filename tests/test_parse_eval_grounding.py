@@ -122,6 +122,91 @@ def test_exploit_grounding_unchanged():
     assert _grounded(node_none, "") is False
 
 
+# =============================================================================
+# IMPACT (C1) — ground only on a proof marker READ BACK, never on output/"pwned"
+# =============================================================================
+
+def test_impact_false_success_no_readback():
+    """success but the marker was WRITTEN and never read back (echo exits 0 even
+    on a permission error). Old code grounded it (findings.output present / the
+    'pwned' objective wording); new code must flag it false_success."""
+    node = {
+        "id": "file_drop", "agent_type": "impact", "status": "success",
+        "findings": {"success": True,
+                     "output": "(no output)", "summary": "wrote /tmp/pwned_x.txt"},
+        "summary": "Executed 1 command(s) on target",
+        "commands": [{"command": "echo 'PWNED marker 42' > /tmp/pwned_x.txt",
+                      "output": "(no output)"}],
+    }
+    assert _grounded(node, "") is False
+    row = _parse_checkpoint(_cp({"file_drop": node}), "")
+    assert row["false_success"] is True
+
+
+def test_impact_real_success_marker_read_back_in_commands():
+    """The written marker appears in a cat read-back output -> grounded."""
+    node = {
+        "id": "file_drop", "agent_type": "impact", "status": "success",
+        "findings": {"success": True, "output": "PWNED marker 42\n"},
+        "summary": "wrote and verified",
+        "commands": [
+            {"command": "echo 'PWNED marker 42' > /tmp/pwned_x.txt",
+             "output": "(no output)"},
+            {"command": "cat /tmp/pwned_x.txt", "output": "PWNED marker 42"},
+        ],
+    }
+    assert _grounded(node, "") is True
+    row = _parse_checkpoint(_cp({"file_drop": node}), "")
+    assert row["false_success"] is False
+
+
+def test_impact_real_success_marker_read_back_in_log():
+    """Subagent/direct impact whose read-back is only in the run log: the marker
+    rides a [direct] OUTPUT line (no session( prefix) -> grounded."""
+    node = {"id": "file_drop", "agent_type": "impact", "status": "success",
+            "findings": {"success": True}, "summary": "proof dropped",
+            "commands": []}
+    log = (
+        "11:34:06 [INFO]   [direct] session(1)> echo 'PWNED via chain' > /tmp/p.txt\n"
+        "11:34:06 [INFO]   [direct] session(1)> cat /tmp/p.txt\n"
+        "11:34:07 [INFO]   [direct]   PWNED via chain\n"
+    )
+    assert _grounded(node, log) is True
+
+
+def test_impact_write_echo_in_log_without_readback_not_grounded():
+    """Only the write echo is in the log (no output line echoing it back) ->
+    not grounded: an echo that exited 0 is not proof the file exists."""
+    node = {"id": "file_drop", "agent_type": "impact", "status": "success",
+            "findings": {"success": True}, "summary": "claimed", "commands": []}
+    log = ("11:34:06 [INFO]   [direct] session(1)> echo 'PWNED via chain' "
+           "> /root/p.txt\n")
+    assert _grounded(node, log) is False
+
+
+def test_impact_pwned_in_summary_alone_does_not_ground():
+    """The 'pwned' objective wording in the summary must NOT ground on its own."""
+    node = {"id": "file_drop", "agent_type": "impact", "status": "success",
+            "findings": {"success": True},
+            "summary": "objective: drop /tmp/pwned_goalonly.txt then verify",
+            "commands": []}
+    assert _grounded(node, "") is False
+
+
+def test_impact_marker_with_shell_expansion_not_used():
+    """A written value containing $(...) can't be matched verbatim on read-back,
+    so it is not treated as a marker -> not grounded from it alone."""
+    node = {"id": "file_drop", "agent_type": "impact", "status": "success",
+            "findings": {"success": True}, "summary": "date drop",
+            "commands": [
+                {"command": 'echo "Compromised at $(date)" >> /tmp/p.txt',
+                 "output": "(no output)"},
+                {"command": "cat /tmp/p.txt",
+                 "output": "Compromised at Mon Feb  9 23:26:38 UTC 2026"},
+            ]}
+    assert _grounded(node, "") is False
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":
