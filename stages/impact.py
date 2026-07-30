@@ -264,6 +264,88 @@ def _find_live_session_id(messages, target_ip: str):
             return sid
     return None
 
+
+_ALIVE_PROBE_NONCE = "__IMPACT_ALIVE_PROBE__"
+
+
+def _shell_responds(session_id, nonce: str = _ALIVE_PROBE_NONCE) -> bool:
+    """True iff the session actually RETURNS output for a trivial echo.
+
+    A fragile reverse_perl command_shell can degrade into a READ-ZOMBIE after a
+    heavy privesc breakout (docker/chroot writes a lot through it): still present
+    in session.list (so it *looks* alive), but every shell READ comes back empty.
+    Such a shell can never write-and-verify a proof file, so grounding correctly
+    refuses to confirm it and the stage grinds its whole budget for nothing. This
+    probe is the ground-truth "can I read from this shell at all?" check. Bounded
+    so a wedged write can never hang the stage. Mirrors
+    stages/persistence.py._shell_responds."""
+    out = _run_with_timeout(
+        msf_session.run_session_command,
+        args=(session_id, f"echo {nonce}"),
+        kwargs={"timeout": 20},
+        timeout=25,
+        on_timeout="",
+    )
+    return nonce in str(out or "")
+
+
+def _find_live_impact_session(target_ip: str, session_id: str, session_type: str):
+    """Return (sid, stype, status) for a RESPONSIVE session usable by impact.
+
+    Responsiveness — not mere presence in session.list — is what matters: the proof
+    file must be written AND read back, which a read-zombie cannot do.
+
+    - given session responds (or is a meterpreter — reliable framed I/O)  → keep it
+    - else a DIFFERENT responsive session on target_ip                    → substitute
+    - else (None, None, reason)  → run_impact aborts with failure_category=
+      session_unusable, and the orchestrator re-exploits for a FRESH session.
+
+    Best-effort: if session.list itself errors (RPC hiccup, not a confirmed zombie),
+    proceed OPTIMISTICALLY with the given session rather than false-abort. Mirrors
+    stages/persistence.py._probe_session (minus the meterpreter upgrade)."""
+    # meterpreter has reliable framed I/O — it does not read-zombie like a raw shell.
+    if session_id and "meterpreter" in (session_type or "").lower():
+        return session_id, session_type, "alive"
+    if session_id and _shell_responds(session_id):
+        return session_id, session_type, "alive"
+
+    # Given shell is unresponsive — hunt for a live, responsive substitute.
+    try:
+        sessions = msf_session.client.call("session.list") or {}
+    except Exception as e:  # noqa: BLE001 — inconclusive probe: don't false-abort
+        print_colored(
+            f"[Impact] session.list failed during probe ({e}) — proceeding with "
+            f"the given session optimistically.",
+            Colors.WARNING,
+        )
+        return session_id, session_type, "probe_inconclusive"
+
+    def _g(d, key, default=None):
+        return d.get(key.encode(), d.get(key, default))
+
+    for sid, details in sessions.items():
+        sid_str = str(sid)
+        if sid_str == str(session_id):
+            continue
+        host = _g(details, "session_host", _g(details, "target_host", b""))
+        if isinstance(host, bytes):
+            host = host.decode("utf-8", errors="ignore")
+        if target_ip and host and host != target_ip:
+            continue
+        raw_type = _g(details, "type", b"shell")
+        if isinstance(raw_type, bytes):
+            raw_type = raw_type.decode("utf-8", errors="ignore")
+        resolved_type = "meterpreter" if "meterpreter" in raw_type else "command_shell"
+        # A meterpreter substitute is trusted; a command_shell must actually respond
+        # (don't swap one read-zombie for another).
+        if resolved_type == "meterpreter" or _shell_responds(sid_str):
+            return sid_str, resolved_type, f"substituted_{sid_str}"
+
+    return None, None, (
+        f"session {session_id} is a read-zombie (listed but returns no output) and "
+        f"no live, responsive session to {target_ip} exists"
+    )
+
 # =============================================================================
 # SYSTEM PROMPTS
 # =============================================================================
@@ -1006,6 +1088,48 @@ def run_impact(
                 summary="Impact skipped — no live session found for target after live lookup.",
             )
 
+    # --- Session USABILITY probe (responsiveness, not just presence) ---
+    # A session can be LISTED in session.list yet be a read-zombie: a heavy privesc
+    # breakout (docker/chroot) can kill the fragile UnrealIRCd reverse_perl
+    # command_shell so writes land but reads return nothing. Such a shell cannot
+    # write-AND-verify a proof file — grounding (correctly) refuses to confirm the
+    # write, and the stage then grinds its whole budget. Probe RESPONSIVENESS up
+    # front and, if the given shell is a zombie, substitute a live one. If none
+    # exists, abort BEFORE building the graph with failure_category=session_unusable
+    # so the orchestrator re-exploits for a FRESH session (its light echo/cat proof
+    # commands survive a new shell) instead of the walker marking impact generically
+    # dead and non-terminating. Mirrors stages/persistence.py's pre-graph probe.
+    probed_id, probed_type, probe_status = _find_live_impact_session(
+        target_ip, session_id, session_type
+    )
+    if probed_id is None:
+        print_colored(
+            f"[Impact] {probe_status} — aborting before graph entry (session_unusable).",
+            Colors.FAIL,
+        )
+        # session_unusable => non-retryable: retrying the SAME node against the SAME
+        # dead session just re-aborts. The node dies; the orchestrator's
+        # session_unusable → re-exploit steer establishes a fresh session and revives
+        # this node onto it (see core_agents/orchestrator.py _replan_from).
+        return dict(ImpactFindings(
+            success=False,
+            actions=[],
+            summary=(
+                f"Impact aborted — no usable session to {target_ip} ({probe_status}). "
+                f"A fresh session must be re-established (re-exploit) before the "
+                f"proof-of-compromise file can be written and verified."
+            ),
+        ), failure_category="session_unusable")
+    if probed_id != session_id or probed_type != session_type:
+        print_colored(
+            f"[Impact] Using responsive session {probed_id} ({probed_type}) instead of "
+            f"requested {session_id} ({session_type}).",
+            Colors.WARNING,
+        )
+        session_id, session_type = probed_id, probed_type
+    else:
+        print_colored(f"[Impact] Session {session_id} confirmed responsive.", Colors.OKGREEN)
+
     workflow = build_graph()
     checkpointer = MemorySaver()
     app = workflow.compile(checkpointer=checkpointer)
@@ -1049,65 +1173,9 @@ def run_impact(
     print_colored(f"  Thread: {thread_id}", Colors.HEADER)
     print_colored(f"{'='*60}\n", Colors.HEADER)
 
-    # --- Session health check: verify session is still alive ---
-    # Wall-clock capped: a busy/wedged console must not block the stage on the
-    # very first call before any impact work begins.
-    try:
-        def _live_session_ids():
-            # F11: use the authoritative RPC session list. The console `sessions`
-            # output can be desync-contaminated (leftover output from a prior command)
-            # and misparsed as "not found", falsely skipping a live session. Format as
-            # newline-separated "<id> " so the line-anchored regex below still matches.
-            sl = msf_session.client.call('session.list') or {}
-            return "\n".join(
-                f"{k.decode() if isinstance(k, bytes) else k} " for k in sl.keys()
-            )
-        session_check = _run_with_timeout(
-            _live_session_ids,
-            args=(), kwargs={},
-            timeout=_MSF_WALLCLOCK_TIMEOUT,
-            on_timeout="(sessions list timed out)",
-        )
-        session_check_str = str(session_check)
-        # If the capped call timed out or errored, don't falsely declare the
-        # session dead — proceed optimistically and let the graph discover the
-        # truth (the executor's own session calls are individually capped too).
-        if session_check_str.strip() in ("(sessions list timed out)",) \
-                or session_check_str.startswith("(call failed:"):
-            print_colored(f"[Impact] Session health check inconclusive ({session_check_str[:80]}) — proceeding.", Colors.WARNING)
-        # Defect 3: explicit empty-session_id guard. re.escape('') is '' so the
-        # line-anchored pattern below collapses to r'(?m)^\s*\s' which matches
-        # ANY whitespace-containing line — trivially passing for empty IDs and
-        # baking session_id='' into state + every prompt. The Defect-1 fallback
-        # above normally resolves a real ID first; this guards the path where
-        # run_impact is called directly (e.g. a test harness) with no live
-        # session, so we never enter the graph with a broken session_id.
-        elif not str(session_id).strip():
-            print_colored(
-                "[Impact] Empty session_id and no live session found — skipping.",
-                Colors.WARNING,
-            )
-            return ImpactFindings(
-                success=False,
-                actions=[],
-                summary="Impact skipped — empty session_id and no live session found.",
-            )
-        # Line-anchored match: MSF `sessions` lists the ID as a standalone token
-        # at the start of a line ("3  shell ..."). A bare substring check would
-        # false-positive when session_id='3' but only sessions 13/30 are alive.
-        elif not re.search(r'(?m)^\s*' + re.escape(str(session_id)) + r'\s', session_check_str):
-            print_colored(f"[Impact] Session {session_id} NOT found in active sessions — skipping impact.", Colors.WARNING)
-            print_colored(f"[Impact] Active sessions output: {session_check_str[:300]}", Colors.WARNING)
-            return ImpactFindings(
-                success=False,
-                actions=[],
-                summary=f"Impact skipped — session {session_id} is no longer active.",
-            )
-        else:
-            print_colored(f"[Impact] Session {session_id} confirmed alive.", Colors.OKGREEN)
-    except Exception as e:
-        print_colored(f"[Impact] Session health check failed: {e}", Colors.WARNING)
-        # Try to continue anyway — the session might still work
+    # (Session usability was probed above, before graph construction — a read-zombie
+    # is caught there and surfaced as failure_category=session_unusable, so we do not
+    # re-check liveness here.)
 
     _start = time.time()
     _timed_out = False
