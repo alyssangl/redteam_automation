@@ -1878,6 +1878,63 @@ def _current_session_context(graph: AttackGraph) -> tuple[str, str]:
     return "unknown", "command_shell"
 
 
+def _reattach_session_unusable_nodes(
+    graph: AttackGraph, new_node: AttackNode, dead_nodes: set,
+    log: logging.Logger,
+) -> list:
+    """Re-attach + REVIVE post-exploitation node(s) that died with
+    failure_category=session_unusable onto a freshly-grown re-exploit node.
+
+    Those nodes failed because the SESSION was a dead/read-zombie, NOT because the
+    step was wrong — on a FRESH session their light commands succeed. But a dead
+    TERMINAL node (e.g. file_drop) has no successors to inherit (unlike the
+    grow_technique path), and a new_edge to a dead node is refused, so after the
+    re-exploit the objective would be silently abandoned. Here we wire the new
+    exploit node → each such dead node, drop it from dead_nodes, and reset it to
+    PENDING so the walker re-runs it. _find_session may still hand impact the stale
+    root session, but the impact stage's own responsiveness probe substitutes the
+    fresh session (see stages/impact.py _find_live_impact_session), so the revived
+    node grounds on the new shell. Mirrors grow_technique's successor re-parenting.
+
+    Mutates dead_nodes in place. Returns the list of revived node ids."""
+    revived: list = []
+    candidate_ids = set(dead_nodes or set()) | {
+        n.id for n in graph.nodes.values() if n.status == NodeStatus.FAILED.value
+    }
+    for nid in candidate_ids:
+        dn = graph.nodes.get(nid)
+        if not dn or dn.id == new_node.id:
+            continue
+        if (dn.findings or {}).get("failure_category") != "session_unusable":
+            continue
+        # Preserve the node's original inbound gate (e.g. a session_id-exists check)
+        # so the walker only advances onto it once the new node actually has a session.
+        checks: list = []
+        for ie in graph.incoming_edges(dn.id):
+            if ie.checks:
+                checks = list(ie.checks)
+                break
+        if not any(oe.target == dn.id for oe in graph.outgoing_edges(new_node.id)):
+            graph.connect(
+                new_node.id, dn.id,
+                checks=checks,
+                evidence=f"Replanner: re-run {dn.id} on the fresh session from {new_node.id}",
+                rationale=(f"{dn.id} failed only because its session was dead — "
+                           f"a fresh session revives it"),
+                condition="on_success",
+            )
+        if dead_nodes is not None:
+            dead_nodes.discard(dn.id)
+        dn.status = NodeStatus.PENDING.value
+        revived.append(dn.id)
+    if revived:
+        log.info(
+            f"[Replanner] Re-attached + revived session_unusable node(s) onto "
+            f"{new_node.id}: {sorted(revived)} (they re-run on the fresh session)"
+        )
+    return revived
+
+
 def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
                  dead_nodes: set = None) -> Optional[str]:
     """
@@ -2352,6 +2409,12 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
         log.info(
             f"[Replanner] NEW EDGE: {stuck_node_id} → {new_node.id} -- {rationale}"
         )
+        # session_unusable recovery: this re-exploit exists to REPLACE a dead session.
+        # If it opens one (it's an exploit module), re-attach + revive the post-ex
+        # node(s) that died on the corpse so they re-run on the fresh session — else a
+        # dead terminal node (file_drop) is orphaned and the objective abandoned.
+        if _session_unusable and new_node.module:
+            _reattach_session_unusable_nodes(graph, new_node, dead_nodes, log)
         return new_node.id
 
     elif action == "give_up":
