@@ -1037,6 +1037,12 @@ def _capabilities_from_findings(findings: dict) -> set:
 # capabilities rather than consuming one, so they are never session-gated.
 _POST_ACCESS_STAGES = {"privesc", "persistence", "impact", "discovery"}
 
+# Failure categories that are a CAPABILITY loss (the session died / a precondition
+# was unmet), NOT a technique failure. The graft (not a technique swap) repairs
+# these, and they must never blacklist the node's technique (T7 / experiment_plan
+# §3.5) — the technique was never at fault.
+_CAPABILITY_LOSS_CATEGORIES = {"session_unusable", "precondition_unmet"}
+
 
 def _required_capabilities(node) -> set:
     """pre(v): the capabilities a node needs before it can run.
@@ -1987,6 +1993,14 @@ def _failed_techniques(graph: AttackGraph, tactic: str) -> set:
         if not _is_tactic_node(n, tactic) or n.status == NodeStatus.SUCCESS.value:
             continue
         f = n.findings or {}
+        # T7 (blacklist correctness, experiment_plan.md §3.5): a CAPABILITY loss — the
+        # session died (session_unusable) or a precondition was unmet — is NOT a
+        # technique failure. The technique was never at fault; blacklisting it would
+        # stop the revived node from reusing the technique that works. Only a genuine
+        # technique failure writes to the tried set. Skip capability-loss nodes.
+        if (f.get("failure_category") in _CAPABILITY_LOSS_CATEGORIES) and \
+                not f.get("technique_exhausted"):
+            continue
         failed_signal = (
             n.status == NodeStatus.FAILED.value
             or f.get("failure_category")
