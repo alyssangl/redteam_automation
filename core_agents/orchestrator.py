@@ -1083,12 +1083,24 @@ def _session_alive(session_id, session_type: str = "") -> bool:
 
 def _world_capabilities(preceding: dict, session_alive_fn=_session_alive) -> set:
     """The LIVE world state s: capabilities actually held now (probed), NOT ever-held
-    (that is H). A session in findings that no longer responds is not in s."""
+    (that is H). A session in findings that no longer responds is not in s.
+
+    Holds `session` if ANY successful predecessor carries a session that is still
+    live — NOT just the single one _find_session would pick. This is essential right
+    after a graft: the orphaned node then has TWO predecessors (the dead original +
+    the fresh re-exploit), and the world genuinely still holds `session` via the live
+    one. Picking only the first/most-escalated could land on the DEAD session and
+    loop F=0 -> graft -> F=0 forever. The stage's own live-session resolver (e.g.
+    privesc._resolve_live_session_id) then runs on the fresh session."""
     caps: set = set()
-    sid, stype, level = _find_session(preceding)
-    if sid and session_alive_fn(sid, stype):
+    for pf in preceding.values():
+        if not pf.get("success"):
+            continue
+        sid = str(pf.get("session_id") or "")
+        if not sid or not session_alive_fn(sid, pf.get("session_type", "shell")):
+            continue
         caps.add("session")
-        lv = str(level or "").lower()
+        lv = str(pf.get("new_level") or pf.get("access_level") or "").lower()
         if lv and lv != "unknown":
             caps.add(f"session@{lv}")
             if _ACCESS_RANK.get(lv, 0) >= _ACCESS_RANK["root"]:

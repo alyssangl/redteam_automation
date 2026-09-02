@@ -63,6 +63,18 @@ def test_world_excludes_dead_session():
     caps = orch._world_capabilities(_preceding_with_session(), lambda sid, st="": False)
     assert caps == set()
 
+def test_world_holds_session_when_any_predecessor_is_live():
+    # REGRESSION (graft loop): after a graft the orphaned node has TWO predecessors
+    # — the DEAD original session and the FRESH re-exploit session. The world must
+    # still hold `session` via the live one; picking only the dead one loops F=0.
+    preceding = {
+        "gain": {"success": True, "session_id": "1", "access_level": "user"},   # killed
+        "reexploit": {"success": True, "session_id": "2", "access_level": "user"},  # fresh
+    }
+    alive = lambda sid, st="": sid == "2"   # only the re-exploit session is live
+    caps = orch._world_capabilities(preceding, alive)
+    assert "session" in caps
+
 
 # --- integration: _feasibility_gate over a real graph -----------------------
 
