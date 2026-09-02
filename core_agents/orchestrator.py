@@ -997,6 +997,38 @@ def _find_session(preceding: dict) -> tuple[str, str, str]:
     return best[1], best[2], best[3]
 
 
+def _capabilities_from_findings(findings: dict) -> set:
+    """Capability tokens a SUCCEEDED node established over the target.
+
+    Feeds the run's capability history H (GRAFT §3.2) — the set of capabilities
+    held at ANY point in the run, which the feasibility gate and failure classifier
+    read to tell a lost capability (in H -> `capability`, repaired by the graft)
+    from one never established (not in H -> `precondition`, repaired by re-order).
+
+    The alphabet is deliberately small and session-centric, matching the scenarios
+    the paper exercises: a live `session`, its privilege level `session@<level>`
+    (plus `root` when escalated), and any proof `artifact` written. Derived ONLY
+    from concrete finding fields (session_id / access_level / new_level / written
+    file), never from the agent's prose — H must be as trustworthy as grounding.
+    """
+    caps: set = set()
+    f = findings or {}
+    if not f.get("success"):
+        return caps
+    sid = str(f.get("session_id") or "")
+    if sid:
+        caps.add("session")
+        level = str(f.get("new_level") or f.get("access_level") or "").lower()
+        if level and level != "unknown":
+            caps.add(f"session@{level}")
+            if _ACCESS_RANK.get(level, 0) >= _ACCESS_RANK["root"]:
+                caps.add("root")
+    tf = f.get("target_file") or (f.get("metadata") or {}).get("target_file")
+    if tf:
+        caps.add(f"artifact:{tf}")
+    return caps
+
+
 def _find_recon(preceding: dict) -> tuple[dict, str, str]:
     """Find target_info, raw_nmap, os_info from preceding findings."""
     target_info = {}
@@ -2654,6 +2686,11 @@ def run_graph(
     log.info(f"  Checkpoint: {checkpoint_path}")
     log.info(f"{'='*70}")
 
+    # Capability history H (GRAFT §3.2): every capability held at ANY point in the
+    # run. Read by the feasibility gate / classifier to distinguish a LOST
+    # capability (in H -> graft) from one NEVER established (not in H -> re-order).
+    capability_history: set = set()
+
     # Track which edges we've tried (to avoid re-checking failed ones)
     tried_edges: set[str] = set()
     # Path stack for backtracking
@@ -2735,6 +2772,18 @@ def run_graph(
         )
 
         if success:
+            # Update capability history H with whatever this node established
+            # (session / privilege level / artifact). Monotonic: capabilities are
+            # recorded as EVER-held, so a later loss is still classifiable.
+            _new_caps = _capabilities_from_findings(node.findings)
+            if _new_caps - capability_history:
+                capability_history |= _new_caps
+                try:
+                    graph.metadata["capability_history"] = sorted(capability_history)
+                except Exception:
+                    pass
+                log.info(f"  [H] capabilities ever-held: {sorted(capability_history)}")
+
             # Post-node judge: even on success, judge can force escalation
             # (e.g. node nominally succeeded but didn't actually advance toward
             # the goal — false positive). If escalate, skip edge eval.
