@@ -109,9 +109,11 @@ def _table(rows: list[dict], flaw_only_recovery: bool = True) -> str:
         vrows = by_variant[variant]
         cells = [variant, str(len(vrows))]
         for key, _ in _RATE_METRICS:
-            # recovery is only defined on flaw_* scenarios; restrict its sample
+            # recovery is only defined on injected-fault scenarios (flaw_* technique
+            # failures + orphan_* capability losses); restrict its sample to those
             if key == "recovered" and flaw_only_recovery:
-                sample = [r for r in vrows if r["scenario"].startswith("flaw")]
+                sample = [r for r in vrows
+                          if r["scenario"].startswith(("flaw", "orphan"))]
             else:
                 sample = vrows
             cells.append(_fmt_rate([_as_bool(r[key]) for r in sample]) if sample else "-")

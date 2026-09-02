@@ -167,6 +167,13 @@ def _impact_write_markers(node: dict, log_text: str) -> set:
         if "[direct]" in line and "session(" in line:  # a command echo, i.e. a write
             for m in _WRITE_LITERAL.finditer(line):
                 _add_marker(markers, m.group(2))
+        # SUBAGENT path: the impact subagent writes via tool_session_command, whose
+        # write command rides in a "Calling Tool: tool_session_command ... command:
+        # echo '<marker>' > file" line (NOT a [direct] echo). Capture it too, else a
+        # genuine subagent write+read-back is mis-scored false_success (C5 threat).
+        elif "tool_session_command" in line:
+            for m in _WRITE_LITERAL.finditer(line):
+                _add_marker(markers, m.group(2))
     return markers
 
 
@@ -192,6 +199,12 @@ def _impact_grounded(node: dict, log_text: str) -> bool:
         if "[direct]" in line and "session(" not in line and "findings" not in line:
             if any(mk in line for mk in markers):
                 return True
+        # SUBAGENT path: the read-back (cat) OUTPUT is streamed as "[Tool Output]: ...".
+        # A written marker appearing in a tool OUTPUT line is independent read-back
+        # proof — tool outputs are captured target bytes, not the agent's prose (the
+        # write command's own line has no output; only a cat/ls read-back echoes it).
+        if "[Tool Output]" in line and any(mk in line for mk in markers):
+            return True
     return False
 
 
@@ -438,10 +451,12 @@ def evaluate_run(log_path: Path, cp_path: Path) -> dict:
     # exclusion robust to a truncated checkpoint OR a reworded summary line.
     row["confounded"] = bool(row.get("confounded")) or bool(row.pop("recon_confounded", False))
 
-    # derived: recovery is only meaningful on flaw_* scenarios
-    is_flaw = scenario.startswith("flaw")
+    # derived: recovery is only meaningful on injected-fault scenarios — the flaw_*
+    # (technique failure) AND orphan_* (capability loss) graphs. Both inject a break
+    # the run must recover from; a plain goal_only run has nothing to recover.
+    is_fault = scenario.startswith("flaw") or scenario.startswith("orphan")
     row["recovered"] = bool(
-        is_flaw and row["grounded_success"] and row["grown_node_success"]
+        is_fault and row["grounded_success"] and row["grown_node_success"]
     )
     # non-termination: never completed, or capped the replan budget without
     # actually reaching the objective.
