@@ -2754,6 +2754,7 @@ def run_graph(
     checkpoint_path: Optional[str] = None,
     explore: bool = False,
     use_judge: bool = True,
+    pre_node_hook: Optional[callable] = None,
 ) -> AttackGraph:
     """
     Walk an AttackGraph using backtracking depth-first traversal.
@@ -2871,8 +2872,19 @@ def run_graph(
                 log.info("[Orchestrator] Path exhausted — no more options.")
                 break
 
+        # Pre-node hook (eval-only fault injection; None in production). Fires just
+        # before the feasibility gate so a scenario can, e.g., destroy the session
+        # a node depends on — the gate then detects the loss. Never affects a
+        # production run (default None); errors are swallowed so a flaky injection
+        # can't crash the walker.
+        if pre_node_hook is not None:
+            try:
+                pre_node_hook(current, graph, log)
+            except Exception as _hook_e:  # noqa: BLE001
+                log.warning(f"  [pre_node_hook] error (ignored): {_hook_e}")
+
         # Feasibility gate F (GRAFT §3.1): BEFORE executing, check the node's
-        # required capabilities are actually held & live. A missing capability that
+        # required capabilities are actually live & held. A missing capability that
         # was EVER held (in H) is a capability LOSS -> mark it session_unusable so
         # the existing graft (revive + re-parent onto a fresh re-exploit) fires; one
         # never established is a precondition/mis-order. Only gates post-access

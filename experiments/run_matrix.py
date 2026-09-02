@@ -118,11 +118,19 @@ def _run_single(scenario: str, variant: str, rep: int,
     graph = builder(target_ip=target, attacker_ip=attacker)
     graph.save(str(checkpoint))
 
+    # Controlled fault injection: an orphan (capability-loss) scenario declares an
+    # external session kill in metadata["injection"]; wire it as run_graph's
+    # pre_node_hook. A no-injection graph produces a hook that never fires, so this
+    # is inert for the flaw_* / goal_only scenarios.
+    from experiments.fault_injection import make_session_kill_hook
+    pre_node_hook = make_session_kill_hook()
+
     run_graph(
         graph,
         checkpoint_path=str(checkpoint),
         explore=spec["explore"],
         use_judge=spec["judge"],
+        pre_node_hook=pre_node_hook,
     )
 
     # run_graph wrote its own timestamped file log to logs/<graph.name>_<ts>.log.
