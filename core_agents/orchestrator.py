@@ -1919,6 +1919,16 @@ def _expand_intent_to_node(
         intent_pay_opts = intent.get("payload_options")
         if isinstance(intent_pay_opts, dict):
             payload_options = {**payload_options, **intent_pay_opts}
+        # A re-provisioned command shell from the module's DEFAULT cmd/unix payload
+        # (cmd/unix/reverse_perl for the UnrealIRCd backdoor) is prone to becoming a
+        # READ-ZOMBIE — present in session.list but every read returns empty — which
+        # breaks the re-run of the orphaned objective (impact/privesc) on the fresh
+        # session. For unix/linux modules, pin the more robust cmd/unix/reverse_bash
+        # so the re-provisioned shell reads reliably. An explicit intent payload wins.
+        _mod_l = target_hint.lower()
+        payload = intent.get("payload")
+        if not payload and ("/unix/" in _mod_l or "/linux/" in _mod_l):
+            payload = "cmd/unix/reverse_bash"
         return AttackNode(
             id=nid,
             label=label,
@@ -1929,6 +1939,7 @@ def _expand_intent_to_node(
             tool_name="metasploit",
             module=target_hint,
             module_options=module_options,
+            payload=payload,
             payload_options=payload_options,
             max_retries=3,
             tags=["replanner_generated", "intent_expanded"],
