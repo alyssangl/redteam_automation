@@ -801,6 +801,39 @@ def critic_node(state: ReconState) -> dict:
 
     print_colored(f"[Recon Critic] Verdict: {verdict}", Colors.OKGREEN if verdict == "PASS" else Colors.FAIL)
 
+    # Salvage a usable scan at the retry-budget boundary. An explicit FAIL on the
+    # FINAL allowed retry that nonetheless produced a real target IP AND >=3 distinct
+    # open ports is almost always the critic being over-strict on a flaky-target run.
+    # Returning FAIL here makes run_recon report success=False, which makes the walker
+    # skip the ENTIRE downstream chain — a whole wasted matrix cell thrown away over a
+    # perfectly usable scan. (Without this, the hard-cap PASS-with-partial branch above
+    # is unreachable: route_after_critic ends the graph at loop_step>=MAX before critic
+    # is ever re-entered.) Scoped tightly so it cannot mask a genuinely empty scan:
+    # fires ONLY at the budget boundary and ONLY with >=3 real open ports. recon
+    # "success" means "usable scan data" — it is NOT part of the false_success
+    # money-metric, and downstream grounding still gates the real objective, so a
+    # lenient recon PASS cannot manufacture a false end-to-end success.
+    if verdict == "FAIL" and new_step >= MAX_RECON_RETRIES:
+        partial_info = _fallback_parse_target_info(scan_results)
+        if (len(partial_info.get("ports", [])) >= 3
+                and partial_info.get("ip") not in ("", "unknown")):
+            print_colored(
+                f"[Recon Critic] Retry budget reached with a usable scan "
+                f"({len(partial_info['ports'])} open ports on {partial_info['ip']}) "
+                f"despite a FAIL verdict — salvaging PASS-with-partial instead of "
+                f"failing the whole chain.",
+                Colors.WARNING,
+            )
+            return {
+                "messages": [AIMessage(content=(
+                    "[Recon Critic] PASS — salvaged partial findings at the retry "
+                    "budget (usable ports found despite an over-strict FAIL verdict)."
+                ))],
+                "loop_step": new_step,
+                "critic_verdict": "PASS",
+                "target_info": partial_info,
+            }
+
     if verdict == "PASS":
         # Extract target_info JSON from critic response
         target_info = parse_json_response(verdict_text)
