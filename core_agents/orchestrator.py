@@ -1029,6 +1029,96 @@ def _capabilities_from_findings(findings: dict) -> set:
     return caps
 
 
+# =============================================================================
+# Feasibility gate F (GRAFT §3.1) — pre-execution capability check
+# =============================================================================
+# Stages that operate OVER an established session, so their precondition includes
+# holding a live `session` capability. recon/exploit/initial_access establish
+# capabilities rather than consuming one, so they are never session-gated.
+_POST_ACCESS_STAGES = {"privesc", "persistence", "impact", "discovery"}
+
+
+def _required_capabilities(node) -> set:
+    """pre(v): the capabilities a node needs before it can run.
+
+    An explicit `metadata["preconditions"]` list wins (a graph may declare exact
+    pre(v)); otherwise inferred — post-access stages require a live `session`,
+    everything else requires nothing. Small and session-centric by design (matches
+    the scenarios the paper exercises)."""
+    explicit = (getattr(node, "metadata", None) or {}).get("preconditions")
+    if explicit:
+        return set(explicit)
+    if (node.agent_type or "").lower() in _POST_ACCESS_STAGES:
+        return {"session"}
+    return set()
+
+
+def _session_alive(session_id, session_type: str = "") -> bool:
+    """Ground-truth: is this session capability actually held RIGHT NOW?
+
+    Robust to BOTH ways a session can be lost: removed from session.list (stopped
+    /killed externally — the orphan scenario) OR present-but-a-read-zombie (returns
+    no output). meterpreter has reliable framed I/O. CONSERVATIVE: any RPC error is
+    inconclusive and returns True, so a probe hiccup never false-fails a live run —
+    only a POSITIVELY absent/unresponsive session reads as lost."""
+    if not session_id:
+        return False
+    try:
+        from tools.metasploit_tools import msf_session
+        sessions = msf_session.client.call("session.list") or {}
+    except Exception:
+        return True  # inconclusive RPC — don't false-fail a normal run
+    if str(session_id) not in {str(k) for k in sessions}:
+        return False  # removed/stopped — capability genuinely lost
+    if "meterpreter" in (session_type or "").lower():
+        return True
+    try:
+        nonce = "__FEAS_PROBE__"
+        out = msf_session.run_session_command(str(session_id), f"echo {nonce}",
+                                              timeout=20)
+        return nonce in str(out or "")   # empty -> read-zombie -> lost
+    except Exception:
+        return True  # inconclusive — assume alive
+
+
+def _world_capabilities(preceding: dict, session_alive_fn=_session_alive) -> set:
+    """The LIVE world state s: capabilities actually held now (probed), NOT ever-held
+    (that is H). A session in findings that no longer responds is not in s."""
+    caps: set = set()
+    sid, stype, level = _find_session(preceding)
+    if sid and session_alive_fn(sid, stype):
+        caps.add("session")
+        lv = str(level or "").lower()
+        if lv and lv != "unknown":
+            caps.add(f"session@{lv}")
+            if _ACCESS_RANK.get(lv, 0) >= _ACCESS_RANK["root"]:
+                caps.add("root")
+    return caps
+
+
+def _feasibility_decision(required: set, world: set, history: set):
+    """(feasible, missing, category). A missing capability that was EVER held (in H)
+    is a `capability` loss (-> graft); one never established is a `precondition`
+    (mis-order -> re-order). Empty pre(v) is always feasible."""
+    missing = set(required) - set(world)
+    if not missing:
+        return True, set(), ""
+    category = "capability" if (missing & set(history)) else "precondition"
+    return False, missing, category
+
+
+def _feasibility_gate(node, graph, history: set, log=None,
+                      session_alive_fn=_session_alive):
+    """Run F for a node against the live world state. Returns (feasible, missing,
+    category). Inert for nodes with no capability preconditions."""
+    required = _required_capabilities(node)
+    if not required:
+        return True, set(), ""
+    preceding = graph.gather_preceding_findings(node.id)
+    world = _world_capabilities(preceding, session_alive_fn)
+    return _feasibility_decision(required, world, set(history))
+
+
 def _find_recon(preceding: dict) -> tuple[dict, str, str]:
     """Find target_info, raw_nmap, os_info from preceding findings."""
     target_info = {}
@@ -2765,11 +2855,29 @@ def run_graph(
                 log.info("[Orchestrator] Path exhausted — no more options.")
                 break
 
-        # Execute the node
-        log.info(f"\n[Orchestrator] Executing node: {current} ({node.label})")
-        success, reason = _execute_node(
-            current, graph, log, explore, checkpoint_path, use_judge=use_judge,
-        )
+        # Feasibility gate F (GRAFT §3.1): BEFORE executing, check the node's
+        # required capabilities are actually held & live. A missing capability that
+        # was EVER held (in H) is a capability LOSS -> mark it session_unusable so
+        # the existing graft (revive + re-parent onto a fresh re-exploit) fires; one
+        # never established is a precondition/mis-order. Only gates post-access
+        # nodes, and is CONSERVATIVE (an inconclusive probe reads as feasible), so it
+        # never false-fails a normal run — F=0 only when a required session is
+        # positively absent or a read-zombie.
+        _feasible, _missing, _cat = _feasibility_gate(node, graph, capability_history, log)
+        if not _feasible:
+            log.warning(f"  [{current}] Feasibility gate F=0 — missing {sorted(_missing)} "
+                        f"({_cat}); routing to repair WITHOUT executing")
+            node.findings = dict(node.findings or {})
+            node.findings["failure_category"] = (
+                "session_unusable" if _cat == "capability" else "precondition_unmet")
+            node.status = NodeStatus.FAILED.value
+            success, reason = False, "feasibility"
+        else:
+            # Execute the node
+            log.info(f"\n[Orchestrator] Executing node: {current} ({node.label})")
+            success, reason = _execute_node(
+                current, graph, log, explore, checkpoint_path, use_judge=use_judge,
+            )
 
         if success:
             # Update capability history H with whatever this node established
