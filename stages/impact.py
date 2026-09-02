@@ -268,7 +268,8 @@ def _find_live_session_id(messages, target_ip: str):
 _ALIVE_PROBE_NONCE = "__IMPACT_ALIVE_PROBE__"
 
 
-def _shell_responds(session_id, nonce: str = _ALIVE_PROBE_NONCE) -> bool:
+def _shell_responds(session_id, nonce: str = _ALIVE_PROBE_NONCE,
+                    attempts: int = 3, settle: float = 2.0) -> bool:
     """True iff the session actually RETURNS output for a trivial echo.
 
     A fragile reverse_perl command_shell can degrade into a READ-ZOMBIE after a
@@ -278,15 +279,27 @@ def _shell_responds(session_id, nonce: str = _ALIVE_PROBE_NONCE) -> bool:
     refuses to confirm it and the stage grinds its whole budget for nothing. This
     probe is the ground-truth "can I read from this shell at all?" check. Bounded
     so a wedged write can never hang the stage. Mirrors
-    stages/persistence.py._shell_responds."""
-    out = _run_with_timeout(
-        msf_session.run_session_command,
-        args=(session_id, f"echo {nonce}"),
-        kwargs={"timeout": 20},
-        timeout=25,
-        on_timeout="",
-    )
-    return nonce in str(out or "")
+    stages/persistence.py._shell_responds.
+
+    RETRY + SETTLE: a JUST-opened reverse shell (e.g. one freshly re-provisioned by
+    a graft) frequently answers the FIRST echo empty because it has not settled —
+    the same shell reads fine a second later. A single probe would false-declare it
+    a read-zombie and abort the whole re-provisioned run. So we give it `attempts`
+    tries with a short `settle` sleep between, returning True on the first that
+    echoes back. A genuinely dead shell still fails all attempts (bounded)."""
+    for i in range(max(1, attempts)):
+        out = _run_with_timeout(
+            msf_session.run_session_command,
+            args=(session_id, f"echo {nonce}"),
+            kwargs={"timeout": 20},
+            timeout=25,
+            on_timeout="",
+        )
+        if nonce in str(out or ""):
+            return True
+        if i < attempts - 1:
+            time.sleep(settle)
+    return False
 
 
 def _find_live_impact_session(target_ip: str, session_id: str, session_type: str):
