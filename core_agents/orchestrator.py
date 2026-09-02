@@ -2000,6 +2000,24 @@ def _current_session_context(graph: AttackGraph) -> tuple[str, str]:
     return "unknown", "command_shell"
 
 
+def _session_unusable_present(graph: AttackGraph) -> bool:
+    """Is there a capability loss (a failed node marked session_unusable) that the
+    GRAFT should recover?
+
+    NO-GRAFT ablation: when the graft is disabled (EVAL_ENABLE_GRAFT=0) this reads
+    as absent even if such a node exists, so the replanner routes the capability
+    failure to the ordinary technique-substitute path instead of the re-exploit +
+    re-parent graft. That path cannot restore a lost session, so recovery collapses
+    — which is exactly what the FULL-vs-NO-GRAFT contrast measures."""
+    if not eval_flags.graft_enabled():
+        return False
+    return any(
+        (n.findings or {}).get("failure_category") == "session_unusable"
+        for n in graph.nodes.values()
+        if n.status == "failed"
+    )
+
+
 def _reattach_session_unusable_nodes(
     graph: AttackGraph, new_node: AttackNode, dead_nodes: set,
     log: logging.Logger,
@@ -2178,11 +2196,9 @@ def _replan_from(graph: AttackGraph, stuck_node_id: str, log: logging.Logger,
     # the whole menu against a corpse — observed live: cron→ssh_key→shell_profile all
     # failing on one zombie). Detect it so we steer to RE-EXPLOIT for a FRESH session
     # instead of the technique menu.
-    _session_unusable = any(
-        (n.findings or {}).get("failure_category") == "session_unusable"
-        for n in graph.nodes.values()
-        if n.status == "failed"
-    )
+    # Gated on graft_enabled() so the NO-GRAFT ablation routes a capability loss to
+    # the technique-substitute path instead (see _session_unusable_present).
+    _session_unusable = _session_unusable_present(graph)
 
     # dead_block (DEAD NODES guidance) is built AFTER tech_block below so it can be
     # session/technique-aware: a dead POST-exploitation node (persistence) means "try

@@ -38,8 +38,8 @@ _NUMERIC_METRICS = [
 ]
 
 # Preferred variant ordering for the table rows.
-_VARIANT_ORDER = ["v0_full", "v1_noreplan", "v2_nojudge", "v3_noground",
-                  "v4_nodeterm", "v5_norag", "v6_naive"]
+_VARIANT_ORDER = ["v0_full", "v_nograft", "v1_noreplan", "v2_nojudge",
+                  "v3_noground", "v4_nodeterm", "v5_norag", "v6_naive"]
 
 
 def _as_bool(v: str) -> float:

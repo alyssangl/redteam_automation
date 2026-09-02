@@ -57,6 +57,9 @@ DEFAULT_TIMEOUT = 40 * 60
 # defaults are ON, so V0 sets nothing. V6 is the naive single-loop baseline.
 VARIANTS: dict[str, dict] = {
     "v0_full":     {"explore": True,  "judge": True,  "env": {}},
+    # NO-GRAFT (GRAFT headline ablation): keeps replan/substitution but disables the
+    # capability-loss graft (revive + re-parent). Recovery on orphan scenarios -> 0.
+    "v_nograft":   {"explore": True,  "judge": True,  "env": {"EVAL_ENABLE_GRAFT": "0"}},
     "v1_noreplan": {"explore": True,  "judge": True,  "env": {"EVAL_ENABLE_REPLAN": "0"}},
     "v2_nojudge":  {"explore": True,  "judge": False, "env": {}},
     "v3_noground": {"explore": True,  "judge": True,  "env": {"EVAL_GROUND_SUCCESS": "0"}},

@@ -53,6 +53,16 @@ def replan_enabled() -> bool:
     return _flag("EVAL_ENABLE_REPLAN", True)
 
 
+def graft_enabled() -> bool:
+    """NO-GRAFT ablation (GRAFT paper, experiment_plan.md §3.4). Off -> the
+    capability branch of the repair (revive + re-parent a session_unusable node onto
+    a fresh re-exploit) is disabled, and a capability loss instead routes to the
+    ordinary technique-substitute path — which cannot restore a lost session, so
+    recovery on the orphan scenarios should collapse to zero. This is THE headline
+    ablation (FULL vs NO-GRAFT); keep the diff minimal so nothing else differs."""
+    return _flag("EVAL_ENABLE_GRAFT", True)
+
+
 def grounding_enabled() -> bool:
     return _flag("EVAL_GROUND_SUCCESS", True)
 
@@ -70,6 +80,8 @@ def active_ablations() -> list[str]:
     off = []
     if not replan_enabled():
         off.append("replan")
+    if not graft_enabled():
+        off.append("graft")
     if not grounding_enabled():
         off.append("grounding")
     if not deterministic_technique_enabled():
