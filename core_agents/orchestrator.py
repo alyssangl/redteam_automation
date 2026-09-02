@@ -1054,13 +1054,16 @@ def _required_capabilities(node) -> set:
 
 
 def _session_alive(session_id, session_type: str = "") -> bool:
-    """Ground-truth: is this session capability actually held RIGHT NOW?
+    """Ground-truth for the feasibility gate: is this session capability still HELD?
 
-    Robust to BOTH ways a session can be lost: removed from session.list (stopped
-    /killed externally — the orphan scenario) OR present-but-a-read-zombie (returns
-    no output). meterpreter has reliable framed I/O. CONSERVATIVE: any RPC error is
-    inconclusive and returns True, so a probe hiccup never false-fails a live run —
-    only a POSITIVELY absent/unresponsive session reads as lost."""
+    Scoped to capability LOSS = the session is gone from session.list (stopped /
+    killed externally — the orphan scenario). We deliberately do NOT echo-probe for
+    responsiveness here: a just-re-provisioned reverse shell often has not settled
+    and would answer an immediate echo empty, which would false-fail the gate and
+    loop F=0 -> graft forever. Read-zombie responsiveness is the STAGE's concern
+    (e.g. privesc._resolve_live_session_id / impact._find_live_impact_session), which
+    runs once the gate admits the node. meterpreter/anything present counts as held.
+    CONSERVATIVE: an RPC error is inconclusive and returns True (never false-fail)."""
     if not session_id:
         return False
     try:
@@ -1068,17 +1071,7 @@ def _session_alive(session_id, session_type: str = "") -> bool:
         sessions = msf_session.client.call("session.list") or {}
     except Exception:
         return True  # inconclusive RPC — don't false-fail a normal run
-    if str(session_id) not in {str(k) for k in sessions}:
-        return False  # removed/stopped — capability genuinely lost
-    if "meterpreter" in (session_type or "").lower():
-        return True
-    try:
-        nonce = "__FEAS_PROBE__"
-        out = msf_session.run_session_command(str(session_id), f"echo {nonce}",
-                                              timeout=20)
-        return nonce in str(out or "")   # empty -> read-zombie -> lost
-    except Exception:
-        return True  # inconclusive — assume alive
+    return str(session_id) in {str(k) for k in sessions}
 
 
 def _world_capabilities(preceding: dict, session_alive_fn=_session_alive) -> set:
@@ -1128,6 +1121,14 @@ def _feasibility_gate(node, graph, history: set, log=None,
         return True, set(), ""
     preceding = graph.gather_preceding_findings(node.id)
     world = _world_capabilities(preceding, session_alive_fn)
+    if log is not None:
+        seen = [(str((pf or {}).get("session_id")), session_alive_fn(
+                    str((pf or {}).get("session_id") or ""),
+                    (pf or {}).get("session_type", "shell")))
+                for pf in preceding.values()
+                if (pf or {}).get("success") and (pf or {}).get("session_id")]
+        log.info(f"  [F] {node.id}: required={sorted(required)} world={sorted(world)} "
+                 f"sessions(id,alive)={seen}")
     return _feasibility_decision(required, world, set(history))
 
 
