@@ -29,14 +29,13 @@ def _run_main(argv):
         sys.argv = orig_argv
 
 
-def test_paper_defaults_are_the_minimal_matrix():
-    assert run_eval.PAPER_SCENARIOS == ["flaw_persistence", "flaw_privesc"]
-    assert run_eval.PAPER_REPS == 5
-    # both contributions represented: replanner (flaw_persistence) + grounding floor
+def test_paper_defaults_are_the_graft_campaign():
+    # headline (capability loss) + control (technique failure), N=10
+    assert run_eval.PAPER_SCENARIOS == ["orphan_c", "flaw_privesc"]
+    assert run_eval.PAPER_REPS == 10
+    # the headline contrast: FULL vs NO-GRAFT
     assert "v0_full" in run_eval.PAPER_VARIANTS
-    assert "v1_noreplan" in run_eval.PAPER_VARIANTS
-    assert "v3_noground" in run_eval.PAPER_VARIANTS
-    assert "v6_naive" in run_eval.PAPER_VARIANTS
+    assert "v_nograft" in run_eval.PAPER_VARIANTS
 
 
 def test_every_default_variant_is_known():

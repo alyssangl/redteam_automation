@@ -50,10 +50,14 @@ sys.path.insert(0, str(ROOT))
 
 from experiments import run_matrix, parse_eval, build_table  # noqa: E402
 
-# The minimal matrix the paper needs (see module docstring).
-PAPER_SCENARIOS = ["flaw_persistence", "flaw_privesc"]
-PAPER_VARIANTS = ["v0_full", "v1_noreplan", "v3_noground", "v4_nodeterm", "v6_naive"]
-PAPER_REPS = 5
+# The GRAFT campaign grid (experiment_plan.md + live validation): the headline
+# contrast on the capability-loss scenario + the technique-failure control.
+#   orphan_c   — capability loss before a deterministic impact objective (headline)
+#   flaw_privesc — technique failure (control: FULL ~ NO-GRAFT, neither needs the graft)
+# Grounding variants (v3_noground / v6_naive) are an optional follow-up batch.
+PAPER_SCENARIOS = ["orphan_c", "flaw_privesc"]
+PAPER_VARIANTS = ["v0_full", "v_nograft"]
+PAPER_REPS = 10
 
 
 def _parse_phase(eval_dir: Path, csv_path: Path) -> int:
