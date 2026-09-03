@@ -190,27 +190,32 @@ def _threats_to_validity() -> str:
 def build_headline(rows: list[dict], all_rows: list[dict] | None = None) -> str:
     all_rows = all_rows if all_rows is not None else list(rows)
     discarded = sum(1 for r in all_rows if _is_confounded(r))
+    variants_present = sorted({r["variant"] for r in rows}, key=_variant_sort_key)
     out = ["# Ablation table\n",
            "_Rows = system variants, cols = metrics. Each cell = mean ± std over "
-           "all runs of that variant (scenarios × reps). Recovery is computed over "
-           "flaw_* scenarios only._\n",
+           "all runs of that variant, POOLED across scenarios × reps._\n",
+           "> **Read the per-scenario table (`eval_per_scenario.md`) for the "
+           "headline.** Recovery is only comparable WITHIN a scenario — pooling it "
+           "here mixes scenarios with different objectives (e.g. a deterministic "
+           "impact objective vs. a technique-failure control), so the pooled "
+           "recovery figure is diluted and not the number to quote.\n",
            f"_Source: {len(rows)} valid runs"
            + (f"; {discarded} confounded run(s) discarded (wedged-msfrpcd "
-              "timeouts, excluded per protocol — see the per-cell breakdown below)."
-              if discarded else ".") + "_\n",
+              "timeouts / recon-root failures, excluded per protocol — see the "
+              "per-cell breakdown below)." if discarded else ".") + "_\n",
            _table(rows),
            "\n\n## Reading it\n",
-           "- **v3_noground** should show **False success** spiking vs v0_full "
-           "(grounding is what suppresses unproven claims). False success is "
-           "re-derived from INDEPENDENT evidence (root token / proof-marker read "
-           "back), never the agent's own findings, and is scoped to privesc+impact.",
-           "- **v1_noreplan** should show **Recovery** collapsing (the replanner "
-           "is what restructures around the injected failure).",
-           "- **v4_nodeterm** should show **Non-termination** rising (deterministic "
-           "tried-tracking is what prevents technique loops).",
-           "- **v6_naive** is the external floor: no graph, judge, or replanner. It "
-           "is graded off the SAME independent evidence (its raw tool outputs), so "
-           "it cannot be grounded off a self-report V0 would be denied.\n",
+           "- **Recovery** is the headline metric for the graft — but read it "
+           "**per scenario** (above it is pooled). On a capability-loss (orphan_*) "
+           "scenario, **v0_full** should recover and **v_nograft** should not; on a "
+           "technique-failure (flaw_*) control the two should behave alike.",
+           "- **False success** is re-derived from INDEPENDENT evidence (a root "
+           "token / a proof-marker read back off the target), never the agent's own "
+           "findings, and is scoped to privesc+impact. Grounded variants hold it at "
+           "0; a grounding-OFF variant (v3_noground / v6_naive) is where it spikes.",
+           "- **Non-termination** is capped by the replan budget; deterministic "
+           "tried-tracking is what keeps it low.\n",
+           f"_Variants in this run: {', '.join(variants_present)}._\n",
            _exclusion_section(all_rows),
            "\n",
            _threats_to_validity()]
