@@ -190,6 +190,24 @@ def tool_metasploit_rpc(command: str):
     **CRITICAL** 6. After obtaining a reverse shell session, you should ALWAYS run
        'exit' command to put the session in background.
     """
+    # GUARD: `sessions -i <id>` attaches the PERSISTENT console to a session
+    # interactively — it never returns a prompt, so the shared console wedges for the
+    # rest of the run (every later RPC hits a stuck console -> MSF_CONSOLE_WEDGED ->
+    # the whole cell confounds). This is the #1 console-wedge cause, and it hits the
+    # naive baseline (which drives the console freely) hardest. Block just the
+    # interactive-attach form and steer to the atomic session API. Non-interactive
+    # session verbs (sessions, sessions -l, -c '<cmd>', -K, -u) are untouched.
+    import re as _re
+    if _re.search(r"\bsessions\s+-i\b", command):
+        m = _re.search(r"\bsessions\s+-i\s+(\d+)", command)
+        sid = m.group(1) if m else "<id>"
+        return (
+            "BLOCKED: `sessions -i` opens an INTERACTIVE console attach that wedges "
+            "the shared Metasploit console for the rest of the run. To run a command "
+            f"on that session, use tool_session_command(\"{sid}\", \"<command>\") "
+            "instead — it is atomic and returns output directly. (Or `sessions -c "
+            "'<command>' -i " + sid + "` for a one-shot console command.)"
+        )
     try:
         return msf_session.send_command(command)
     except Exception as e:
