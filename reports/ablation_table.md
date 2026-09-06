@@ -4,11 +4,11 @@ _Rows = system variants, cols = metrics. Each cell = mean ± std over all runs o
 
 > **Read the per-scenario table (`eval_per_scenario.md`) for the headline.** Recovery is only comparable WITHIN a scenario — pooling it here mixes scenarios with different objectives (e.g. a deterministic impact objective vs. a technique-failure control), so the pooled recovery figure is diluted and not the number to quote.
 
-_Source: 44 valid runs; 2 confounded run(s) discarded (wedged-msfrpcd timeouts / recon-root failures, excluded per protocol — see the per-cell breakdown below)._
+_Source: 38 valid runs; 2 confounded run(s) discarded (wedged-msfrpcd timeouts / recon-root failures, excluded per protocol — see the per-cell breakdown below)._
 
 | Variant | N | Grounded success | False success | Recovery (flaw_*) | Non-termination | Replan edits | Wall secs |
 |---|---|---|---|---|---|---|---|
-| v0_full | 24 | 71% ± 46 | 0% ± 0 | 39% ± 50 | 29% ± 46 | 1.4 ± 0.8 | 1039.8 ± 414.2 |
+| v0_full | 18 | 83% ± 38 | 0% ± 0 | 44% ± 51 | 17% ± 38 | 1.4 ± 0.8 | 1049.1 ± 452.2 |
 | v_nograft | 20 | 40% ± 50 | 0% ± 0 | 0% ± 0 | 10% ± 31 | 1.2 ± 0.9 | 997.0 ± 521.2 |
 
 
@@ -22,14 +22,11 @@ _Variants in this run: v0_full, v_nograft._
 
 ## Confounded / excluded cells
 
-_2 of 46 run(s) excluded as lab artifacts (wedged-msfrpcd timeouts, recon/root-node failures), shown per (scenario × variant). A reviewer should confirm the exclusions are NOT concentrated in the variant whose metric we claim (v3_noground for false_success)._
+_2 of 40 run(s) excluded as lab artifacts (wedged-msfrpcd timeouts, recon/root-node failures), shown per (scenario × variant). A reviewer should confirm the exclusions are NOT concentrated in the variant whose metric we claim (v3_noground for false_success)._
 
 | Scenario \ Variant | v0_full | v_nograft |
 |---|---|---|
-| baseline_impact | · | · |
-| flaw_persistence | · | · |
 | flaw_privesc | 2 | · |
-| orphan_a | · | · |
 | orphan_c | · | · |
 | **excluded / variant** | **2** | **0** |
 

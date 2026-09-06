@@ -1,6 +1,4 @@
 scenario,variant,rep,log,confounded,completed,success_rate,grounded_success,objective_node,false_success,false_success_nodes,recovered,replan_capped,non_termination,replan_edits,judge_continue,judge_adapt,judge_escalate,wall_secs,graph_status,cp_success_rate,grown_node_success
-baseline_impact,v0_full,0,baseline_impact__v0_full__r0.log,False,True,1.0,True,file_drop,False,,False,False,False,0,3,0,0,403,completed,1.0,False
-flaw_persistence,v0_full,0,flaw_persistence__v0_full__r0.log,False,True,0.8,True,file_drop,False,,True,False,False,1,4,0,0,1018,completed,0.8,True
 flaw_privesc,v0_full,0,flaw_privesc__v0_full__r0.log,False,True,1.0,True,file_drop,False,,False,False,False,1,3,0,1,1490,completed,1.0,False
 flaw_privesc,v0_full,1,flaw_privesc__v0_full__r1.log,False,True,1.0,True,file_drop,False,,False,False,False,1,3,0,1,1572,completed,1.0,False
 flaw_privesc,v0_full,2,flaw_privesc__v0_full__r2.log,True,True,0.5,False,file_drop,False,,False,True,True,0,2,0,0,1380,completed,0.5,False
@@ -21,10 +19,6 @@ flaw_privesc,v_nograft,6,flaw_privesc__v_nograft__r6.log,False,True,1.0,True,fil
 flaw_privesc,v_nograft,7,flaw_privesc__v_nograft__r7.log,False,True,1.0,True,file_drop,False,,False,False,False,1,3,0,1,1440,completed,1.0,False
 flaw_privesc,v_nograft,8,flaw_privesc__v_nograft__r8.log,False,True,1.0,True,file_drop,False,,False,False,False,1,3,0,1,1684,completed,1.0,False
 flaw_privesc,v_nograft,9,flaw_privesc__v_nograft__r9.log,False,True,1.0,True,file_drop,False,,False,False,False,1,3,0,1,1500,completed,1.0,False
-orphan_a,v0_full,0,orphan_a__v0_full__r0.log,False,True,0.75,False,escalate,False,,False,True,True,2,3,0,0,1186,completed,0.75,True
-orphan_a,v0_full,1,orphan_a__v0_full__r1.log,False,True,0.75,False,escalate,False,,False,True,True,2,3,0,0,1143,completed,0.75,True
-orphan_a,v0_full,2,orphan_a__v0_full__r2.log,False,True,0.75,False,escalate,False,,False,True,True,2,3,0,0,1153,completed,0.75,True
-orphan_a,v0_full,3,orphan_a__v0_full__r3.log,False,True,0.75,False,escalate,False,,False,True,True,2,3,0,0,1170,completed,0.75,True
 orphan_c,v0_full,0,orphan_c__v0_full__r0.log,False,True,1.0,True,file_drop,False,,True,False,False,2,4,0,0,557,completed,1.0,True
 orphan_c,v0_full,1,orphan_c__v0_full__r1.log,False,True,0.75,False,file_drop,False,,False,True,True,2,3,0,0,1209,completed,0.75,True
 orphan_c,v0_full,2,orphan_c__v0_full__r2.log,False,True,1.0,True,file_drop,False,,True,False,False,2,4,0,0,546,completed,1.0,True
