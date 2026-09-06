@@ -167,6 +167,23 @@ def _restart_msf() -> None:
         print(f"[warn] restart_msf failed (continuing): {e}", file=sys.stderr)
 
 
+def _restart_target() -> None:
+    """Best-effort snapshot-restore + reboot of the target VM before a cell.
+
+    The UnrealIRCd backdoor degrades under heavy use (an overnight batch confounded
+    19/20 cells once the target wedged). A clean snapshot per cell removes that
+    confounder. Non-fatal if VBoxManage / the VM is absent (e.g. containerized lab),
+    so the harness still runs where target-restore isn't available. Generous timeout
+    (restore + boot + wait-for-6667 ~ up to a few minutes)."""
+    try:
+        subprocess.run(
+            [sys.executable, str(ROOT / "experiments" / "restart_target.py")],
+            timeout=360, cwd=str(ROOT),
+        )
+    except Exception as e:
+        print(f"[warn] restart_target failed (continuing): {e}", file=sys.stderr)
+
+
 def _preserve_timeout_log(tag: str, since: float) -> None:
     """On a cell timeout the subprocess is killed before it can copy its own log,
     so the eval pair goes missing and the signal is lost. Copy the partial run
@@ -249,7 +266,7 @@ def _cell_done(scenario: str, variant: str, rep: int) -> bool:
 
 
 def _run_matrix(scenarios, variants, reps, target, attacker,
-                timeout, restart, skip_done=True) -> None:
+                timeout, restart, skip_done=True, restart_target=False) -> None:
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
     total = len(scenarios) * len(variants) * reps
     done = 0
@@ -265,6 +282,10 @@ def _run_matrix(scenarios, variants, reps, target, attacker,
                     results[tag] = "skip"
                     continue
                 print(f"\n########## [{done}/{total}] {tag} ##########", flush=True)
+                # Fresh target FIRST (snapshot-restore removes UnrealIRCd degradation),
+                # then a clean msfrpcd to talk to it.
+                if restart_target:
+                    _restart_target()
                 if restart:
                     _restart_msf()
                 status = _spawn_cell(scenario, variant, rep,
@@ -318,6 +339,9 @@ def main() -> int:
                     help="per-cell wall-clock ceiling (seconds)")
     ap.add_argument("--no-restart", action="store_true",
                     help="skip restart_msf before each cell")
+    ap.add_argument("--restart-target", action="store_true",
+                    help="snapshot-restore + reboot the target VM before each cell "
+                         "(removes UnrealIRCd degradation; needs VBoxManage + the VM)")
     ap.add_argument("--no-skip-done", action="store_true",
                     help="re-run cells even if a completed log already exists "
                          "(default: skip completed cells so the matrix is resumable)")
@@ -344,7 +368,8 @@ def main() -> int:
     _run_matrix(args.scenarios, args.variants, args.reps,
                 args.target, args.attacker, args.timeout,
                 restart=not args.no_restart,
-                skip_done=not args.no_skip_done)
+                skip_done=not args.no_skip_done,
+                restart_target=args.restart_target)
     return 0
 
 
