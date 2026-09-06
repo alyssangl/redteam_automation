@@ -265,12 +265,31 @@ def _cell_done(scenario: str, variant: str, rep: int) -> bool:
     return True
 
 
+def _cell_confounded(scenario: str, variant: str, rep: int) -> bool:
+    """True iff the just-run cell scored as a lab artifact (confounded). Used by the
+    live canary so a degrading lab halts the batch instead of silently producing
+    hours of unusable (excluded) data — the failure mode of the earlier overnight run."""
+    from experiments import parse_eval as _pe
+    tag = _run_tag(scenario, variant, rep)
+    log = EVAL_DIR / f"{tag}.log"
+    cp = EVAL_DIR / f"{tag}.json"
+    if not (log.exists() and cp.exists()):
+        return False
+    try:
+        row = _pe.evaluate_run(log, cp)
+        return bool(row.get("confounded"))
+    except Exception:
+        return False
+
+
 def _run_matrix(scenarios, variants, reps, target, attacker,
-                timeout, restart, skip_done=True, restart_target=False) -> None:
+                timeout, restart, skip_done=True, restart_target=False,
+                abort_after_confounded=0) -> None:
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
     total = len(scenarios) * len(variants) * reps
     done = 0
     results: dict[str, str] = {}
+    consecutive_confounded = 0
     for scenario in scenarios:
         for variant in variants:
             for rep in range(reps):
@@ -291,9 +310,34 @@ def _run_matrix(scenarios, variants, reps, target, attacker,
                 status = _spawn_cell(scenario, variant, rep,
                                      target, attacker, timeout)
                 results[tag] = status
+
+                # Live canary: watch for a degrading lab. A confounded cell is a lab
+                # artifact (recon/root fail, wedged msf/console, harness timeout); a
+                # RUN of them means the lab has gone bad and every further cell is
+                # wasted. Halt so we notice NOW, not after hours of excluded data.
+                if _cell_confounded(scenario, variant, rep):
+                    consecutive_confounded += 1
+                    print(f"  [canary] {tag} scored CONFOUNDED "
+                          f"({consecutive_confounded} in a row)", flush=True)
+                    if abort_after_confounded and \
+                            consecutive_confounded >= abort_after_confounded:
+                        print(f"\n!!!!!!!! ABORTING: {consecutive_confounded} "
+                              f"consecutive confounded cells — the lab is degraded. "
+                              f"Fix the lab and relaunch (completed cells are skipped). "
+                              f"!!!!!!!!", flush=True)
+                        results[tag] = "ABORT_CONFOUNDED"
+                        _print_matrix_summary(results)
+                        return
+                else:
+                    consecutive_confounded = 0
+    _print_matrix_summary(results)
+
+
+def _print_matrix_summary(results: dict) -> None:
     print("\n================ MATRIX COMPLETE ================")
     for tag, status in results.items():
         print(f"  {status:8s} {tag}")
+    n_conf = sum(1 for s in results.values() if s == "ABORT_CONFOUNDED")
     print(f"\nNext: python experiments/parse_eval.py --eval-dir logs/eval "
           f"-o eval_results.csv")
 
@@ -342,6 +386,9 @@ def main() -> int:
     ap.add_argument("--restart-target", action="store_true",
                     help="snapshot-restore + reboot the target VM before each cell "
                          "(removes UnrealIRCd degradation; needs VBoxManage + the VM)")
+    ap.add_argument("--abort-after-confounded", type=int, default=3,
+                    help="halt the batch after this many CONSECUTIVE confounded cells "
+                         "(a degraded lab); 0 disables. Default 3.")
     ap.add_argument("--no-skip-done", action="store_true",
                     help="re-run cells even if a completed log already exists "
                          "(default: skip completed cells so the matrix is resumable)")
@@ -369,7 +416,8 @@ def main() -> int:
                 args.target, args.attacker, args.timeout,
                 restart=not args.no_restart,
                 skip_done=not args.no_skip_done,
-                restart_target=args.restart_target)
+                restart_target=args.restart_target,
+                abort_after_confounded=args.abort_after_confounded)
     return 0
 
 
