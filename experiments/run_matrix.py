@@ -47,6 +47,49 @@ LOGS_DIR = ROOT / "logs"
 DEFAULT_TARGET = "192.168.34.7"
 DEFAULT_ATTACKER = os.getenv("LHOST", "192.168.34.6")
 
+# Single-batch lock. Two matrix PARENTS running at once write the SAME <tag> files
+# (checkpoint/log/stdout), silently contaminating each other's cells — the bug that
+# corrupted the grounding batch. The parent takes this lock; a second parent refuses
+# to start rather than overlap. (--single children don't lock; they're owned by a
+# parent that already holds it.)
+_LOCKFILE = EVAL_DIR / ".matrix.lock"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)          # signal 0 = existence check (POSIX + Windows via os)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+    except Exception:
+        return True              # can't tell -> assume alive (safer: refuse)
+
+
+def _acquire_lock() -> bool:
+    """Take the single-batch lock. False if another LIVE matrix parent holds it."""
+    EVAL_DIR.mkdir(parents=True, exist_ok=True)
+    if _LOCKFILE.exists():
+        try:
+            old = int(_LOCKFILE.read_text().strip() or "0")
+        except Exception:
+            old = 0
+        if old and old != os.getpid() and _pid_alive(old):
+            print(f"[lock] another matrix batch is already running (pid {old}). "
+                  f"Refusing to start a second — it would contaminate the same cell "
+                  f"files. Stop it first (or rm {_LOCKFILE} if it's stale).",
+                  file=sys.stderr)
+            return False
+    _LOCKFILE.write_text(str(os.getpid()))
+    return True
+
+
+def _release_lock() -> None:
+    try:
+        if _LOCKFILE.exists() and _LOCKFILE.read_text().strip() == str(os.getpid()):
+            _LOCKFILE.unlink()
+    except Exception:
+        pass
+
 # Per-cell wall-clock ceiling. A wedged msfrpcd shows a 120s-per-command
 # signature; a healthy full-chain run is ~15-25 min, so 40 min is a generous cap
 # that still catches a truly stuck cell.
@@ -412,12 +455,17 @@ def main() -> int:
         _dry_run(args.scenarios, args.variants, args.reps)
         return 0
 
-    _run_matrix(args.scenarios, args.variants, args.reps,
-                args.target, args.attacker, args.timeout,
-                restart=not args.no_restart,
-                skip_done=not args.no_skip_done,
-                restart_target=args.restart_target,
-                abort_after_confounded=args.abort_after_confounded)
+    if not _acquire_lock():
+        return 3
+    try:
+        _run_matrix(args.scenarios, args.variants, args.reps,
+                    args.target, args.attacker, args.timeout,
+                    restart=not args.no_restart,
+                    skip_done=not args.no_skip_done,
+                    restart_target=args.restart_target,
+                    abort_after_confounded=args.abort_after_confounded)
+    finally:
+        _release_lock()
     return 0
 
 
