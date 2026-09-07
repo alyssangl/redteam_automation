@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 | I need… | Read |
 |---|---|
-| The 5 subagents (roles, watch-fors) | `HANDOFF.md` §3 — the current-state index; deep stage guides for 3 of 5 in `docs/GUIDE_{PRIVESC,PERSISTENCE,IMPACT}.md` (implementation-era, verify against code) |
+| The 5 subagents (roles, watch-fors) | `HANDOFF.md` §3 — the current-state index |
 | Network / lab topology, IPs, creds, ports | `HANDOFF.md` §4 (lab reality + confounders) & §6 (config table); `REPRODUCIBILITY.md` (full setup + networking) |
 | How findings/sessions flow between stages | `HANDOFF.md` §2.5 |
 | Why it's built this way (3-layer model, etc.) | `docs/DESIGN_PHILOSOPHY.md` |
