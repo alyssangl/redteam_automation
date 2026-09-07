@@ -1,0 +1,537 @@
+<title>GRAFT</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --paper:#eef1ef; --surface:#ffffff; --surface-2:#f6f8f6;
+    --ink:#152420; --muted:#5c6d66; --line:#d3dcd7;
+    --graft:#0d7d80; --graft-deep:#0a5f61; --graft-soft:#d9ebe9;
+    --pass:#2e8b57; --fail:#c1412b; --warn:#b8811a;
+    --pass-soft:#dcecdf; --fail-soft:#f4ddd7; --warn-soft:#f2e7cf;
+    --shadow:0 1px 2px rgba(16,40,34,.04), 0 8px 30px rgba(16,40,34,.06);
+    --font-display:"Archivo", system-ui, sans-serif;
+    --font-body:"Newsreader", Georgia, serif;
+    --font-mono:"IBM Plex Mono", ui-monospace, monospace;
+  }
+  :root:not([data-theme="light"]){
+    @media (prefers-color-scheme: dark){
+      --paper:#0e1512; --surface:#15201c; --surface-2:#111a17;
+      --ink:#e7ece9; --muted:#93a49c; --line:#25322d;
+      --graft:#43bcb5; --graft-deep:#6fd0c9; --graft-soft:#123330;
+      --pass:#54c07d; --fail:#e0674f; --warn:#e0a53c;
+      --pass-soft:#12291c; --fail-soft:#2c1712; --warn-soft:#2a2110;
+      --shadow:0 1px 2px rgba(0,0,0,.3), 0 12px 34px rgba(0,0,0,.36);
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#0e1512; --surface:#15201c; --surface-2:#111a17;
+    --ink:#e7ece9; --muted:#93a49c; --line:#25322d;
+    --graft:#43bcb5; --graft-deep:#6fd0c9; --graft-soft:#123330;
+    --pass:#54c07d; --fail:#e0674f; --warn:#e0a53c;
+    --pass-soft:#12291c; --fail-soft:#2c1712; --warn-soft:#2a2110;
+    --shadow:0 1px 2px rgba(0,0,0,.3), 0 12px 34px rgba(0,0,0,.36);
+  }
+
+  *{box-sizing:border-box}
+  body{background:var(--paper); color:var(--ink); font-family:var(--font-body);
+    font-size:17px; line-height:1.5; -webkit-font-smoothing:antialiased;}
+  h1,h2,h3,.eyebrow,.mono,.metric,.tag,.btn,th{font-family:var(--font-display);}
+  .mono,code,.trace,.metric-num{font-family:var(--font-mono);}
+
+  /* ---- top rail ---- */
+  .rail{position:sticky; top:0; z-index:20; display:flex; align-items:center;
+    justify-content:space-between; gap:1rem; padding:.7rem clamp(1rem,4vw,3rem);
+    background:color-mix(in srgb, var(--paper) 86%, transparent);
+    backdrop-filter:blur(10px); border-bottom:1px solid var(--line);}
+  .rail .brand{font-family:var(--font-display); font-weight:800; letter-spacing:.14em;
+    font-size:.9rem; color:var(--graft);}
+  .rail .brand small{color:var(--muted); font-weight:600; letter-spacing:.08em;}
+  .rail nav{display:flex; gap:.15rem; flex-wrap:wrap; justify-content:flex-end;}
+  .rail nav a{width:22px; height:22px; display:grid; place-items:center;
+    font-family:var(--font-mono); font-size:.62rem; color:var(--muted);
+    text-decoration:none; border:1px solid var(--line); border-radius:5px;
+    background:var(--surface); transition:all .15s;}
+  .rail nav a:hover{color:var(--graft); border-color:var(--graft);}
+  .rail nav a:focus-visible{outline:2px solid var(--graft); outline-offset:2px;}
+
+  /* ---- slides ---- */
+  .deck{max-width:1080px; margin:0 auto; padding:0 clamp(1rem,4vw,2rem);}
+  .slide{min-height:82vh; padding:clamp(2.2rem,6vh,5rem) 0 clamp(2rem,5vh,4rem);
+    border-bottom:1px solid var(--line); display:flex; flex-direction:column;
+    justify-content:center;}
+  .slide:last-child{border-bottom:none;}
+  .eyebrow{display:inline-flex; align-items:center; gap:.6rem; font-size:.72rem;
+    font-weight:700; letter-spacing:.18em; text-transform:uppercase;
+    color:var(--graft); margin-bottom:1.1rem;}
+  .eyebrow .num{font-family:var(--font-mono); color:var(--muted);
+    border:1px solid var(--line); border-radius:5px; padding:.05rem .4rem;}
+  h1{font-size:clamp(2.6rem,7vw,5.2rem); line-height:.98; font-weight:800;
+    letter-spacing:-.02em; margin:.2rem 0; text-wrap:balance;}
+  h2{font-size:clamp(1.7rem,4vw,2.7rem); line-height:1.05; font-weight:700;
+    letter-spacing:-.015em; margin:0 0 1rem; text-wrap:balance;}
+  h3{font-size:1.02rem; font-weight:700; letter-spacing:.01em; margin:0 0 .4rem;}
+  p{margin:0 0 1rem; max-width:64ch;}
+  .lead{font-size:clamp(1.1rem,2.2vw,1.4rem); color:var(--ink);}
+  .muted{color:var(--muted);}
+  strong{font-weight:500; color:var(--ink); background:var(--graft-soft);
+    padding:0 .18em; border-radius:3px;}
+  .serif-strong{font-weight:600; background:none; padding:0;}
+  em{font-style:italic;}
+
+  /* ---- title slide ---- */
+  .title-slide{min-height:90vh; justify-content:center;}
+  .kicker{font-family:var(--font-mono); font-size:.8rem; letter-spacing:.1em;
+    color:var(--graft); margin-bottom:1.4rem; text-transform:uppercase;}
+  .expand{font-family:var(--font-display); font-weight:600;
+    font-size:clamp(1.05rem,2.4vw,1.55rem); color:var(--muted); letter-spacing:-.01em;
+    margin-top:.6rem; max-width:30ch;}
+  .expand b{color:var(--ink); font-weight:700;}
+  .credits{display:flex; flex-wrap:wrap; gap:.4rem 2.2rem; margin-top:2.6rem;
+    padding-top:1.6rem; border-top:2px solid var(--ink);}
+  .credit .k{font-family:var(--font-mono); font-size:.66rem; letter-spacing:.12em;
+    text-transform:uppercase; color:var(--muted);}
+  .credit .v{font-family:var(--font-display); font-weight:600; font-size:1.02rem;}
+
+  /* ---- generic bits ---- */
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:1.4rem;}
+  @media(max-width:720px){.grid2{grid-template-columns:1fr;}}
+  .card{background:var(--surface); border:1px solid var(--line); border-radius:12px;
+    padding:1.4rem 1.5rem; box-shadow:var(--shadow);}
+  .card.accent{border-top:3px solid var(--graft);}
+  .card.fail-top{border-top:3px solid var(--fail);}
+  .card.pass-top{border-top:3px solid var(--pass);}
+  .card p:last-child{margin-bottom:0;}
+
+  .tag{display:inline-block; font-family:var(--font-mono); font-size:.68rem;
+    font-weight:500; letter-spacing:.04em; padding:.16rem .5rem; border-radius:5px;
+    border:1px solid var(--line); color:var(--muted); background:var(--surface-2);}
+  .tag.graft{color:var(--graft); border-color:var(--graft); background:var(--graft-soft);}
+  .tag.pass{color:var(--pass); border-color:var(--pass); background:var(--pass-soft);}
+  .tag.fail{color:var(--fail); border-color:var(--fail); background:var(--fail-soft);}
+  .tag.warn{color:var(--warn); border-color:var(--warn); background:var(--warn-soft);}
+
+  ul.clean{list-style:none; padding:0; margin:0 0 1rem;}
+  ul.clean li{padding:.5rem 0 .5rem 1.5rem; position:relative; border-bottom:1px solid var(--line);}
+  ul.clean li:last-child{border-bottom:none;}
+  ul.clean li::before{content:""; position:absolute; left:0; top:1.05em;
+    width:8px; height:8px; border-radius:2px; background:var(--graft);}
+  ul.clean li.no::before{background:var(--fail);}
+  ul.clean li.yes::before{background:var(--pass);}
+
+  /* ---- mechanism trace ---- */
+  .trace{display:flex; flex-direction:column; gap:.5rem; font-family:var(--font-mono);
+    font-size:.82rem; background:var(--surface-2); border:1px solid var(--line);
+    border-radius:12px; padding:1.3rem 1.4rem; overflow-x:auto;}
+  .step{display:flex; align-items:flex-start; gap:.8rem; white-space:nowrap;}
+  .step .dot{flex:none; width:1.4rem; height:1.4rem; border-radius:6px; display:grid;
+    place-items:center; font-size:.72rem; font-weight:600; color:#fff; margin-top:.05rem;}
+  .step .txt{white-space:normal; line-height:1.45;}
+  .d-ok{background:var(--pass);} .d-kill{background:var(--fail);}
+  .d-f{background:var(--warn);} .d-graft{background:var(--graft);}
+  .step .lbl{color:var(--muted);}
+  .step .hi{color:var(--ink); font-weight:600;}
+  .step.indent{margin-left:2.2rem;}
+  .conn{margin-left:.62rem; width:2px; height:.5rem; background:var(--line);}
+
+  /* ---- results ---- */
+  .bars{display:flex; flex-direction:column; gap:1.1rem; margin:.5rem 0 0;}
+  .bar-row{display:grid; grid-template-columns:130px 1fr; gap:1rem; align-items:center;}
+  .bar-row .name{font-family:var(--font-display); font-weight:700; font-size:.9rem;}
+  .bar-row .name small{display:block; font-family:var(--font-mono); font-weight:400;
+    font-size:.68rem; color:var(--muted); letter-spacing:.02em;}
+  .track{position:relative; height:2.6rem; background:var(--surface-2);
+    border:1px solid var(--line); border-radius:7px; overflow:hidden;}
+  .fill{position:absolute; inset:0 auto 0 0; display:flex; align-items:center;
+    padding-left:.8rem; color:#fff; font-family:var(--font-mono); font-weight:600;
+    font-size:.82rem; border-radius:6px 0 0 6px;}
+  .fill.full{background:linear-gradient(90deg,var(--graft),var(--graft-deep));}
+  .fill.none{background:var(--fail); min-width:2.6rem;}
+  .fill.zero{width:0 !important; background:transparent; color:var(--fail);
+    padding-left:0; left:.8rem;}
+  .pfoot{display:flex; align-items:baseline; gap:.7rem; margin-top:1.2rem;
+    padding-top:1rem; border-top:1px dashed var(--line); flex-wrap:wrap;}
+  .pval{font-family:var(--font-mono); font-weight:600; color:var(--graft); font-size:1.05rem;}
+
+  table{width:100%; border-collapse:collapse; font-size:.92rem; margin:.3rem 0 0;}
+  th,td{text-align:left; padding:.62rem .7rem; border-bottom:1px solid var(--line);}
+  th{font-size:.68rem; letter-spacing:.1em; text-transform:uppercase; color:var(--muted);
+    font-weight:700;}
+  td.num, th.num{text-align:right; font-family:var(--font-mono);
+    font-variant-numeric:tabular-nums;}
+  tbody tr:last-child td{border-bottom:none;}
+  .row-hi td{background:var(--graft-soft);}
+
+  .statline{display:flex; flex-wrap:wrap; gap:1rem; margin:1.4rem 0 0;}
+  .stat{flex:1 1 160px; background:var(--surface); border:1px solid var(--line);
+    border-radius:12px; padding:1.1rem 1.2rem; box-shadow:var(--shadow);}
+  .stat .metric-num{font-family:var(--font-mono); font-weight:600;
+    font-size:clamp(1.6rem,4vw,2.3rem); line-height:1; letter-spacing:-.02em;}
+  .stat .metric-num.g{color:var(--graft);} .stat .metric-num.p{color:var(--pass);}
+  .stat .metric-num.f{color:var(--fail);}
+  .stat .lbl{font-family:var(--font-mono); font-size:.66rem; letter-spacing:.08em;
+    text-transform:uppercase; color:var(--muted); margin-top:.5rem;}
+
+  /* ---- layers ---- */
+  .layers{display:flex; flex-direction:column; gap:.7rem;}
+  .layer{display:grid; grid-template-columns:64px 1fr; gap:1rem; align-items:center;
+    background:var(--surface); border:1px solid var(--line); border-radius:10px;
+    padding:.9rem 1.1rem;}
+  .layer .lv{font-family:var(--font-display); font-weight:800; font-size:1.3rem;
+    color:var(--graft); text-align:center; border-right:1px solid var(--line);}
+  .layer .lv small{display:block; font-family:var(--font-mono); font-size:.58rem;
+    font-weight:400; letter-spacing:.08em; color:var(--muted); margin-top:.2rem;}
+  .layer h3{margin:0 0 .1rem;}
+  .layer p{margin:0; font-size:.92rem; color:var(--muted); max-width:none;}
+
+  .chips{display:flex; flex-wrap:wrap; gap:.5rem; margin:.4rem 0 1rem;}
+  .chain{display:flex; align-items:center; gap:.35rem; flex-wrap:wrap;
+    font-family:var(--font-mono); font-size:.8rem;}
+  .chain span{padding:.3rem .6rem; border:1px solid var(--line); border-radius:6px;
+    background:var(--surface); color:var(--muted);}
+  .chain .arr{border:none; background:none; color:var(--graft); padding:0 .1rem;}
+
+  .callout{border-left:3px solid var(--graft); padding:.4rem 0 .4rem 1.2rem;
+    margin:1.3rem 0; color:var(--ink);}
+  .callout .q{font-size:1.15rem; font-weight:500;}
+
+  .foot{display:flex; flex-wrap:wrap; gap:1rem 2rem; margin-top:1.6rem;
+    padding-top:1.2rem; border-top:1px solid var(--line); font-family:var(--font-mono);
+    font-size:.78rem; color:var(--muted);}
+  .foot b{color:var(--graft); font-weight:600;}
+  .foot a{color:var(--ink);}
+
+  @media (prefers-reduced-motion:no-preference){
+    .fill{animation:grow .9s cubic-bezier(.2,.7,.2,1) both;}
+    @keyframes grow{from{transform:scaleX(.001); transform-origin:left;}}
+  }
+
+  /* ---- PRINT / PDF EXPORT: one slide per landscape page ----
+     Rendered via headless Chrome (see reports/README or handoff_walkthrough). */
+  @media print{
+    /* Force the light palette so dark-mode machines still print on white. */
+    :root{
+      --paper:#eef1ef; --surface:#ffffff; --surface-2:#f6f8f6;
+      --ink:#152420; --muted:#5c6d66; --line:#d3dcd7;
+      --graft:#0d7d80; --graft-deep:#0a5f61; --graft-soft:#d9ebe9;
+      --pass:#2e8b57; --fail:#c1412b; --warn:#b8811a;
+      --pass-soft:#dcecdf; --fail-soft:#f4ddd7; --warn-soft:#f2e7cf;
+      --shadow:none;
+    }
+    @page{ size:A4 landscape; margin:11mm 13mm; }
+    *{ -webkit-print-color-adjust:exact !important; print-color-adjust:exact !important; }
+    body{ background:#fff; font-size:15px; }
+    .rail{ display:none !important; }
+    .deck{ max-width:none; padding:0; }
+    .slide{ min-height:auto; height:auto; padding:2mm 0; border-bottom:none;
+      justify-content:flex-start; break-after:page; page-break-after:always; }
+    .slide:last-child{ break-after:auto; page-break-after:avoid; }
+    /* Keep visual units whole across page breaks. */
+    .card,.trace,.bars,.layers,.layer,.grid2,table,.callout,.statline,.chain,.step{
+      break-inside:avoid; page-break-inside:avoid; }
+    a{ color:var(--graft); text-decoration:none; }
+    .fill{ animation:none !important; }
+  }
+</style>
+
+<div class="rail">
+  <div class="brand">GRAFT <small>· research talk</small></div>
+  <nav aria-label="slides">
+    <a href="#s1">01</a><a href="#s2">02</a><a href="#s3">03</a><a href="#s4">04</a>
+    <a href="#s5">05</a><a href="#s6">06</a><a href="#s7">07</a><a href="#s8">08</a>
+    <a href="#s9">09</a><a href="#s10">10</a>
+  </nav>
+</div>
+
+<div class="deck">
+
+  <!-- 01 TITLE -->
+  <section class="slide title-slide" id="s1">
+    <div class="kicker">Autonomous red-team · attack-graph repair · grounded verification</div>
+    <h1>GRAFT</h1>
+    <div class="expand"><b>G</b>rounded <b>R</b>epair of <b>A</b>ttack-graph <b>T</b>raversal —
+      recovering from capability loss in autonomous penetration testing, and admitting
+      success only on captured evidence.</div>
+    <div class="credits">
+      <div class="credit"><div class="k">Author</div><div class="v">Austin</div></div>
+      <div class="credit"><div class="k">Advisor</div><div class="v">Prof. Didik</div></div>
+      <div class="credit"><div class="k">Target venue</div><div class="v">IEEE ICC 2027</div></div>
+      <div class="credit"><div class="k">System</div><div class="v">lgg_automation · <span class="mono" style="font-size:.85em">graph-orchestrator</span></div></div>
+    </div>
+  </section>
+
+  <!-- 02 PROBLEM -->
+  <section class="slide" id="s2">
+    <div class="eyebrow"><span class="num">02</span> The problem</div>
+    <h2>An autonomous agent's step can fail two ways — and agents treat them the same.</h2>
+    <p class="lead muted">The whole recovery strategy depends on telling them apart. Conflating
+      them is why LLM pentest agents get stuck or lie about it.</p>
+    <div class="grid2" style="margin-top:1.4rem">
+      <div class="card fail-top">
+        <span class="tag fail">technique failure</span>
+        <h3 style="margin-top:.8rem">The action was wrong</h3>
+        <p class="muted">Wrong exploit module, wrong option. The world state is intact —
+          so <span class="serif-strong">retry</span> a different technique and move on. Ordinary
+          replanning handles this fine.</p>
+      </div>
+      <div class="card accent">
+        <span class="tag graft">capability loss</span>
+        <h3 style="margin-top:.8rem">The action was fine — a precondition vanished</h3>
+        <p class="muted">The <span class="serif-strong">session died</span> (blip, reboot, kill).
+          Every downstream step that needed it is <em>orphaned</em>. Retrying is useless —
+          the session is dead at <em>every</em> retry budget.</p>
+      </div>
+    </div>
+    <div class="callout">
+      <div class="q">“Capability orphaning” (Eq. 6): when a held capability is lost, its
+        precondition is unsatisfiable at any retry budget — so repair must be
+        <span class="serif-strong">structural</span>, not a retry.</div>
+    </div>
+  </section>
+
+  <!-- 03 CONTRIBUTIONS -->
+  <section class="slide" id="s3">
+    <div class="eyebrow"><span class="num">03</span> Two contributions</div>
+    <h2>Detect the difference, repair it structurally, and never trust the agent's word.</h2>
+    <div class="grid2" style="margin-top:1rem">
+      <div class="card accent">
+        <span class="tag graft">C1 · the graft</span>
+        <h3 style="margin-top:.8rem">Structural repair of capability loss</h3>
+        <p class="muted">A feasibility gate detects that a <em>held</em> capability is gone,
+          re-provisions it (grows a fresh re-exploit), and <span class="serif-strong">re-parents</span>
+          the orphaned objective onto it. A graph mutation — not a retry.</p>
+      </div>
+      <div class="card pass-top">
+        <span class="tag pass">C2 · the grounding oracle</span>
+        <h3 style="margin-top:.8rem">Success = captured target bytes</h3>
+        <p class="muted"><span class="serif-strong">uid=0(root)</span> in captured output; a proof
+          marker <em>read back off disk</em>. Never the agent's prose. Formal property
+          <span class="mono">Δ_A = 0</span>: no unproven claim ever enters execution state.</p>
+      </div>
+    </div>
+    <p class="muted" style="margin-top:1.5rem">The system beneath them — a backtracking
+      walker over an attack graph, driving Metasploit + SSH against a lab target — is the
+      vehicle. These two ideas are the science.</p>
+  </section>
+
+  <!-- 04 THE GRAFT -->
+  <section class="slide" id="s4">
+    <div class="eyebrow"><span class="num">04</span> Contribution 1 — the graft</div>
+    <h2>A loop of three parts: a history <span class="mono" style="color:var(--graft)">H</span>,
+      a gate <span class="mono" style="color:var(--warn)">F</span>, and a structural repair.</h2>
+    <div class="grid2" style="margin-bottom:1.6rem">
+      <div>
+        <ul class="clean">
+          <li><b class="serif-strong">H — capability history.</b> After every success, record
+            what was established (<span class="mono">session</span>, <span class="mono">root</span>,
+            <span class="mono">artifact</span>). Monotonic: “ever held”, from concrete fields, never prose.</li>
+          <li><b class="serif-strong">F — feasibility gate.</b> Before each node, is the required
+            capability live? Missing &amp; in H → <span class="tag graft">capability</span> loss.
+            Missing &amp; not in H → <span class="tag warn">precondition</span> (mis-order).</li>
+          <li><b class="serif-strong">The repair.</b> On capability loss: grow a fresh re-exploit,
+            re-parent the orphaned node(s) onto it, reset to pending. The objective survives.</li>
+        </ul>
+      </div>
+      <div class="trace" aria-label="graft execution trace">
+        <div class="step"><span class="dot d-ok">✓</span><span class="txt"><span class="hi">recon</span> <span class="lbl">→ services mapped</span></span></div>
+        <div class="conn"></div>
+        <div class="step"><span class="dot d-ok">✓</span><span class="txt"><span class="hi">gain_access</span> <span class="lbl">→ session 1 · H += {session}</span></span></div>
+        <div class="conn"></div>
+        <div class="step"><span class="dot d-kill">✕</span><span class="txt"><span class="lbl">harness</span> <span class="hi">kills session 1</span></span></div>
+        <div class="conn"></div>
+        <div class="step"><span class="dot d-f">F</span><span class="txt"><span class="hi">file_drop</span> <span class="lbl">→ F=0 · req {session} world {} · ∈ H →</span> capability</span></div>
+        <div class="conn"></div>
+        <div class="step indent"><span class="dot d-graft">⇲</span><span class="txt"><span class="hi">graft</span> <span class="lbl">grow</span> re_exploit <span class="lbl">· re-parent</span> file_drop</span></div>
+        <div class="conn" style="margin-left:2.82rem"></div>
+        <div class="step"><span class="dot d-ok">✓</span><span class="txt"><span class="hi">re_exploit</span> <span class="lbl">→ session 2 · F passes</span></span></div>
+        <div class="conn"></div>
+        <div class="step"><span class="dot d-ok">✓</span><span class="txt"><span class="hi">file_drop</span> <span class="lbl">on session 2 → marker read back →</span> <span style="color:var(--pass);font-weight:600">grounded</span></span></div>
+      </div>
+    </div>
+    <p class="muted">F fires exactly once; one graft; no loop. Turn the graft off and the
+      re-exploit is never grown — the session stays dead and the objective is silently abandoned.
+      <span class="mono" style="font-size:.85em">core_agents/orchestrator.py</span></p>
+  </section>
+
+  <!-- 05 GROUNDING -->
+  <section class="slide" id="s5">
+    <div class="eyebrow"><span class="num">05</span> Contribution 2 — the grounding oracle</div>
+    <h2>Success is defined over the raw bytes the target emitted.</h2>
+    <p class="lead muted">An LLM will happily report “I am now root” when it isn't. If that
+      self-report drives execution state, the whole run is built on a lie.</p>
+    <div class="grid2" style="margin-top:1.2rem">
+      <div class="card fail-top">
+        <h3><span class="tag fail">rejected</span> &nbsp;the agent's word</h3>
+        <p class="muted">A plan line that merely <em>mentions</em> <span class="mono">uid=0(root)</span>.
+          A stage's self-set <span class="mono">new_level</span>. Circular — defeats the metric.</p>
+      </div>
+      <div class="card pass-top">
+        <h3><span class="tag pass">admitted</span> &nbsp;captured evidence</h3>
+        <p class="muted">A root token co-occurring with a real probe line (<span class="mono">DIRECT ID CHECK</span>).
+          The exact marker written, then <em>read back</em> in a <span class="mono">cat</span> output.</p>
+      </div>
+    </div>
+    <div class="callout" style="border-color:var(--pass)">
+      <div class="q">The oracle is re-derived from run artifacts by <span class="mono" style="font-size:.9em">experiments/parse_eval.py</span>
+        — independent of the acting agent. The money metric <span class="mono">false_success</span>
+        counts a claimed success with no captured proof.</div>
+    </div>
+  </section>
+
+  <!-- 06 ARCHITECTURE -->
+  <section class="slide" id="s6">
+    <div class="eyebrow"><span class="num">06</span> The system</div>
+    <h2>A backtracking walker over an attack graph, with three layers of decision.</h2>
+    <div class="chain" style="margin:.2rem 0 1.4rem">
+      <span>recon</span><span class="arr">→</span><span>initial_access</span><span class="arr">→</span>
+      <span>privesc</span><span class="arr">→</span><span>persistence</span><span class="arr">→</span>
+      <span>impact</span>
+    </div>
+    <div class="layers">
+      <div class="layer"><div class="lv">L1<small>tactical</small></div>
+        <div><h3>Stage subagents (<span class="mono" style="font-size:.85em">stages/*.py</span>)</h3>
+          <p>Each a Planner→Executor→Critic loop. Tight kill-chain scope, broad tools inside it.</p></div></div>
+      <div class="layer"><div class="lv">L2<small>strategic</small></div>
+        <div><h3>The judge — <span class="mono" style="font-size:.85em">judge()</span></h3>
+          <p>Between nodes: <span class="mono">continue · adapt · escalate</span>. Catches drift early.</p></div></div>
+      <div class="layer"><div class="lv">L3<small>heavyweight</small></div>
+        <div><h3>The replanner — <span class="mono" style="font-size:.85em">_replan_from()</span></h3>
+          <p>Graph mutation. LLM emits a tiny intent; code expands it. <b class="serif-strong">The graft lives here.</b></p></div></div>
+    </div>
+    <p class="muted" style="margin-top:1.3rem">The LLM enters at L2/L3 — never inside the
+      deterministic edge routing. That's what keeps every run replayable and auditable.</p>
+  </section>
+
+  <!-- 07 DESIGN -->
+  <section class="slide" id="s7">
+    <div class="eyebrow"><span class="num">07</span> Experimental design</div>
+    <h2>Two scenarios, two variants, a minimal-diff ablation.</h2>
+    <div class="grid2" style="margin-top:.6rem">
+      <div class="card">
+        <h3>Scenarios</h3>
+        <p class="muted" style="margin-bottom:.6rem"><span class="tag graft">orphan_c</span>
+          the headline — kill the session right before the impact objective. Recovery is
+          possible only via the graft.</p>
+        <p class="muted"><span class="tag">flaw_privesc</span> the control — a wrong exploit
+          module at privesc. A <em>technique</em> failure that substitution alone repairs.</p>
+      </div>
+      <div class="card">
+        <h3>Variants</h3>
+        <p class="muted" style="margin-bottom:.6rem"><span class="tag pass">v0_full</span>
+          everything on.</p>
+        <p class="muted"><span class="tag fail">v_nograft</span> identical but the capability
+          branch routes to technique-substitution instead of the graft — <span class="serif-strong">one flag</span>
+          (<span class="mono">EVAL_ENABLE_GRAFT=0</span>).</p>
+      </div>
+    </div>
+    <p class="muted" style="margin-top:1.4rem">Lab: Metasploitable 3 target
+      (<span class="mono">192.168.34.7</span>), Kali + msfrpcd, GPT-4o judge/replanner.
+      Fault injected by a <span class="mono">pre_node_hook</span> that kills the session before
+      the orphaned node. <span class="serif-strong">N = 10</span> per cell.</p>
+  </section>
+
+  <!-- 08 RESULTS -->
+  <section class="slide" id="s8">
+    <div class="eyebrow"><span class="num">08</span> Results</div>
+    <h2>On capability loss, the graft is the difference between recovery and none.</h2>
+
+    <h3 style="margin-top:.4rem; color:var(--muted); letter-spacing:.06em; text-transform:uppercase; font-size:.7rem">
+      Result 1 · recovery from capability loss — <span class="mono" style="text-transform:none">orphan_c</span></h3>
+    <div class="bars">
+      <div class="bar-row">
+        <div class="name">FULL<small>graft on</small></div>
+        <div class="track"><div class="fill full" style="width:80%">8 / 10 recovered</div></div>
+      </div>
+      <div class="bar-row">
+        <div class="name">NO-GRAFT<small>graft off</small></div>
+        <div class="track"><div class="fill zero">0 / 10 recovered</div></div>
+      </div>
+    </div>
+    <div class="pfoot">
+      <span class="pval">Fisher exact (2-sided) &nbsp;p = 0.0007</span>
+      <span class="muted">Not “lower” — a clean zero. Without the graft the lost session cannot
+        be restored, so recovery is impossible at any budget.</span>
+    </div>
+
+    <div class="grid2" style="margin-top:1.8rem; align-items:start">
+      <div>
+        <h3 style="color:var(--muted); letter-spacing:.06em; text-transform:uppercase; font-size:.7rem">
+          Result 2 · control — <span class="mono" style="text-transform:none">flaw_privesc</span></h3>
+        <table>
+          <thead><tr><th>Variant</th><th class="num">Grounded</th></tr></thead>
+          <tbody>
+            <tr><td>FULL</td><td class="num">7 / 8</td></tr>
+            <tr><td>NO-GRAFT</td><td class="num">8 / 10</td></tr>
+          </tbody>
+        </table>
+        <p class="muted" style="font-size:.86rem; margin-top:.7rem">No separation. The 8-vs-0 gap
+          appears <em>only</em> on capability loss — so it is the graft, not generic replanning.</p>
+      </div>
+      <div>
+        <h3 style="color:var(--muted); letter-spacing:.06em; text-transform:uppercase; font-size:.7rem">
+          Result 3 · grounding</h3>
+        <div class="statline" style="margin-top:0">
+          <div class="stat"><div class="metric-num p">0<span style="font-size:.5em; color:var(--muted)"> / 38</span></div>
+            <div class="lbl">false successes<br>across all valid runs</div></div>
+          <div class="stat"><div class="metric-num g">Δ<sub>A</sub>=0</div>
+            <div class="lbl">verified 3 ways:<br>empirical · adversarial · formal</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="foot">
+      <span><b>40</b> cells · 38 valid</span><span><b>2</b> excluded as lab artifacts</span>
+      <span>every number traces to a row in <a>eval_results.csv</a></span>
+    </div>
+  </section>
+
+  <!-- 09 STATUS -->
+  <section class="slide" id="s9">
+    <div class="eyebrow"><span class="num">09</span> Honest status</div>
+    <h2>What's proven, and what is deliberately future work.</h2>
+    <ul class="clean" style="margin-top:.6rem">
+      <li class="yes"><b class="serif-strong">C1 — the graft: complete &amp; significant.</b>
+        <span class="muted">8/10 vs 0/10, p = 0.0007, with a matched control.</span></li>
+      <li class="yes"><b class="serif-strong">C2 — the oracle's soundness half: proven.</b>
+        <span class="muted">Δ<sub>A</sub> = 0 empirically (0/38), by an offline adversarial test,
+          and by construction.</span></li>
+      <li class="no"><b class="serif-strong">C2's complementary spike (Δ<sub>A</sub>=Δ<sub>R</sub>): not yet shown.</b>
+        <span class="muted">Our own stages rarely overclaim (privesc honestly times out). The
+          right vehicle is an <em>external</em> agent that does — future work.</span></li>
+      <li class="no"><b class="serif-strong">Generality across placements: one clean placement so far.</b>
+        <span class="muted">orphan-B (a second placement) is scaffolded and ready to run.</span></li>
+    </ul>
+    <p class="muted" style="margin-top:1.2rem"><span class="serif-strong">Threats to validity, controlled:</span>
+      lab artifacts excluded by protocol (not concentrated in the claim variant); grounding
+      independent of the acting agent; single lab / single target model is the standing limitation.</p>
+  </section>
+
+  <!-- 10 HANDOFF -->
+  <section class="slide" id="s10">
+    <div class="eyebrow"><span class="num">10</span> For the next researchers</div>
+    <h2>Where to pick it up — in priority order.</h2>
+    <div class="grid2" style="margin-top:.4rem; align-items:start">
+      <div class="card accent">
+        <span class="tag graft">next · scaffolded</span>
+        <h3 style="margin-top:.7rem">orphan-B — generality</h3>
+        <p class="muted">Kill the session before <em>persistence</em>: a second placement, with a
+          terminal impact node so the objective still grounds independently. Stronger than
+          orphan-C — the graft must re-parent a <span class="serif-strong">two-node subgraph</span>.
+          Graph + offline test already written.</p>
+      </div>
+      <div class="card pass-top">
+        <span class="tag pass">next · the C2 spike</span>
+        <h3 style="margin-top:.7rem">External agent — HackingBuddyGPT</h3>
+        <p class="muted">Run a third-party agent that genuinely overclaims through <em>our</em>
+          oracle, unmodified. Cheap first step: 3 transcripts — does it claim root when captured
+          <span class="mono">id</span> doesn't show it? If yes, the spike is real.</p>
+      </div>
+    </div>
+    <div class="foot" style="border-top-width:2px">
+      <span>Start here → <b>docs/ONBOARDING.md</b></span>
+      <span>then <a>HANDOFF.md</a> · <a>DESIGN_PHILOSOPHY.md</a></span>
+      <span>results → <b>reports/graft_results_summary.md</b></span>
+      <span>read side by side → <a>orphan_c_graph.py</a> + <a>parse_eval.py</a></span>
+    </div>
+  </section>
+
+</div>
