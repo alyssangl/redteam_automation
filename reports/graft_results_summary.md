@@ -9,11 +9,11 @@ The core claim holds with statistical significance. On a controlled **capability
 break, the full system recovers **8/10** runs versus **0/10** for the ablation that keeps
 everything except the graft — **Fisher exact p = 0.0007**. The technique-failure control
 shows no separation, confirming the gap is the graft specifically, not general repair. And
-across all 44 valid runs the grounded system admitted **zero** unproven successes.
+across all 38 valid runs the grounded system admitted **zero** unproven successes.
 
 ## What was run
 
-40 cells = 2 scenarios × 2 variants × N=10 (44 valid, 2 excluded as lab artifacts):
+40 cells = 2 scenarios × 2 variants × N=10 (38 valid, 2 excluded as lab artifacts):
 
 - **orphan_c** — the headline. A normal chain (recon → access → impact objective) whose
   established session is destroyed **externally, by the harness**, right before the impact
@@ -56,9 +56,9 @@ rates carry the control conclusion.)
 
 ## Result 3 — grounding (independent success verification)
 
-**False-success = 0 across all 44 valid runs** (FULL 0/24, NO-GRAFT 0/20). The grounding
+**False-success = 0 across all 38 valid runs** (FULL 0/18, NO-GRAFT 0/20). The grounding
 oracle never once let an unproven claim become execution state (Δ_A = 0). This is verified
-three independent ways: (a) empirically here, 0/44; (b) an offline adversarial test — a
+three independent ways: (a) empirically here, 0/38; (b) an offline adversarial test — a
 fake `uid=0(root)` / proof marker planted in the agent's own text does not ground, only a
 token captured off the target does; (c) by construction — admission is defined over
 captured bytes, so Δ_A = 0 whenever admission is on the oracle.
@@ -80,7 +80,7 @@ captured bytes, so Δ_A = 0 whenever admission is on the oracle.
 
 ## Threats to validity (already controlled)
 
-- **Lab artifacts excluded, not hidden.** 2 of 46 runs were confounded (a wedged
+- **Lab artifacts excluded, not hidden.** 2 of 40 runs were confounded (a wedged
   msfrpcd/console) and dropped per protocol; the exclusions are not concentrated in the
   claim variant. The harness now snapshot-restores a fresh target per cell, aborts a batch
   after consecutive confounded cells, and refuses overlapping batches — the three failure
