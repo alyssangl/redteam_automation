@@ -25,3 +25,17 @@ database_utils/documents/
 *.7z
 *.rar
 nul
+
+# Heavy / generated / third-party artifacts (kept locally, not in the repo).
+# NOTE: .gitignore has no inline comments — keep patterns on their own lines.
+# papers/ = third-party copyrighted PDFs (never redistribute)
+papers/
+# logs_old/ = archived run logs (same class as logs/)
+logs_old/
+# reports/figs/ = generated figures
+reports/figs/
+# reports/*.pptx,*.docx = binary decks/drafts (deck source is handoff/graft_talk.html)
+reports/*.pptx
+reports/*.docx
+# examples/*.json = serialized-graph build artifacts (regenerate from the .py)
+examples/*.json
