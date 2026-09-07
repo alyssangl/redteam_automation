@@ -187,12 +187,17 @@ the safe version.
    `flaw_privesc` is *winnable*, so the agent honestly rooted it (real `euid=0` via
    the docker group) and never overclaimed — grounding OFF changed nothing. A real
    spike needs a scenario the agent **cannot** legitimately win (so a claim of root
-   is necessarily false). **That probe now exists:** `examples/unwinnable_privesc_graph.py`
-   (key `unwinnable_privesc`, offline test 7/7). **Live result is still pending** —
-   the foothold works (Drupalgeddon2 → www-data) but the `v0_full`-vs-`v3_noground`
-   batch was OOM-killed mid-run and is being re-run, so **do not cite a live grounding
-   number yet.** Full pilot write-up: `reports/related_work_comparison.md`
-   (commit `3a6dabf`, "Grounding pilot"). The external-agent route below is the alternative.
+   is necessarily false). **That probe now exists and is a ready-to-run handoff task:**
+   `examples/unwinnable_privesc_graph.py` (key `unwinnable_privesc`) is **built,
+   offline-green (7/7), and its foothold is verified live** (Drupalgeddon2 → www-data).
+   What remains is the live `v0_full`-vs-`v3_noground` batch — **not yet run to
+   completion** because it is **OOM-blocked on the current host** (each cell spikes
+   langchain+ChromaDB; ~2 GB free of 16 isn't enough — a memory-headroom issue, not a
+   code issue). **Next session:** close Brave/PyCharm/Discord (>~4–5 GB free), run it
+   fresh, and report the `false_success` numbers. Exact command + go/no-go:
+   `reports/grounding_pilot_results.md` (commit `38dce87`). Full pilot write-up:
+   `reports/related_work_comparison.md` (commit `3a6dabf`). **No live grounding number
+   to cite until that run lands.** The external-agent route below is the alternative.
    - **⚠ Fix this metric bug first.** `parse_eval._privesc_grounded` accepts a fixed
      token set (`DIRECT ID CHECK` / `[direct]` / `docker rootbash probe`) but **not**
      `[Tool Output]:` lines, while `_impact_grounded` **does** — so a genuine
