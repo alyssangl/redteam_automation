@@ -1,6 +1,6 @@
 # GRAFT — smoke-test results (T1–T7)
 
-_For Prof. Didik. The 7 gate tests from `experiment_plan.md §4` — the bar the
+The 7 gate tests from `experiment_plan.md §4` — the bar the
 campaign had to clear before any recovery/grounding number counted. All run on the
 isolated lab: Metasploitable 3 target (192.168.34.7), Kali attacker + msfrpcd
 (192.168.34.6), GPT-4o judge/replanner._
