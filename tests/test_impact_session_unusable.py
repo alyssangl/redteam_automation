@@ -14,6 +14,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import stages.impact as impact
+import stages.persistence as persistence
 
 _NONCE = impact._ALIVE_PROBE_NONCE
 
@@ -42,6 +43,13 @@ class FakeMsf:
 
 def _install(fake):
     impact.msf_session = fake
+    # HERMETIC: the command_shell path in _find_live_impact_session upgrades to
+    # meterpreter FIRST via persistence._upgrade_shell_to_meterpreter, which uses
+    # persistence's own (un-faked) msf_session and would reach the LIVE lab — passing
+    # only when the lab is DOWN (upgrade times out → fallback). Stub it to None so the
+    # probe/substitute/abort logic under test runs deterministically regardless of lab
+    # state. The upgrade path itself is covered by test_impact_meterpreter_upgrade.py.
+    persistence._upgrade_shell_to_meterpreter = lambda *a, **k: None
 
 
 def _target_shell(host="192.168.34.7", stype=b"shell"):
