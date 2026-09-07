@@ -89,7 +89,7 @@ If the box won't download, build MS3 locally from
 ## 5. Run a scenario
 
 ```bash
-docker compose run --rm app python experiments/live_test_continuum.py
+docker compose run --rm app python experiments/live_test_flaw_privesc.py
 # logs land in ./logs (bind-mounted)
 ```
 

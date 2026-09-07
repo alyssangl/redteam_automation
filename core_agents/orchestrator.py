@@ -20,11 +20,11 @@ Usage:
     from core_agents.orchestrator import run_graph
     from core_agents.attack_graph import AttackGraph
 
-    graph = AttackGraph.load("examples/disk_wipe_graph.json")
+    graph = AttackGraph.load("examples/orphan_c_graph.json")
     result = run_graph(graph)
 
     # Or interactively:
-    python -m core_agents.orchestrator examples/disk_wipe_graph.json
+    python -m core_agents.orchestrator examples/orphan_c_graph.json
 """
 
 import re
@@ -3211,7 +3211,7 @@ def main():
 
 def _interactive_mode():
     """Build a simple graph interactively then run it."""
-    from examples.disk_wipe_graph import build_disk_wipe_graph
+    from examples.orphan_c_graph import build_orphan_c_graph
 
     print_colored("--- Graph-Driven Orchestrator ---", Colors.OKGREEN)
 
@@ -3224,8 +3224,8 @@ def _interactive_mode():
     if not attacker_ip:
         attacker_ip = "192.168.34.6"
 
-    # For now, use the disk wipe template
-    graph = build_disk_wipe_graph(target_ip=target_ip, attacker_ip=attacker_ip)
+    # For now, use the orphan_c capability-loss template
+    graph = build_orphan_c_graph(target_ip=target_ip, attacker_ip=attacker_ip)
     print()
     print(graph.summary())
     print()

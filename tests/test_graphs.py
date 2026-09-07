@@ -7,16 +7,12 @@ import sys, os, importlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 GRAPHS = {
-    "proftpd_modcopy": "build_proftpd_modcopy_graph",
-    "unrealircd_backdoor": "build_unrealircd_backdoor_graph",
-    "samba_pipename": "build_samba_pipename_graph",
-    "continuum_rce": "build_continuum_rce_graph",
-    "drupal_drupalgeddon2": "build_drupal_drupalgeddon2_graph",
     "goal_only": "build_goal_only_graph",
-    "flawed": "build_flawed_graph",
 }
-CONVERTED = ["proftpd_modcopy", "unrealircd_backdoor", "samba_pipename",
-             "continuum_rce", "drupal_drupalgeddon2"]
+# Real-service RCE graphs (proftpd/unrealircd/samba/continuum/drupal/flawed) were
+# retired to archive/examples/; their structural checks live in their dedicated
+# tests. goal_only remains here as the generic subagent-path build smoke.
+CONVERTED = []
 
 
 def _build(name, fn):

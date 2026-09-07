@@ -70,10 +70,10 @@ graph, then on all test graphs (including the deliberately-broken `flaw_*` ones)
 python tests/run_offline.py
 
 # Run a live scenario against the lab (bring the lab up first — see HANDOFF.md §4)
-python experiments/live_test_continuum.py     # or live_test_proftpd.py, etc.
+python experiments/live_test_flaw_privesc.py  # or live_test_baseline.py, etc.
 
 # Run the orchestrator directly on a graph
-python -m core_agents.orchestrator examples/continuum_rce_graph.json
+python -m core_agents.orchestrator examples/orphan_c_graph.json
 python -m core_agents.orchestrator --interactive
 
 # Build/rebuild the RAG knowledge base (ChromaDB)

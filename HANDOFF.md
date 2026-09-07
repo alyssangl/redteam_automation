@@ -77,11 +77,11 @@ Inside `_execute_node` (orchestrator.py ~177 vs ~202) there is a fork:
   `explore=True` — it dispatches to the stage subagent (`run_recon`,
   `run_exploitation`, `run_privesc`, …) which improvises within its scope.
 
-**Consequence for testing:** a graph full of prescribed modules (e.g.
-`examples/continuum_rce_graph.py`) mostly exercises the *direct path* and only
+**Consequence for testing:** a graph full of prescribed modules (nodes that all
+carry a `module`/`commands`) mostly exercises the *direct path* and only
 `recon` as a subagent. To actually test the exploit/privesc/persistence/impact
 **subagents**, use a **goal-only** graph (`examples/goal_only_graph.py`) or a
-**flawed** graph (`examples/flaw_*_graph.py`, one broken stage each). If you
+**flawed** graph (`examples/flaw_privesc_graph.py`, a broken stage). If you
 "refined a subagent" and nothing changed at runtime, you were probably on the
 direct path — check the logs for `[direct]` vs `[Dispatch]`.
 
@@ -219,12 +219,12 @@ docker compose run --rm app python tests/run_offline.py
 python tests/run_offline.py                 # 8 suites / ~52 checks
 
 # LIVE test of one scenario (needs the lab up — see §4.3 first)
-python experiments/live_test_continuum.py   # or live_test_proftpd.py, _unrealircd.py, ...
+python experiments/live_test_flaw_privesc.py  # or live_test_baseline.py, etc.
 #   -> each builds a graph and calls run_graph(graph, explore=True, use_judge=True)
 #   -> watch logs/<scenario>_<ip>_<ts>.log
 
 # The orchestrator directly (CLI)
-python -m core_agents.orchestrator examples/continuum_rce_graph.json
+python -m core_agents.orchestrator examples/orphan_c_graph.json
 python -m core_agents.orchestrator --interactive
 
 # Rebuild the RAG knowledge base (ChromaDB) after changing documents/
@@ -311,7 +311,7 @@ Full detail in `reports/refinement_roadmap.md`. Priority order:
      gate) — driver: a goal-only/flaw_privesc graph.
    - v17: continuum/drupal fallback pivots to UnrealIRCd instead of time-boxing.
    - v19: `ssh_login(vagrant/vagrant)` proposed after root/root fails —
-     `experiments/live_test_init_fail.py`.
+     `archive/experiments/live_test_init_fail.py` (retired).
 2. **Goal-coverage skip** (flagged as the higher-priority architectural gap): the
    replanner uses `new_edge` to skip a planned node (e.g. `persistence`) when a
    later node's *preconditions* are met, but never checks whether the skipped
