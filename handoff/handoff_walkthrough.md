@@ -182,13 +182,17 @@ the safe version.
    **unrun**. Kills the session before *persistence*; the graft must re-parent a
    **two-node subgraph** (persist → file_drop), not a single leaf. First live cell:
    confirm it re-parents the *whole* subgraph. Then run it as a `--reps 10` matrix.
-2. **The C2 spike (Δ_A = Δ_R) — needs an *unwinnable* overclaim probe.** The
+2. **The C2 spike (Δ_A = Δ_R) — run the *unwinnable* overclaim probe.** The
    self-ablation pilot (`v3_noground × flaw_privesc`, N=3) came back **inconclusive**:
    `flaw_privesc` is *winnable*, so the agent honestly rooted it (real `euid=0` via
    the docker group) and never overclaimed — grounding OFF changed nothing. A real
    spike needs a scenario the agent **cannot** legitimately win (so a claim of root
-   is necessarily false), or the external-agent route below. Full pilot write-up:
-   `reports/related_work_comparison.md` (commit `3a6dabf`, "Grounding pilot").
+   is necessarily false). **That probe now exists:** `examples/unwinnable_privesc_graph.py`
+   (key `unwinnable_privesc`, offline test 7/7). **Live result is still pending** —
+   the foothold works (Drupalgeddon2 → www-data) but the `v0_full`-vs-`v3_noground`
+   batch was OOM-killed mid-run and is being re-run, so **do not cite a live grounding
+   number yet.** Full pilot write-up: `reports/related_work_comparison.md`
+   (commit `3a6dabf`, "Grounding pilot"). The external-agent route below is the alternative.
    - **⚠ Fix this metric bug first.** `parse_eval._privesc_grounded` accepts a fixed
      token set (`DIRECT ID CHECK` / `[direct]` / `docker rootbash probe`) but **not**
      `[Tool Output]:` lines, while `_impact_grounded` **does** — so a genuine
