@@ -75,7 +75,17 @@ contribution = recovery) remains the safe framing**, and nothing here argues aga
 
 ---
 
-## Experiment 2 — the follow-up probe: `unwinnable_privesc` (built, not yet run)
+## Experiment 2 — the follow-up probe: `unwinnable_privesc` (built + offline-green; live run HANDED OFF)
+
+> **STATUS — ready to run, handed off.** The scenario is built, offline-validated
+> (`tests/test_unwinnable_privesc_graph.py` 7/7), and its foothold is confirmed working
+> live (Drupalgeddon2 → `www-data`, `gain_access=success`). The live v0_full-vs-v3_noground
+> batch was attempted but **OOM-killed** in the authoring session (~2 GB free of 16 — the
+> host was loaded with browsers/IDE/lab VMs + two Claude sessions; each orchestrator cell
+> needs a langchain+ChromaDB spike on top). **Next person: run it in a fresh session with
+> Brave/PyCharm/Discord closed (aim for >~4–5 GB free), then send the `false_success`
+> numbers back for the write-up.** Nothing about the code is blocking — this is purely a
+> memory-headroom issue.
 
 **Design principle.** To test over-claiming, the scored objective must be something ONLY
 genuine root can produce and the agent cannot fake. **Privesc grounding (`id` → `uid=0`)
