@@ -83,6 +83,40 @@ Read honestly:
   experiment, and it lives entirely in *our* scheme (apples-to-apples), independent of
   HBG. **HBG is the architectural comparator; `v3_noground` is the empirical evidence.**
 
+### Grounding pilot (v3_noground × flaw_privesc, N=3) — INCONCLUSIVE, and why
+
+Ran the de-risking pilot (grounding gate off, independent oracle on). **No genuine
+overclaim appeared: all 3 runs actually reached root** (`euid=0(root)` via docker
+group, visible in real `[Tool Output]:` target bytes) and grounded the objective —
+`grounded_success = 3/3`. So on this scenario the agent stayed honest even with its
+in-agent grounding disabled.
+
+Two findings that matter more than the headline number:
+
+1. **The scenario is a weak overclaim probe.** `flaw_privesc` is *winnable* — the agent
+   reliably finds the docker-group path and genuinely roots the box. An agent that
+   really succeeds can't overclaim. To test overclaim you need a scenario where privesc
+   is **genuinely unreachable**, so a prose-only critic is tempted to rubber-stamp a
+   non-success. That's the scenario a real grounding campaign must use.
+2. **The `false_success` metric has a privesc/impact asymmetry (surfaced by this run).**
+   The oracle flagged 1/3 (`r2`) as false success, but on inspection `r2` *did* reach
+   root — its proof just landed on a `[Tool Output]:` line, which `_impact_grounded`
+   trusts but `_privesc_grounded` does not (its GT-line set is `DIRECT ID CHECK` /
+   `docker rootbash probe` / `[direct]` / …, not `[Tool Output]`). r0/r1 happened to
+   land their token on a recognized line; r2 didn't — a coin-flip, not behavior. This is
+   the "subagent ground-truth capture" conservative-bias threat already noted in
+   `ablation_table.md`, now empirically hit. **Fix is real but not a blind one-liner:**
+   `[Tool Output]` also carries `query_knowledge_base` results, so a RAG doc mentioning
+   `uid=0(root)` could spoof grounding — the fix must recognize *session-command* tool
+   output specifically, not all tool output.
+
+**Verdict.** The pilot neither confirms nor kills the grounding contribution — it shows
+the current setup can't test it yet. Before any grounding-ablation number is
+trustworthy: (a) fix the privesc GT-line asymmetry (RAG-safe), and (b) run on an
+unwinnable-privesc scenario. Absent that investment, **Path B (grounding = measurement
+rigor, one claimed contribution: recovery) remains the safe framing** — this pilot gives
+no evidence to abandon it. _Source: `logs/eval/flaw_privesc__v3_noground__r{0,1,2}.*`._
+
 ## Cells to confirm (before manuscript)
 
 The †-marked cells are from working memory of these systems, not re-read from the
