@@ -6,7 +6,6 @@ Everything you need to **present** the GRAFT handover, in one place.
 |---|---|
 | `graft_talk.html` | The talk deck (10 slides). Open in a browser; theme-aware, has a print stylesheet. |
 | `graft_talk.pdf` | The deck exported to PDF (one slide per landscape page) — hand this to the audience. |
-| `handoff_walkthrough.md` | **Presenter's runsheet** — read from this while presenting: pre-flight, slide-by-slide talking points, the 4-file code tour, the offline demo, anticipated Q&A. |
 
 ## The newcomer-facing docs stay in the repo (not here)
 

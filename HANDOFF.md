@@ -2,14 +2,16 @@
 
 **For the next engineer.** This is the one doc to read first. It captures the
 mental model, the lab operations, the landmines, and the roadmap — the stuff that
-*isn't* obvious from the code or git history. Everything here is verified against
-the code as of 2026-07-01 on branch `graph-orchestrator`.
+*isn't* obvious from the code or git history. The mental model and lab facts below
+were verified against the code on 2026-07-01; the `graph-orchestrator` work was
+merged into `master` and that branch retired on 2026-09-10, so the repo now has a
+**single `master` line** — everything here lives there.
 
 > **If you read nothing else:** the real code is `core_agents/orchestrator.py` +
 > `stages/*.py`, NOT `single_focus.py` (that's dead, now under `legacy_agents/`).
-> `CLAUDE.md` is partly stale — trust this doc and the file:line refs below.
-> The current work lives on branch **`graph-orchestrator`** (~20 commits ahead of
-> `master`, **not merged**). Nothing is in production; this is a lab research tool.
+> Trust this doc and the file:line refs below; `grep` the function names if a line
+> number has drifted. All work is on **`master`** (a single branch now). Nothing is
+> in production; this is a lab research tool. AI agents: read `AGENTS.md` too.
 
 ---
 
@@ -21,10 +23,11 @@ the code as of 2026-07-01 on branch `graph-orchestrator`.
 - **Where it runs:** a controlled lab — **Kali attacker `192.168.34.6`**,
   **Metasploitable 3 (Linux) target `192.168.34.7`**. Never point it at anything
   you don't own.
-- **Branch:** `graph-orchestrator`. The last big push was the v16–v19 subagent
-  refinement batch (privesc kernel path, initial_access proven-vector bias,
-  credential-retry rotation). All offline-tested; **live validation still owed**
-  (the lab was down at handoff — see §4).
+- **Branch:** `master` (the single active line; `graph-orchestrator` was merged in
+  and retired 2026-09-10). The last big push was the v16–v19 subagent refinement
+  batch (privesc kernel path, initial_access proven-vector bias, credential-retry
+  rotation). All offline-tested; **live validation still owed** (the lab was down at
+  handoff — see §4).
 - **The evolution story** (why the code looks the way it does) is in
   `reports/refinement_history_v0_v19.md`. Read it after this.
 
@@ -319,8 +322,9 @@ Full detail in `reports/refinement_roadmap.md`. Priority order:
    establishing persistence. `preconditions_met` answers "can it run?", not "is
    the skipped goal satisfied?". Needs a `goal_likely_satisfied` heuristic per
    node + a prompt rule. Confirm the heuristic set before coding.
-3. **Merge `graph-orchestrator` → `master`** once (1) is green. It's two logical
-   units (judge redesign + replanner reliability) — two PRs, or one squash.
+3. ~~**Merge `graph-orchestrator` → `master`.**~~ **Done (2026-09-10)** — the work
+   is consolidated onto a single `master` branch; there's no separate feature branch
+   to track anymore. Live-validation of (1) can now land straight on `master`.
 4. Lower-priority: harder privesc time-box, more targets (true Jenkins = Windows
    MS3), lab-hygiene automation folded into the run drivers.
 
@@ -367,8 +371,9 @@ databases/, my_knowledge_base/   the RAG vector store
 ```
 
 **Stale/broken to ignore:** `legacy_agents/` (dead), `refined.py` (never existed —
-CLAUDE.md lies), root `test_recon_only.py` (imports a `build_pipeline` that no
-longer exists), `experiments/test_stage_*.py` (ad-hoc, not in the offline suite).
+it was a planned successor to `single_focus.py` that was never built), root
+`test_recon_only.py` (imports a `build_pipeline` that no longer exists),
+`experiments/test_stage_*.py` (ad-hoc, not in the offline suite).
 
 ---
 

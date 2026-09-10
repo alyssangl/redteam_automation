@@ -10,9 +10,9 @@ detail against the real source, how to run it, and where to plug your own work i
 > the reasoning behind the shape. This doc is the bridge between them and the code.
 
 Everything below is verified against `core_agents/orchestrator.py` +
-`stages/*.py` + `experiments/parse_eval.py` on branch **`graph-orchestrator`**
-(the live branch; **not merged to `master`**). Line numbers are approximate —
-trust the function names, `grep` if a number has drifted.
+`stages/*.py` + `experiments/parse_eval.py` on the **`master`** branch (the single
+active line — the old `graph-orchestrator` work was merged in). Line numbers are
+approximate — trust the function names, `grep` if a number has drifted.
 
 ---
 

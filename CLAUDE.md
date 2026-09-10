@@ -4,8 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 > **New here? Read `HANDOFF.md` first** — it has the verified mental model, lab
 > operations, landmines, and roadmap. The current pipeline is
-> `core_agents/orchestrator.py` + `stages/*.py` on branch `graph-orchestrator`.
-> The old `single_focus.py` is retired (now `legacy_agents/single_focus.py`).
+> `core_agents/orchestrator.py` + `stages/*.py` and lives on the single `master`
+> branch (the old `graph-orchestrator` line was merged in and retired).
+> The old `single_focus.py` is retired too (now `legacy_agents/single_focus.py`).
+> **AI agents working this repo:** also read `AGENTS.md` at the root.
 
 ### Where the detail lives (this file stays a lean index — go deep here)
 
@@ -117,8 +119,8 @@ PASS → END
 
 ### Development Focus
 
-Active work is the **graph-driven orchestrator** (`core_agents/orchestrator.py` +
-`stages/*.py`) on branch `graph-orchestrator` — a backtracking walker with a
+The engine is the **graph-driven orchestrator** (`core_agents/orchestrator.py` +
+`stages/*.py`) on the `master` branch — a backtracking walker with a
 2-layer feedback system (`judge()` + `_replan_from`) that replaced the old linear
 `single_focus.py` pipeline. The 3-layer model (L1 stage subagents / L2 judge /
 L3 replanner) and the full evolution are documented in `HANDOFF.md` and
