@@ -25,3 +25,6 @@ msgpack==1.1.2
 python-dotenv==1.2.2
 pypdf==6.14.2
 PyYAML==6.0.3
+
+# --- Terminal cockpit UI (ui/, optional — only needed for `python -m ui.cockpit`) ---
+textual==8.2.8
