@@ -1,0 +1,27 @@
+# lgg_automation — pinned to the versions verified in the working conda env
+# (red_teaming_auto_lamgchain, Python 3.10). Regenerate the pins after any
+# dependency bump. Direct deps only; pip resolves the transitive tree.
+
+# --- LLM / graph stack ---
+langchain==1.3.2
+langchain-core==1.4.0
+langchain-community==0.4.2
+langchain-openai==1.2.2
+langchain-chroma==1.1.0
+langchain-text-splitters==1.1.2
+langgraph==1.2.2
+openai==2.40.0
+tiktoken==0.13.0
+
+# --- RAG vector store ---
+chromadb==1.5.9
+
+# --- Lab I/O (SSH to Kali, Metasploit RPC) ---
+paramiko==5.0.0
+pymetasploit3==1.0.6
+msgpack==1.1.2
+
+# --- Config + document ingestion (database_utils/build_database.py) ---
+python-dotenv==1.2.2
+pypdf==6.14.2
+PyYAML==6.0.3

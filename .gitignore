@@ -1,0 +1,41 @@
+# Secrets (real .env stays ignored; keep the committed .env.example template)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Runtime artifacts / data
+logs/
+graphs/
+creme_logs/
+databases/
+my_knowledge_base/
+.refine_snapshots/
+database_utils/documents/
+
+# Editor / tooling
+.claude/
+.idea/
+
+# Archives & misc
+*.7z
+*.rar
+nul
+
+# Heavy / generated / third-party artifacts (kept locally, not in the repo).
+# NOTE: .gitignore has no inline comments — keep patterns on their own lines.
+# papers/ = third-party copyrighted PDFs (never redistribute)
+papers/
+# logs_old/ = archived run logs (same class as logs/)
+logs_old/
+# reports/figs/ = generated figures
+reports/figs/
+# reports/*.pptx,*.docx = binary decks/drafts (deck source is handoff/graft_talk.html)
+reports/*.pptx
+reports/*.docx
+# examples/*.json = serialized-graph build artifacts (regenerate from the .py)
+examples/*.json

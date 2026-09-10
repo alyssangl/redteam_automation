@@ -1,0 +1,31 @@
+# Keep the build context small and never bake secrets or lab artifacts.
+.git/
+__pycache__/
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# secrets — never bake ANY env file (incl. .env.bak.*, .env.local) except the template
+.env*
+!.env.example
+
+# runtime artifacts (regenerated / mounted as volumes)
+logs/
+creme_logs/
+graphs/
+databases/
+my_knowledge_base/
+.refine_snapshots/
+_pdf_extract/
+*.log
+
+# local editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Claude Code local state + git worktrees (full repo copies — bloat, and they
+# duplicated the leaked key). Never ship these.
+.claude/

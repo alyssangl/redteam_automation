@@ -1,0 +1,24 @@
+# 1. 隱藏環境與日誌
+__pycache__/
+*.py[cod]
+.env
+venv/
+env/
+*.log
+creme_logs/
+
+# 2. 隱藏 ChromaDB 資料庫 (避免 AI 試圖讀取二進位向量檔)
+databases/
+
+# 3. 隱藏實驗性與測試代碼 (當你專注於主線時)
+# 如果你需要 AI 幫你改測試檔，可以暫時把這裡註解掉
+test_*.py
+test.py
+somestuff.py
+graphhing.py
+static_*.py
+
+# 4. 隱藏舊版 Agent (防止邏輯混淆)
+# 等你完全棄用 single_focus.py 後，可以把它移到 legacy 資料夾並在這裡忽略
+single_focus.py
+single_focus_clean.py

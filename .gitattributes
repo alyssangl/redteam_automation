@@ -1,0 +1,8 @@
+# Force LF for files that run inside Linux containers, so a Windows checkout
+# (autocrlf) doesn't inject CRLF and break shebangs / entrypoints.
+*.sh            text eol=lf
+docker/*        text eol=lf
+Dockerfile*     text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+Vagrantfile     text eol=lf
