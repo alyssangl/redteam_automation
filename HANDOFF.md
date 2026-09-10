@@ -298,6 +298,16 @@ test. `tests/` holds pure-logic checks (no lab); add to them for any new plumbin
 and run `tests/run_offline.py` before every commit. Live runs are for *behavior*
 validation only (does the LLM actually pivot?), and they need the §4.3 runbook.
 
+> **Known offline-suite bug:** `tests/test_impact_probe_retry.py` is **not** pure
+> offline — it opens a **real** msfrpcd connection (`192.168.34.6:55553`) instead
+> of injecting the fake `tools.metasploit_tools` the way the other suites do (see
+> Landmine #1). With no lab up, its 3 checks (`test_first_try_short_circuits`,
+> `test_genuinely_dead_shell_fails_bounded`, `test_settles_then_responds`) fail
+> after the 60 s connect budget, so `run_offline.py` returns rc=1 even when the
+> other 42 files pass. It is **expected** to fail without the lab — don't chase it.
+> Proper fix: mock MSF like the neighbouring tests so the offline suite is truly
+> lab-free and goes green rc=0 with the lab down.
+
 **Commit hygiene:** small, self-contained commits (one logical change), so any
 piece is revertible. Keep `reports/stage_refinement_cycle_log.md` (per-run
 findings) and `reports/refinement_roadmap.md` (future plan) current. This was a
